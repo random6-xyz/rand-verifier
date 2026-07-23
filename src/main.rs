@@ -1,3 +1,4 @@
 fn main() {
-    println!("Hello, world!");
+    println!("rand-verifier: eBPF verifier in Rust");
+    println!("Use `cargo test` to run the test suite.");
 }
