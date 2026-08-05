@@ -66,13 +66,27 @@ fn parse_insn_st_stack() {
 #[test]
 fn parse_insn_jeq() {
     let insn = parse(opcode::JEQ, 1, 2, 4, 0);
-    assert!(matches!(insn, BpfInsn::Jeq { dst: 1, src: 2, offset: 4 }));
+    assert!(matches!(
+        insn,
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 4
+        }
+    ));
 }
 
 #[test]
 fn parse_insn_jgt() {
     let insn = parse(opcode::JGT, 1, 2, -4, 0);
-    assert!(matches!(insn, BpfInsn::Jgt { dst: 1, src: 2, offset: -4 }));
+    assert!(matches!(
+        insn,
+        BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: -4
+        }
+    ));
 }
 
 #[test]
@@ -97,10 +111,7 @@ fn parse_insn_exit() {
 
 #[test]
 fn add_subprog_no_calls() {
-    let insns = vec![
-        BpfInsn::MovImm { dst: 0, imm: 1 },
-        BpfInsn::Exit,
-    ];
+    let insns = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
     let subprogs = add_subprog(&insns).unwrap();
     assert_eq!(subprogs, vec![0]);
 }
@@ -135,10 +146,7 @@ fn add_subprog_dedup_target() {
 #[test]
 fn add_subprog_out_of_range() {
     // call target beyond the program → error
-    let insns = vec![
-        BpfInsn::Call { imm: 99 },
-        BpfInsn::Exit,
-    ];
+    let insns = vec![BpfInsn::Call { imm: 99 }, BpfInsn::Exit];
     assert!(add_subprog(&insns).is_err());
 }
 
@@ -207,7 +215,11 @@ fn visit_insn_jmp_crosses_boundary() {
 fn visit_insn_cond_branch() {
     // Jeq: branch target 0 + 1 + 1 = 2, fall-through 1
     let insns = vec![
-        BpfInsn::Jeq { dst: 1, src: 2, offset: 1 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
         BpfInsn::Exit,
         BpfInsn::Exit,
     ];
@@ -218,21 +230,14 @@ fn visit_insn_cond_branch() {
 #[test]
 fn visit_insn_call() {
     // Call imm is an absolute insn index: callee 2, return address 1
-    let insns = vec![
-        BpfInsn::Call { imm: 2 },
-        BpfInsn::Exit,
-        BpfInsn::Exit,
-    ];
+    let insns = vec![BpfInsn::Call { imm: 2 }, BpfInsn::Exit, BpfInsn::Exit];
     let nexts = visit_insn(0, &insns, &[0, 2]).unwrap();
     assert_eq!(nexts, vec![2, 1]);
 }
 
 #[test]
 fn visit_insn_alu_fallthrough() {
-    let insns = vec![
-        BpfInsn::AddImm { dst: 0, imm: 1 },
-        BpfInsn::Exit,
-    ];
+    let insns = vec![BpfInsn::AddImm { dst: 0, imm: 1 }, BpfInsn::Exit];
     let nexts = visit_insn(0, &insns, &[0]).unwrap();
     assert_eq!(nexts, vec![1]);
 }
@@ -267,10 +272,7 @@ fn visit_insn_error_carries_insn_idx() {
 
 #[test]
 fn check_cfg_valid_simple() {
-    let insns = vec![
-        BpfInsn::MovImm { dst: 0, imm: 1 },
-        BpfInsn::Exit,
-    ];
+    let insns = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
     assert!(check_cfg(&insns, &[0]).is_ok());
 }
 
@@ -326,7 +328,11 @@ fn check_cfg_back_edge_rejected() {
     // Jeq R1==R1, offset -1 → jump to itself (target = 0 + 1 - 1 = 0):
     // this path never reaches EXIT → must be rejected with a loop error
     let insns = vec![
-        BpfInsn::Jeq { dst: 1, src: 1, offset: -1 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 1,
+            offset: -1,
+        },
         BpfInsn::Exit,
     ];
     let err = check_cfg(&insns, &[0]).unwrap_err();
@@ -338,10 +344,7 @@ fn check_cfg_back_edge_rejected() {
 fn check_cfg_multi_insn_loop_rejected() {
     // 0: jmp +0 → 1    (target = 0 + 1 + 0 = 1)
     // 1: jmp -2 → 0    (target = 1 + 1 - 2 = 0) — 2-instruction loop
-    let insns = vec![
-        BpfInsn::Jmp { offset: 0 },
-        BpfInsn::Jmp { offset: -2 },
-    ];
+    let insns = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Jmp { offset: -2 }];
     assert!(check_cfg(&insns, &[0]).is_err());
 }
 
@@ -353,7 +356,11 @@ fn check_cfg_valid_with_join() {
     // 2: r0 = 1 → falls to 3
     // 3: exit
     let insns = vec![
-        BpfInsn::Jeq { dst: 1, src: 2, offset: 1 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
         BpfInsn::Jmp { offset: 1 },
         BpfInsn::MovImm { dst: 0, imm: 1 },
         BpfInsn::Exit,
@@ -390,9 +397,7 @@ fn setup_prog_reads_program() {
     std::fs::write(&path, prog_bytes(&insns)).unwrap();
 
     let mut env = BpfVerifierEnv::new();
-    let insn_cnt = env
-        .setup_prog(path.to_str().unwrap().to_string())
-        .unwrap();
+    let insn_cnt = env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
 
     assert_eq!(insn_cnt, 2);
     assert_eq!(env.prog.insn_cnt, 2);
@@ -411,8 +416,7 @@ fn setup_prog_reads_program() {
 /// Load a corpus program file and run the full verification pipeline.
 fn verify_corpus_program(path: &std::path::Path) -> Verdict {
     let mut env = BpfVerifierEnv::new();
-    env.setup_prog(path.to_str().unwrap().to_string())
-        .unwrap();
+    env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
     env.verify().unwrap()
 }
 

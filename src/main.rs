@@ -26,6 +26,8 @@ const MAX_SUBPROGS: usize = 256;
 // ── BPF instruction ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+// register fields (dst/src/imm/offset) are consumed by state tracking (v0.2)
+#[allow(dead_code)]
 enum BpfInsn {
     MovImm { dst: u8, imm: i32 },
     MovReg { dst: u8, src: u8 },
@@ -91,10 +93,7 @@ fn register_subprog(
     if subprogs.len() >= MAX_SUBPROGS {
         return Err(VerificationFailure::new(
             call_idx,
-            format!(
-                "exceeded maximum number of subprograms ({})",
-                MAX_SUBPROGS
-            ),
+            format!("exceeded maximum number of subprograms ({})", MAX_SUBPROGS),
         ));
     }
 
@@ -314,6 +313,7 @@ enum Verdict {
 #[derive(Default)]
 struct BpfVerifierEnv {
     pub prog: BpfProg, // BPF program data
+    #[allow(dead_code)] // consumed by state tracking (v0.2)
     pub insn_idx: u32, // current checking instruction
 }
 
@@ -340,10 +340,7 @@ impl BpfVerifierEnv {
 
         let insn_cnt = (raw_data.len() / 8) as u32;
 
-        let insns: Vec<BpfInsn> = raw_data
-            .chunks_exact(8)
-            .map(parse_insn)
-            .collect();
+        let insns: Vec<BpfInsn> = raw_data.chunks_exact(8).map(parse_insn).collect();
 
         self.prog.name = name.clone();
         self.prog.location = name;
