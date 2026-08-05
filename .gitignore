@@ -1,1 +1,11 @@
+# Build artifacts
 /target
+
+# Personal agent instructions (not part of the repository)
+/AGENTS.md
+
+# Study notes and planning docs (kept local only)
+/docs
+
+# Editor / OS junk
+.DS_Store
