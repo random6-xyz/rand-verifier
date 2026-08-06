@@ -141,6 +141,42 @@ impl VerifierState {
 
 // ── Abstract instruction execution (v0.2 Micro) ──────────────────────────────
 
+/// step() runs without program context; the driver loop assigns the real pc (#23).
+const NO_PC: u32 = 0;
+
+/// Validate a register number used as a write destination.
+fn check_reg(reg: u8) -> Result<(), VerificationFailure> {
+    if reg as usize >= NUM_REGS {
+        Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "invalid register r{} (valid range is r0..r{})",
+                reg,
+                NUM_REGS - 1
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a register's abstract state.
+///
+/// This is the single read entry point for instructions: a register must
+/// have been written before it is read, otherwise the read is rejected
+/// (cf. the kernel verifier's "R%d !read_ok" error). Later issues reuse
+/// this helper for their own read sites (#15, #17, #23, #28).
+fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFailure> {
+    check_reg(reg)?;
+    match state.regs[reg as usize] {
+        RegState::Uninit => Err(VerificationFailure::new(
+            NO_PC,
+            format!("register r{} is uninitialized", reg),
+        )),
+        other => Ok(other),
+    }
+}
+
 /// Symbolically execute a single instruction, producing the next state.
 ///
 /// Instead of tracking concrete u64 values, registers are updated by
@@ -152,30 +188,10 @@ impl VerifierState {
 /// rejected with a reference to the issue that introduces them.
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
-    // step() has no program context; the driver loop assigns the real pc (#23)
-    const NO_PC: u32 = 0;
-
-    // register operands come from a 4-bit nibble, so numbers above r10
-    // must be rejected
-    let check_reg = |r: &u8| -> Result<(), VerificationFailure> {
-        if *r as usize >= NUM_REGS {
-            Err(VerificationFailure::new(
-                NO_PC,
-                format!(
-                    "invalid register r{} (valid range is r0..r{})",
-                    r,
-                    NUM_REGS - 1
-                ),
-            ))
-        } else {
-            Ok(())
-        }
-    };
-
     match insn {
         // rX = imm → constant scalar
         BpfInsn::MovImm { dst, imm } => {
-            check_reg(dst)?;
+            check_reg(*dst)?;
             let mut next = *state;
             next.regs[*dst as usize] = RegState::Scalar {
                 min: *imm as i64,
@@ -184,12 +200,12 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             Ok(next)
         }
         // rX = rY → copy the source's abstract state;
-        // reading an uninitialized register is rejected in #14
+        // the source must have been written before it is read (#14)
         BpfInsn::MovReg { dst, src } => {
-            check_reg(dst)?;
-            check_reg(src)?;
+            check_reg(*dst)?;
+            let src_state = read_reg(state, *src)?;
             let mut next = *state;
-            next.regs[*dst as usize] = next.regs[*src as usize];
+            next.regs[*dst as usize] = src_state;
             Ok(next)
         }
         // terminal — the path ends here without changing the state

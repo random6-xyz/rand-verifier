@@ -230,12 +230,29 @@ fn step_mov_reg_copies_pointers() {
 }
 
 #[test]
-fn step_mov_reg_copies_uninit() {
-    // copying an uninitialized register is allowed for now;
-    // rejection is added in #14
+fn step_mov_reg_uninit_rejected() {
+    // issue example: r0 = r2 with R2 uninitialized → REJECT
     let state = VerifierState::initial();
-    let next = step(&state, &BpfInsn::MovReg { dst: 6, src: 7 }).unwrap();
-    assert_eq!(next.regs[6], RegState::Uninit);
+    let err = step(&state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap_err();
+    assert!(err.message.contains("r2"));
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_mov_reg_self_copy_uninit_rejected() {
+    // r2 = r2 with R2 uninitialized is still a read → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::MovReg { dst: 2, src: 2 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_mov_reg_uninit_after_write_ok() {
+    // r2 = 10 then r0 = r2 → the read is allowed once written
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap();
+    assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
 }
 
 #[test]
@@ -284,6 +301,31 @@ fn step_is_pure() {
     let state = VerifierState::initial();
     let _ = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
     assert_eq!(state.regs[2], RegState::Uninit);
+}
+
+#[test]
+fn read_reg_initialized_regs() {
+    let state = VerifierState::initial();
+    // R1 (PtrToCtx) and R10 (PtrToStack) are readable at entry
+    assert_eq!(read_reg(&state, 1).unwrap(), RegState::PtrToCtx);
+    assert_eq!(
+        read_reg(&state, 10).unwrap(),
+        RegState::PtrToStack { offset: 0 }
+    );
+}
+
+#[test]
+fn read_reg_uninit_rejected() {
+    let state = VerifierState::initial();
+    let err = read_reg(&state, 2).unwrap_err();
+    assert!(err.message.contains("register r2 is uninitialized"));
+}
+
+#[test]
+fn read_reg_out_of_range_rejected() {
+    let state = VerifierState::initial();
+    let err = read_reg(&state, 11).unwrap_err();
+    assert!(err.message.contains("invalid register r11"));
 }
 
 // ── add_subprog / register_subprog ───────────────────────────────────────
