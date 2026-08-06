@@ -111,6 +111,36 @@ fn initial_reg_state() -> [RegState; NUM_REGS] {
     regs
 }
 
+// ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
+
+/// Abstract stack state.
+///
+/// Placeholder until #17 introduces the real abstract stack state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackState;
+
+/// Unified verifier state carried through instruction simulation.
+///
+/// Holds the abstract state of all 11 registers plus the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by abstract execution engine (#13)
+struct VerifierState {
+    regs: [RegState; NUM_REGS],
+    stack: StackState,
+}
+
+impl VerifierState {
+    /// Initial state at program entry: R1 = PtrToCtx, R10 = PtrToStack(0),
+    /// all other registers uninitialized.
+    #[allow(dead_code)] // consumed by abstract execution engine (#13)
+    fn initial() -> Self {
+        Self {
+            regs: initial_reg_state(),
+            stack: StackState,
+        }
+    }
+}
+
 /// Validate and register a single call target as a subprogram entry point.
 fn register_subprog(
     call_idx: u32,

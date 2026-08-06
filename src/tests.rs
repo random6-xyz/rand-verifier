@@ -151,6 +151,38 @@ fn reg_state_display() {
     assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
 }
 
+// ── VerifierState (v0.2) ─────────────────────────────────────────────────
+
+#[test]
+fn verifier_state_initial() {
+    let state = VerifierState::initial();
+
+    // registers match the #11 initial state
+    assert_eq!(state.regs, initial_reg_state());
+
+    // stack placeholder exists (real stack state arrives in #17)
+    assert_eq!(state.stack, StackState);
+}
+
+#[test]
+fn verifier_state_initial_matches_issue_spec() {
+    let state = VerifierState::initial();
+
+    // R0 = Uninit
+    assert_eq!(state.regs[0], RegState::Uninit);
+
+    // R1 = PtrToCtx
+    assert_eq!(state.regs[1], RegState::PtrToCtx);
+
+    // R2..R9 = Uninit
+    for i in 2..=9 {
+        assert_eq!(state.regs[i], RegState::Uninit);
+    }
+
+    // R10 = PtrToStack(0)
+    assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
 // ── add_subprog / register_subprog ───────────────────────────────────────
 
 #[test]
