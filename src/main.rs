@@ -66,7 +66,50 @@ fn parse_insn(bytes: &[u8]) -> BpfInsn {
     }
 }
 
-// ── Subprogram discovery ────────────────────────────────────────────────────
+// ── Abstract register state (v0.2 Micro) ─────────────────────────────────────
+
+/// Number of eBPF registers: R0..R10.
+const NUM_REGS: usize = 11;
+
+/// Abstract state of a single register during symbolic execution.
+///
+/// Instead of tracking concrete u64 values, the verifier tracks an abstract
+/// value per register (cf. kernel verifier docs):
+///
+/// - `Uninit` — the register has never been written
+/// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
+/// - `PtrToStack` — pointer into the stack frame, offset relative to R10
+/// - `PtrToCtx` — pointer to the program context
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by abstract execution engine (#13)
+enum RegState {
+    Uninit,
+    Scalar { min: i64, max: i64 },
+    PtrToStack { offset: i32 },
+    PtrToCtx,
+}
+
+impl std::fmt::Display for RegState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegState::Uninit => write!(f, "UNINIT"),
+            RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
+            RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
+            RegState::PtrToCtx => write!(f, "PTR_CTX"),
+        }
+    }
+}
+
+/// Initial register state at program entry, following the eBPF calling
+/// convention: R1 receives the context pointer, R10 is the read-only stack
+/// frame pointer, all other registers start uninitialized.
+#[allow(dead_code)] // consumed by abstract execution engine (#13)
+fn initial_reg_state() -> [RegState; NUM_REGS] {
+    let mut regs = [RegState::Uninit; NUM_REGS];
+    regs[1] = RegState::PtrToCtx;
+    regs[10] = RegState::PtrToStack { offset: 0 };
+    regs
+}
 
 /// Validate and register a single call target as a subprogram entry point.
 fn register_subprog(

@@ -107,6 +107,50 @@ fn parse_insn_exit() {
     assert!(matches!(insn, BpfInsn::Exit));
 }
 
+// ── RegState (v0.2) ─────────────────────────────────────────────────────
+
+#[test]
+fn reg_state_initial_state() {
+    let regs = initial_reg_state();
+    assert_eq!(regs.len(), 11);
+
+    // R0 = Uninit
+    assert_eq!(regs[0], RegState::Uninit);
+
+    // R1 = PtrToCtx
+    assert_eq!(regs[1], RegState::PtrToCtx);
+
+    // R2..R9 = Uninit
+    for i in 2..=9 {
+        assert_eq!(regs[i], RegState::Uninit);
+    }
+
+    // R10 = PtrToStack(0)
+    assert_eq!(regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn reg_state_scalar_equality() {
+    let c = RegState::Scalar { min: 10, max: 10 };
+    assert_eq!(c, RegState::Scalar { min: 10, max: 10 });
+    assert_ne!(c, RegState::Scalar { min: 10, max: 11 });
+    assert_ne!(c, RegState::Uninit);
+}
+
+#[test]
+fn reg_state_display() {
+    assert_eq!(RegState::Uninit.to_string(), "UNINIT");
+    assert_eq!(
+        RegState::Scalar { min: 0, max: 100 }.to_string(),
+        "SCALAR(0..100)"
+    );
+    assert_eq!(
+        RegState::PtrToStack { offset: -8 }.to_string(),
+        "PTR_STACK(-8)"
+    );
+    assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
+}
+
 // ── add_subprog / register_subprog ───────────────────────────────────────
 
 #[test]
