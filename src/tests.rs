@@ -265,9 +265,6 @@ fn step_exit_unchanged() {
 #[test]
 fn step_stub_errors_reference_issue() {
     let state = VerifierState::initial();
-    // ALU → #15
-    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 1 }).unwrap_err();
-    assert!(err.message.contains("#15"));
     // stack → #17
     let err = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
     assert!(err.message.contains("#17"));
@@ -326,6 +323,88 @@ fn read_reg_out_of_range_rejected() {
     let state = VerifierState::initial();
     let err = read_reg(&state, 11).unwrap_err();
     assert!(err.message.contains("invalid register r11"));
+}
+
+// ── ALU (v0.2) ───────────────────────────────────────────────────────────
+
+#[test]
+fn step_add_imm_issue_example() {
+    // issue example: r1 = 10; r1 += 20 → R1 = Scalar(30..30)
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 30, max: 30 });
+}
+
+#[test]
+fn step_add_imm_negative() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: -3 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+}
+
+#[test]
+fn step_add_reg_constants() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 15, max: 15 });
+    // the source register is unchanged
+    assert_eq!(next.regs[2], RegState::Scalar { min: 5, max: 5 });
+}
+
+#[test]
+fn step_add_reg_self() {
+    // r1 += r1 doubles the value
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 1 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 20, max: 20 });
+}
+
+#[test]
+fn step_add_imm_range() {
+    // range shift, a preview of #16: [0, 100] + 10 → [10, 110]
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 10, max: 110 });
+}
+
+#[test]
+fn step_add_reg_ranges() {
+    // [0, 100] + [5, 5] → [5, 105]
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 5, max: 105 });
+}
+
+#[test]
+fn step_add_uninit_rejected() {
+    // r0 += 1 with R0 uninitialized → #14 error
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 1 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+    // r0 += r2 with R2 uninitialized → #14 error
+    let err = step(&state, &BpfInsn::AddReg { dst: 0, src: 2 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_add_ptr_rejected() {
+    // r1 += 10 with R1 = PtrToCtx → pointer arithmetic error (#20)
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap_err();
+    assert!(err.message.contains("#20"));
+    assert!(err.message.contains("pointer arithmetic"));
+    // r0 += r10 with R10 = PtrToStack → pointer arithmetic error (#20)
+    let state = step(&state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
+    let err = step(&state, &BpfInsn::AddReg { dst: 0, src: 10 }).unwrap_err();
+    assert!(err.message.contains("#20"));
 }
 
 // ── add_subprog / register_subprog ───────────────────────────────────────

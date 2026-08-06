@@ -177,6 +177,25 @@ fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFail
     }
 }
 
+/// Read a register as a scalar (min, max) value.
+///
+/// ALU operations only accept scalars: uninitialized registers are
+/// rejected by `read_reg` (#14), and pointers are rejected because
+/// pointer arithmetic is not part of the micro subset yet (#20).
+fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), VerificationFailure> {
+    match read_reg(state, reg)? {
+        RegState::Scalar { min, max } => Ok((min, max)),
+        RegState::PtrToStack { .. } | RegState::PtrToCtx => Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "pointer arithmetic on r{} is not supported yet (see #20)",
+                reg
+            ),
+        )),
+        RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+    }
+}
+
 /// Symbolically execute a single instruction, producing the next state.
 ///
 /// Instead of tracking concrete u64 values, registers are updated by
@@ -184,8 +203,9 @@ fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFail
 /// a register move copies the source's abstract state, and `exit`
 /// terminates the path without changing the state.
 ///
-/// Instructions outside the micro subset (ALU, stack, control flow) are
-/// rejected with a reference to the issue that introduces them.
+/// Instructions outside the micro subset (stack, control flow, pointer
+/// arithmetic) are rejected with a reference to the issue that introduces
+/// them.
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
     match insn {
@@ -210,11 +230,32 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
         }
         // terminal — the path ends here without changing the state
         BpfInsn::Exit => Ok(*state),
+        // rX += imm → shift the scalar range by imm (wrapping 64-bit math,
+        // mirroring the kernel's wrap-around ALU semantics)
+        BpfInsn::AddImm { dst, imm } => {
+            check_reg(*dst)?;
+            let (min, max) = read_scalar(state, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: min.wrapping_add(*imm as i64),
+                max: max.wrapping_add(*imm as i64),
+            };
+            Ok(next)
+        }
+        // rX += rY → add the two scalar ranges; exact constants propagate
+        // because a constant is a range with min == max
+        BpfInsn::AddReg { dst, src } => {
+            check_reg(*dst)?;
+            let (dmin, dmax) = read_scalar(state, *dst)?;
+            let (smin, smax) = read_scalar(state, *src)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: dmin.wrapping_add(smin),
+                max: dmax.wrapping_add(smax),
+            };
+            Ok(next)
+        }
         // ── outside the micro subset, deferred to later issues ──
-        BpfInsn::AddImm { .. } | BpfInsn::AddReg { .. } => Err(VerificationFailure::new(
-            NO_PC,
-            "alu operation not supported yet (see #15)",
-        )),
         BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => Err(VerificationFailure::new(
             NO_PC,
             "stack load/store not supported yet (see #17)",
