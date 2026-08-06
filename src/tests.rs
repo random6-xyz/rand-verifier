@@ -183,6 +183,109 @@ fn verifier_state_initial_matches_issue_spec() {
     assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
 }
 
+// ── step (v0.2) ──────────────────────────────────────────────────────────
+
+#[test]
+fn step_mov_imm_issue_example() {
+    // Before: R2 = Uninit;  r2 = 10;  After: R2 = Scalar(10..10)
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+    // other registers untouched
+    assert_eq!(next.regs[1], RegState::PtrToCtx);
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_mov_imm_overwrites() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
+    assert_eq!(next.regs[2], RegState::Scalar { min: 20, max: 20 });
+}
+
+#[test]
+fn step_mov_imm_negative() {
+    // i32 imm is sign-extended into the i64 scalar range
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovImm { dst: 0, imm: -7 }).unwrap();
+    assert_eq!(next.regs[0], RegState::Scalar { min: -7, max: -7 });
+}
+
+#[test]
+fn step_mov_reg_copies_scalar() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovReg { dst: 3, src: 2 }).unwrap();
+    assert_eq!(next.regs[3], RegState::Scalar { min: 10, max: 10 });
+}
+
+#[test]
+fn step_mov_reg_copies_pointers() {
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovReg { dst: 4, src: 1 }).unwrap();
+    assert_eq!(next.regs[4], RegState::PtrToCtx);
+    let next = step(&state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_mov_reg_copies_uninit() {
+    // copying an uninitialized register is allowed for now;
+    // rejection is added in #14
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovReg { dst: 6, src: 7 }).unwrap();
+    assert_eq!(next.regs[6], RegState::Uninit);
+}
+
+#[test]
+fn step_exit_unchanged() {
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::Exit).unwrap();
+    assert_eq!(next, state);
+}
+
+#[test]
+fn step_stub_errors_reference_issue() {
+    let state = VerifierState::initial();
+    // ALU → #15
+    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 1 }).unwrap_err();
+    assert!(err.message.contains("#15"));
+    // stack → #17
+    let err = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("#17"));
+    // control flow → #23
+    let err = step(
+        &state,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+    )
+    .unwrap_err();
+    assert!(err.message.contains("#23"));
+}
+
+#[test]
+fn step_invalid_register_rejected() {
+    let state = VerifierState::initial();
+    // dst 11 is out of range (valid: r0..r10)
+    let err = step(&state, &BpfInsn::MovImm { dst: 11, imm: 1 }).unwrap_err();
+    assert!(err.message.contains("invalid register r11"));
+    // src 12 is out of range
+    let err = step(&state, &BpfInsn::MovReg { dst: 0, src: 12 }).unwrap_err();
+    assert!(err.message.contains("invalid register r12"));
+}
+
+#[test]
+fn step_is_pure() {
+    // the input state is not mutated
+    let state = VerifierState::initial();
+    let _ = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    assert_eq!(state.regs[2], RegState::Uninit);
+}
+
 // ── add_subprog / register_subprog ───────────────────────────────────────
 
 #[test]

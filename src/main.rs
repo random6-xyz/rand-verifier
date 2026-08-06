@@ -81,7 +81,6 @@ const NUM_REGS: usize = 11;
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by abstract execution engine (#13)
 enum RegState {
     Uninit,
     Scalar { min: i64, max: i64 },
@@ -123,7 +122,6 @@ struct StackState;
 ///
 /// Holds the abstract state of all 11 registers plus the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by abstract execution engine (#13)
 struct VerifierState {
     regs: [RegState; NUM_REGS],
     stack: StackState,
@@ -132,11 +130,84 @@ struct VerifierState {
 impl VerifierState {
     /// Initial state at program entry: R1 = PtrToCtx, R10 = PtrToStack(0),
     /// all other registers uninitialized.
-    #[allow(dead_code)] // consumed by abstract execution engine (#13)
+    #[allow(dead_code)] // consumed by the micro verifier driver (#23)
     fn initial() -> Self {
         Self {
             regs: initial_reg_state(),
             stack: StackState,
+        }
+    }
+}
+
+// ── Abstract instruction execution (v0.2 Micro) ──────────────────────────────
+
+/// Symbolically execute a single instruction, producing the next state.
+///
+/// Instead of tracking concrete u64 values, registers are updated by
+/// abstract rules: an immediate move produces a constant scalar range,
+/// a register move copies the source's abstract state, and `exit`
+/// terminates the path without changing the state.
+///
+/// Instructions outside the micro subset (ALU, stack, control flow) are
+/// rejected with a reference to the issue that introduces them.
+#[allow(dead_code)] // consumed by the micro verifier driver (#23)
+fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
+    // step() has no program context; the driver loop assigns the real pc (#23)
+    const NO_PC: u32 = 0;
+
+    // register operands come from a 4-bit nibble, so numbers above r10
+    // must be rejected
+    let check_reg = |r: &u8| -> Result<(), VerificationFailure> {
+        if *r as usize >= NUM_REGS {
+            Err(VerificationFailure::new(
+                NO_PC,
+                format!(
+                    "invalid register r{} (valid range is r0..r{})",
+                    r,
+                    NUM_REGS - 1
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    match insn {
+        // rX = imm → constant scalar
+        BpfInsn::MovImm { dst, imm } => {
+            check_reg(dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: *imm as i64,
+                max: *imm as i64,
+            };
+            Ok(next)
+        }
+        // rX = rY → copy the source's abstract state;
+        // reading an uninitialized register is rejected in #14
+        BpfInsn::MovReg { dst, src } => {
+            check_reg(dst)?;
+            check_reg(src)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = next.regs[*src as usize];
+            Ok(next)
+        }
+        // terminal — the path ends here without changing the state
+        BpfInsn::Exit => Ok(*state),
+        // ── outside the micro subset, deferred to later issues ──
+        BpfInsn::AddImm { .. } | BpfInsn::AddReg { .. } => Err(VerificationFailure::new(
+            NO_PC,
+            "alu operation not supported yet (see #15)",
+        )),
+        BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => Err(VerificationFailure::new(
+            NO_PC,
+            "stack load/store not supported yet (see #17)",
+        )),
+        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } | BpfInsn::Call { .. } => {
+            Err(VerificationFailure::new(
+                NO_PC,
+                "control flow not supported yet (see #23)",
+            ))
         }
     }
 }
