@@ -570,15 +570,76 @@ fn step_add_uninit_rejected() {
 
 #[test]
 fn step_add_ptr_rejected() {
-    // r1 += 10 with R1 = PtrToCtx → pointer arithmetic error (#20)
+    // r1 += 10 with R1 = PtrToCtx → arithmetic on a context pointer is rejected
     let state = VerifierState::initial();
     let err = step(&state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap_err();
-    assert!(err.message.contains("#20"));
-    assert!(err.message.contains("pointer arithmetic"));
-    // r0 += r10 with R10 = PtrToStack → pointer arithmetic error (#20)
+    assert!(err.message.contains("context pointer"));
+    // r0 += r10 with R10 = PtrToStack → register-offset pointer arithmetic is rejected
     let state = step(&state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
     let err = step(&state, &BpfInsn::AddReg { dst: 0, src: 10 }).unwrap_err();
-    assert!(err.message.contains("#20"));
+    assert!(err.message.contains("register-offset"));
+    // r10 += r1 with R1 = PtrToCtx → a pointer destination is rejected too
+    let err = step(&state, &BpfInsn::AddReg { dst: 10, src: 1 }).unwrap_err();
+    assert!(err.message.contains("register-offset"));
+}
+
+// ── Pointer arithmetic (v0.2) ────────────────────────────────────────────
+
+#[test]
+fn step_add_imm_ptr_stack() {
+    // r10 += -8 → PtrToStack(-8): the frame pointer moves down one slot
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: -8 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_chain() {
+    // r10 += -8; r10 += -8 → offset -16
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: -16 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_copied_reg() {
+    // r5 = r10; r5 += -16 → a copied stack pointer moves independently
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 5, imm: -16 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToStack { offset: -16 });
+    // the frame pointer itself is untouched
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_out_of_frame() {
+    // r10 += 8 → offset 8 points above the frame → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: 8 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+    // r10 += -520 → offset -520 exceeds the frame → REJECT
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: -520 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+}
+
+#[test]
+fn step_add_imm_ptr_stack_bounds_edges() {
+    // offset -512 is the last valid slot; one step past it → REJECT
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::AddImm { dst: 10, imm: -512 }).unwrap();
+    assert_eq!(state.regs[10], RegState::PtrToStack { offset: -512 });
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+}
+
+#[test]
+fn step_add_imm_ptr_stack_zero() {
+    // adding 0 keeps the pointer (no-op)
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: 0 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
 }
 
 // ── Branch refinement (v0.2) ─────────────────────────────────────────────

@@ -256,14 +256,15 @@ fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFail
 ///
 /// ALU operations only accept scalars: uninitialized registers are
 /// rejected by `read_reg` (#14), and pointers are rejected because
-/// pointer arithmetic is not part of the micro subset yet (#20).
+/// register-offset pointer arithmetic is not supported yet (only
+/// pointer + immediate is allowed, #20).
 fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), VerificationFailure> {
     match read_reg(state, reg)? {
         RegState::Scalar { min, max } => Ok((min, max)),
         RegState::PtrToStack { .. } | RegState::PtrToCtx => Err(VerificationFailure::new(
             NO_PC,
             format!(
-                "pointer arithmetic on r{} is not supported yet (see #20)",
+                "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
                 reg
             ),
         )),
@@ -278,8 +279,8 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
 /// a register move copies the source's abstract state, and `exit`
 /// terminates the path without changing the state.
 ///
-/// Instructions outside the micro subset (control flow, pointer
-/// arithmetic) are rejected with a reference to the issue that
+/// Instructions outside the micro subset (control flow, register-offset
+/// pointer arithmetic) are rejected with a reference to the issue that
 /// introduces them.
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
@@ -305,17 +306,43 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
         }
         // terminal — the path ends here without changing the state
         BpfInsn::Exit => Ok(*state),
-        // rX += imm → shift the scalar range by imm (wrapping 64-bit math,
-        // mirroring the kernel's wrap-around ALU semantics)
+        // rX += imm → shift a scalar range, or a stack pointer offset:
+        // pointer + immediate is the only allowed pointer arithmetic (#20)
         BpfInsn::AddImm { dst, imm } => {
             check_reg(*dst)?;
-            let (min, max) = read_scalar(state, *dst)?;
-            let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: min.wrapping_add(*imm as i64),
-                max: max.wrapping_add(*imm as i64),
-            };
-            Ok(next)
+            let dst_state = read_reg(state, *dst)?;
+            match dst_state {
+                RegState::Scalar { min, max } => {
+                    let mut next = *state;
+                    next.regs[*dst as usize] = RegState::Scalar {
+                        min: min.wrapping_add(*imm as i64),
+                        max: max.wrapping_add(*imm as i64),
+                    };
+                    Ok(next)
+                }
+                // PtrToStack + Scalar => PtrToStack at the shifted offset;
+                // the pointer must stay within the frame (cf. #19)
+                RegState::PtrToStack { offset } => {
+                    let new_offset = offset.wrapping_add(*imm);
+                    if !(-(STACK_SIZE as i32)..=0).contains(&new_offset) {
+                        return Err(VerificationFailure::new(
+                            NO_PC,
+                            format!(
+                                "stack pointer r{} offset {} is out of the {} byte frame",
+                                dst, new_offset, STACK_SIZE
+                            ),
+                        ));
+                    }
+                    let mut next = *state;
+                    next.regs[*dst as usize] = RegState::PtrToStack { offset: new_offset };
+                    Ok(next)
+                }
+                RegState::PtrToCtx => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("arithmetic on context pointer r{} is not allowed", dst),
+                )),
+                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+            }
         }
         // rX += rY → add the two scalar ranges; exact constants propagate
         // because a constant is a range with min == max
