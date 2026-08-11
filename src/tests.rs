@@ -407,6 +407,94 @@ fn step_add_ptr_rejected() {
     assert!(err.message.contains("#20"));
 }
 
+// ── Branch refinement (v0.2) ─────────────────────────────────────────────
+
+#[test]
+fn refine_gt_issue_example() {
+    // issue example: R1 = [0, 100]; if R1 > 50
+    // true: R1 = [51, 100], false: R1 = [0, 50]
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (50, 50));
+    assert_eq!(true_dst, (51, 100));
+    assert_eq!(true_src, (50, 50));
+    assert_eq!(false_dst, (0, 50));
+    assert_eq!(false_src, (50, 50));
+}
+
+#[test]
+fn refine_gt_both_ranges() {
+    // dst = [0, 100], src = [20, 200]: on the true branch both operands
+    // narrow (dst >= src.min + 1, src <= dst.max - 1)
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (20, 200));
+    assert_eq!(true_dst, (21, 100));
+    assert_eq!(true_src, (20, 99));
+    // the false branch adds no constraint here (dst <= 200, src >= 0
+    // are already implied by the ranges)
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (20, 200));
+}
+
+#[test]
+fn refine_gt_self() {
+    // r1 > r1 with r1 = [0, 100]: both sides of the comparison are
+    // refined, so the true branch narrows to the empty range
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (0, 100));
+    assert_eq!(true_dst, (1, 100));
+    assert_eq!(true_src, (0, 99));
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (0, 100));
+}
+
+#[test]
+fn refine_gt_infeasible_true_branch() {
+    // dst = [0, 100] vs src = [100, 100]: dst > 100 is impossible,
+    // so the true branch narrows to an empty range (min > max)
+    let ((true_dst, _), _) = refine_gt((0, 100), (100, 100));
+    assert!(true_dst.0 > true_dst.1);
+}
+
+#[test]
+fn refine_eq_intersection() {
+    // dst = [0, 100], src = [40, 60]: equality means both must be in [40, 60]
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_eq((0, 100), (40, 60));
+    assert_eq!(true_dst, (40, 60));
+    assert_eq!(true_src, (40, 60));
+    // false branch keeps both ranges (no safe single-interval narrowing)
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (40, 60));
+}
+
+#[test]
+fn refine_eq_disjoint() {
+    // disjoint ranges: equality is impossible → true branch is empty
+    let ((true_dst, true_src), _) = refine_eq((0, 10), (20, 30));
+    assert!(true_dst.0 > true_dst.1);
+    assert!(true_src.0 > true_src.1);
+}
+
+#[test]
+fn refine_eq_constants() {
+    // two constants: r1 = 5, r2 = 5 → true branch keeps 5..5
+    let ((true_dst, _), _) = refine_eq((5, 5), (5, 5));
+    assert_eq!(true_dst, (5, 5));
+}
+
+#[test]
+fn refine_gt_extremes() {
+    // wrapping at i64 extremes stays sound (never panics)
+    let ((true_dst, true_src), _) = refine_gt((i64::MIN, i64::MAX), (0, 0));
+    assert_eq!(true_dst, (1, i64::MAX));
+    // src.max = 0 is already below dst.max - 1, so src stays [0, 0]
+    assert_eq!(true_src, (0, 0));
+    // src.min + 1 wraps to i64::MIN; dst is kept soundly (the branch is
+    // actually infeasible, but over-approximation is allowed)
+    let ((true_dst, _), _) = refine_gt((0, i64::MAX), (i64::MAX, i64::MAX));
+    assert_eq!(true_dst.0, 0);
+    // dst.max - 1 wraps when dst.max = i64::MIN; dst stays [MIN, MIN] so
+    // the true branch narrows to an empty range (dst > src is impossible)
+    let ((true_dst, _), _) = refine_gt((i64::MIN, i64::MIN), (i64::MIN, i64::MIN));
+    assert!(true_dst.0 > true_dst.1);
+}
+
 // ── add_subprog / register_subprog ───────────────────────────────────────
 
 #[test]

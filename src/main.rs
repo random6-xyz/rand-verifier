@@ -269,6 +269,50 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
     }
 }
 
+// ── Branch refinement (v0.2 Micro) ───────────────────────────────────────────
+
+/// A scalar value range [min, max].
+type ScalarRange = (i64, i64);
+
+/// Both operands of a comparison refined for one branch side: (dst, src).
+type RefinedPair = (ScalarRange, ScalarRange);
+
+/// Refinement result of a comparison: (true branch, false branch).
+type RefinedBranches = (RefinedPair, RefinedPair);
+
+/// Refine two scalar ranges on the `dst > src` comparison.
+///
+/// Both operands are narrowed (cf. the kernel's adjust_scalar_min_max_vals):
+///
+/// - true branch:  dst >= src.min + 1, src <= dst.max - 1
+/// - false branch: dst <= src.max,     src >= dst.min
+///
+/// A refined range with min > max means the branch is infeasible.
+/// Comparisons are interpreted as signed (the kernel splits JGT/JSGT by
+/// signedness; our subset has a single `Jgt`).
+#[allow(dead_code)] // consumed by branch exploration (#24)
+fn refine_gt(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
+    // true: dst > src
+    let true_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
+    let true_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
+    // false: dst <= src
+    let false_dst = (dst.0, dst.1.min(src.1));
+    let false_src = (src.0.max(dst.0), src.1);
+    ((true_dst, true_src), (false_dst, false_src))
+}
+
+/// Refine two scalar ranges on the `dst == src` comparison.
+///
+/// - true branch: both operands take the intersection of the two ranges
+///   (min > max means the branch is infeasible)
+/// - false branch: a single interval cannot represent the complement of
+///   another interval, so no safe narrowing is possible — both are kept
+#[allow(dead_code)] // consumed by branch exploration (#24)
+fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
+    let inter = (dst.0.max(src.0), dst.1.min(src.1));
+    ((inter, inter), (dst, src))
+}
+
 /// Validate and register a single call target as a subprogram entry point.
 fn register_subprog(
     call_idx: u32,
