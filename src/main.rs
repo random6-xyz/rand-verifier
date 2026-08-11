@@ -126,7 +126,6 @@ const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 /// Slot-level granularity (not byte-level) keeps the model approachable;
 /// scalar ranges and spilled pointer states are not tracked here yet (#30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // written by stack stores (#18)
 enum StackSlot {
     Uninit,
     Scalar,
@@ -143,18 +142,35 @@ impl std::fmt::Display for StackSlot {
 
 /// Abstract stack state: one slot per 8-byte cell of the 512-byte frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // read/write and bounds checks arrive in #18/#19
 struct StackState {
     slots: [StackSlot; STACK_SLOTS],
 }
 
 impl StackState {
     /// A fresh stack frame: every slot uninitialized.
-    #[allow(dead_code)] // read/write and bounds checks arrive in #18/#19
     fn new() -> Self {
         Self {
             slots: [StackSlot::Uninit; STACK_SLOTS],
         }
+    }
+}
+
+/// Map an r10-relative stack offset to a slot index.
+///
+/// Offsets must point into the frame (r10-512..r10-8) and be 8-byte
+/// aligned: -8 → slot 0, -16 → slot 1, ..., -512 → slot 63.
+/// Bounds-violation error messages are refined in #19.
+fn stack_slot_index(offset: i32) -> Result<usize, VerificationFailure> {
+    if offset < 0 && offset >= -(STACK_SIZE as i32) && offset % 8 == 0 {
+        Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
+    } else {
+        Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "invalid stack offset {} (valid: r10-512..r10-8, 8-byte aligned)",
+                offset
+            ),
+        ))
     }
 }
 
@@ -245,9 +261,9 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
 /// a register move copies the source's abstract state, and `exit`
 /// terminates the path without changing the state.
 ///
-/// Instructions outside the micro subset (stack, control flow, pointer
-/// arithmetic) are rejected with a reference to the issue that introduces
-/// them.
+/// Instructions outside the micro subset (control flow, pointer
+/// arithmetic) are rejected with a reference to the issue that
+/// introduces them.
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
     match insn {
@@ -297,11 +313,51 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             };
             Ok(next)
         }
+        // r10[offset] = rY → store the source's abstract state to a stack
+        // slot; only scalars are representable yet (pointer spill is #30)
+        BpfInsn::StStack { src, offset } => {
+            let slot = stack_slot_index(*offset as i32)?;
+            let src_state = read_reg(state, *src)?;
+            match src_state {
+                RegState::Scalar { .. } => {}
+                RegState::PtrToStack { .. } | RegState::PtrToCtx => {
+                    return Err(VerificationFailure::new(
+                        NO_PC,
+                        format!("spilling pointer r{} is not supported yet (see #30)", src),
+                    ));
+                }
+                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+            }
+            let mut next = *state;
+            next.stack.slots[slot] = StackSlot::Scalar;
+            Ok(next)
+        }
+        // rX = r10[offset] → load a stack slot; a slot must have been
+        // written before it is read (write-before-read, #18)
+        BpfInsn::LdStack { dst, offset } => {
+            check_reg(*dst)?;
+            let slot = stack_slot_index(*offset as i32)?;
+            match state.stack.slots[slot] {
+                StackSlot::Uninit => {
+                    return Err(VerificationFailure::new(
+                        NO_PC,
+                        format!(
+                            "stack slot at offset {} is uninitialized (write before read)",
+                            offset
+                        ),
+                    ));
+                }
+                StackSlot::Scalar => {}
+            }
+            // the slot carries no range yet, so a loaded scalar is unknown
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: i64::MIN,
+                max: i64::MAX,
+            };
+            Ok(next)
+        }
         // ── outside the micro subset, deferred to later issues ──
-        BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => Err(VerificationFailure::new(
-            NO_PC,
-            "stack load/store not supported yet (see #17)",
-        )),
         BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } | BpfInsn::Call { .. } => {
             Err(VerificationFailure::new(
                 NO_PC,

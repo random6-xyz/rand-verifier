@@ -214,6 +214,109 @@ fn stack_state_equality() {
     assert_ne!(a, b);
 }
 
+// ── Stack load/store (v0.2) ──────────────────────────────────────────────
+
+#[test]
+fn st_stack_writes_scalar_slot() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+    assert_eq!(next.stack.slots[0], StackSlot::Scalar);
+    // the source register is unchanged
+    assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+}
+
+#[test]
+fn st_stack_offsets_map_to_slots() {
+    // -8 → slot 0, -16 → slot 1, -512 → slot 63
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(
+        &state,
+        &BpfInsn::StStack {
+            src: 2,
+            offset: -512,
+        },
+    )
+    .unwrap();
+    assert_eq!(next.stack.slots[63], StackSlot::Scalar);
+    assert_eq!(next.stack.slots[0], StackSlot::Uninit);
+}
+
+#[test]
+fn st_stack_rejects_uninit_src() {
+    // storing r0 before it is written → #14 error
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn st_stack_rejects_pointer_spill() {
+    // storing a pointer is not representable yet → #30
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("#30"));
+}
+
+#[test]
+fn ld_stack_after_store() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let state = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap();
+    // the slot carries no range, so the loaded scalar is unknown (full range)
+    assert_eq!(
+        next.regs[0],
+        RegState::Scalar {
+            min: i64::MIN,
+            max: i64::MAX
+        }
+    );
+}
+
+#[test]
+fn ld_stack_before_store_rejected() {
+    // issue example: load [r10 - 8] with no prior store → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+    assert!(err.message.contains("write before read"));
+}
+
+#[test]
+fn ld_stack_slot_granularity() {
+    // a store at -16 does not make -8 readable (slot-level granularity)
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let state = step(
+        &state,
+        &BpfInsn::StStack {
+            src: 2,
+            offset: -16,
+        },
+    )
+    .unwrap();
+    let err = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("write before read"));
+}
+
+#[test]
+fn stack_invalid_offsets_rejected() {
+    let state = VerifierState::initial();
+    // positive (wrong direction), zero, beyond the frame, misaligned
+    for offset in [8, 0, -520, -7, -4] {
+        let err = step(&state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+        assert!(
+            err.message.contains("invalid stack offset"),
+            "offset {}",
+            offset
+        );
+    }
+    let err = step(&state, &BpfInsn::StStack { src: 1, offset: 8 }).unwrap_err();
+    assert!(err.message.contains("invalid stack offset"));
+}
+
 // ── step (v0.2) ──────────────────────────────────────────────────────────
 
 #[test]
@@ -296,9 +399,6 @@ fn step_exit_unchanged() {
 #[test]
 fn step_stub_errors_reference_issue() {
     let state = VerifierState::initial();
-    // stack → #17
-    let err = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
-    assert!(err.message.contains("#17"));
     // control flow → #23
     let err = step(
         &state,
