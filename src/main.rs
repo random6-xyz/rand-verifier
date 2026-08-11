@@ -110,13 +110,55 @@ fn initial_reg_state() -> [RegState; NUM_REGS] {
     regs
 }
 
-// ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
+// ── Stack state (v0.2 Micro) ─────────────────────────────────────────────────
 
-/// Abstract stack state.
+/// BPF stack size in bytes, fixed by the eBPF spec.
+const STACK_SIZE: usize = 512;
+
+/// Size of one stack slot in bytes (8-byte access granularity).
+const STACK_SLOT_SIZE: usize = 8;
+
+/// Number of stack slots: 512 / 8 = 64.
+const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
+
+/// Abstract state of a single stack slot.
 ///
-/// Placeholder until #17 introduces the real abstract stack state.
+/// Slot-level granularity (not byte-level) keeps the model approachable;
+/// scalar ranges and spilled pointer states are not tracked here yet (#30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StackState;
+#[allow(dead_code)] // written by stack stores (#18)
+enum StackSlot {
+    Uninit,
+    Scalar,
+}
+
+impl std::fmt::Display for StackSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StackSlot::Uninit => write!(f, "UNINIT"),
+            StackSlot::Scalar => write!(f, "SCALAR"),
+        }
+    }
+}
+
+/// Abstract stack state: one slot per 8-byte cell of the 512-byte frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // read/write and bounds checks arrive in #18/#19
+struct StackState {
+    slots: [StackSlot; STACK_SLOTS],
+}
+
+impl StackState {
+    /// A fresh stack frame: every slot uninitialized.
+    #[allow(dead_code)] // read/write and bounds checks arrive in #18/#19
+    fn new() -> Self {
+        Self {
+            slots: [StackSlot::Uninit; STACK_SLOTS],
+        }
+    }
+}
+
+// ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
 
 /// Unified verifier state carried through instruction simulation.
 ///
@@ -129,12 +171,12 @@ struct VerifierState {
 
 impl VerifierState {
     /// Initial state at program entry: R1 = PtrToCtx, R10 = PtrToStack(0),
-    /// all other registers uninitialized.
+    /// all other registers uninitialized, stack frame fully uninitialized.
     #[allow(dead_code)] // consumed by the micro verifier driver (#23)
     fn initial() -> Self {
         Self {
             regs: initial_reg_state(),
-            stack: StackState,
+            stack: StackState::new(),
         }
     }
 }

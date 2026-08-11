@@ -160,8 +160,8 @@ fn verifier_state_initial() {
     // registers match the #11 initial state
     assert_eq!(state.regs, initial_reg_state());
 
-    // stack placeholder exists (real stack state arrives in #17)
-    assert_eq!(state.stack, StackState);
+    // the stack frame starts with every slot uninitialized (#17)
+    assert_eq!(state.stack, StackState::new());
 }
 
 #[test]
@@ -181,6 +181,37 @@ fn verifier_state_initial_matches_issue_spec() {
 
     // R10 = PtrToStack(0)
     assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+// ── StackState (v0.2) ────────────────────────────────────────────────────
+
+#[test]
+fn stack_state_new_all_uninit() {
+    let stack = StackState::new();
+    assert_eq!(stack.slots.len(), STACK_SLOTS);
+    assert!(stack.slots.iter().all(|s| *s == StackSlot::Uninit));
+}
+
+#[test]
+fn stack_slot_constants() {
+    // the 512-byte frame split into 8-byte slots → 64 slots
+    assert_eq!(STACK_SIZE, 512);
+    assert_eq!(STACK_SLOT_SIZE, 8);
+    assert_eq!(STACK_SLOTS, 64);
+}
+
+#[test]
+fn stack_slot_display() {
+    assert_eq!(StackSlot::Uninit.to_string(), "UNINIT");
+    assert_eq!(StackSlot::Scalar.to_string(), "SCALAR");
+}
+
+#[test]
+fn stack_state_equality() {
+    let a = StackState::new();
+    let mut b = StackState::new();
+    b.slots[0] = StackSlot::Scalar;
+    assert_ne!(a, b);
 }
 
 // ── step (v0.2) ──────────────────────────────────────────────────────────
