@@ -304,17 +304,60 @@ fn ld_stack_slot_granularity() {
 #[test]
 fn stack_invalid_offsets_rejected() {
     let state = VerifierState::initial();
-    // positive (wrong direction), zero, beyond the frame, misaligned
-    for offset in [8, 0, -520, -7, -4] {
+    // wrong direction: r10 + N (positive) and the frame pointer itself (0)
+    for offset in [8, 0] {
+        let err = step(&state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+        assert!(err.message.contains("points away"), "offset {}", offset);
+    }
+    // beyond the 512-byte frame
+    let err = step(
+        &state,
+        &BpfInsn::LdStack {
+            dst: 0,
+            offset: -520,
+        },
+    )
+    .unwrap_err();
+    assert!(err.message.contains("exceeds"));
+    // not 8-byte aligned
+    for offset in [-7, -4] {
         let err = step(&state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
         assert!(
-            err.message.contains("invalid stack offset"),
+            err.message.contains("not 8-byte aligned"),
             "offset {}",
             offset
         );
     }
+    // a store with a wrong-direction offset is rejected too
     let err = step(&state, &BpfInsn::StStack { src: 1, offset: 8 }).unwrap_err();
-    assert!(err.message.contains("invalid stack offset"));
+    assert!(err.message.contains("points away"));
+}
+
+#[test]
+fn stack_bounds_frame_edges() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    // both frame edges are valid
+    for offset in [-8, -512] {
+        let next = step(&state, &BpfInsn::StStack { src: 2, offset }).unwrap();
+        let idx = stack_slot_index(offset as i32).unwrap();
+        assert_eq!(next.stack.slots[idx], StackSlot::Scalar);
+    }
+    // one byte beyond each edge is rejected
+    for offset in [-7, -513] {
+        assert!(
+            step(&state, &BpfInsn::StStack { src: 2, offset }).is_err(),
+            "offset {}",
+            offset
+        );
+    }
+}
+
+#[test]
+fn stack_slot_index_mapping() {
+    assert_eq!(stack_slot_index(-8).unwrap(), 0);
+    assert_eq!(stack_slot_index(-16).unwrap(), 1);
+    assert_eq!(stack_slot_index(-512).unwrap(), 63);
 }
 
 // ── step (v0.2) ──────────────────────────────────────────────────────────

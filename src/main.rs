@@ -158,20 +158,37 @@ impl StackState {
 /// Map an r10-relative stack offset to a slot index.
 ///
 /// Offsets must point into the frame (r10-512..r10-8) and be 8-byte
-/// aligned: -8 → slot 0, -16 → slot 1, ..., -512 → slot 63.
-/// Bounds-violation error messages are refined in #19.
+/// aligned: -8 → slot 0, -16 → slot 1, ..., -512 → slot 63. Each kind
+/// of bounds violation is reported with its own message (#19).
 fn stack_slot_index(offset: i32) -> Result<usize, VerificationFailure> {
-    if offset < 0 && offset >= -(STACK_SIZE as i32) && offset % 8 == 0 {
-        Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
-    } else {
-        Err(VerificationFailure::new(
+    // wrong direction: r10 + N, or the frame pointer itself (r10 + 0)
+    if offset >= 0 {
+        return Err(VerificationFailure::new(
             NO_PC,
             format!(
-                "invalid stack offset {} (valid: r10-512..r10-8, 8-byte aligned)",
+                "stack access at r10{:+} points away from the frame (valid: r10-512..r10-8)",
                 offset
             ),
-        ))
+        ));
     }
+    // beyond the frame
+    if offset < -(STACK_SIZE as i32) {
+        return Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "stack access at r10{:+} exceeds the {} byte frame",
+                offset, STACK_SIZE
+            ),
+        ));
+    }
+    // slot alignment
+    if offset % (STACK_SLOT_SIZE as i32) != 0 {
+        return Err(VerificationFailure::new(
+            NO_PC,
+            format!("stack access at r10{:+} is not 8-byte aligned", offset),
+        ));
+    }
+    Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
 }
 
 // ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
