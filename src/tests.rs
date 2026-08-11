@@ -1252,3 +1252,257 @@ fn corpus_micro_reject_all() {
     }
     assert!(count > 0, "no reject programs found in {:?}", dir);
 }
+
+// ── Worklist (v0.3) ──────────────────────────────────────────────────────
+
+#[test]
+fn verify_mini_straight_line() {
+    // r0 = 42; exit → R0 is set before exit
+    let program = vec![BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn verify_mini_exit_r0_uninit_rejected() {
+    // exit with R0 never written → REJECT
+    let program = vec![BpfInsn::Exit];
+    let err = verify_mini(&program).unwrap_err();
+    assert!(err.message.contains("r0 is uninitialized at exit"));
+}
+
+#[test]
+fn verify_mini_diamond_both_paths() {
+    // both paths must reach exit with R0 set:
+    // 0: r1 = 5
+    // 1: r2 = 5
+    // 2: jeq r1, r2, +2 → taken 5, fall 3
+    // 3: r0 = 1
+    // 4: jmp +1 → 6
+    // 5: r0 = 2
+    // 6: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 1, imm: 5 },
+        BpfInsn::MovImm { dst: 2, imm: 5 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 2,
+        },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Jmp { offset: 1 },
+        BpfInsn::MovImm { dst: 0, imm: 2 },
+        BpfInsn::Exit,
+    ];
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn verify_mini_r0_set_on_one_path_only_rejected() {
+    // the fall path reaches exit without writing R0 → REJECT:
+    // 0: r1 = 1
+    // 1: r2 = 1
+    // 2: jeq r1, r2, +1 → taken 4, fall 3
+    // 3: jmp +1 → 5
+    // 4: r0 = 42
+    // 5: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 1, imm: 1 },
+        BpfInsn::MovImm { dst: 2, imm: 1 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        BpfInsn::Jmp { offset: 1 },
+        BpfInsn::MovImm { dst: 0, imm: 42 },
+        BpfInsn::Exit,
+    ];
+    let err = verify_mini(&program).unwrap_err();
+    assert!(err.message.contains("r0 is uninitialized at exit"));
+}
+
+#[test]
+fn verify_mini_infeasible_taken_branch_pruned() {
+    // jeq with disjoint constants: the taken branch (exit directly, R0
+    // unset) is infeasible and must be pruned, otherwise this would reject
+    // 0: r1 = 7
+    // 1: r2 = 5
+    // 2: jeq r1, r2, +1 → taken 4 (infeasible), fall 3
+    // 3: r0 = 1
+    // 4: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 1, imm: 7 },
+        BpfInsn::MovImm { dst: 2, imm: 5 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Exit,
+    ];
+    assert!(verify_mini(&program).is_ok());
+
+    // the expansion itself yields a single (fall) successor
+    let mut state = VerifierState::initial();
+    state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 7 }).unwrap();
+    state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
+    let nexts = successors(
+        2,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 1);
+    assert_eq!(nexts[0].0, 3);
+}
+
+#[test]
+fn successors_jgt_refines_issue_example() {
+    // issue #16 example wired through the driver: R1 = [0, 100]; if R1 > 50
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+
+    let nexts = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+
+    // taken: pc = 0 + 1 + 1 = 2, R1 = [51, 100]
+    let (taken_pc, taken) = &nexts[0];
+    assert_eq!(*taken_pc, 2);
+    assert_eq!(taken.regs[1], RegState::Scalar { min: 51, max: 100 });
+    // fall: pc = 1, R1 = [0, 50]
+    let (fall_pc, fall) = &nexts[1];
+    assert_eq!(*fall_pc, 1);
+    assert_eq!(fall.regs[1], RegState::Scalar { min: 0, max: 50 });
+}
+
+#[test]
+fn successors_jeq_pointer_equality_allowed() {
+    // comparing a context pointer with itself: two successors, no refinement
+    let state = VerifierState::initial();
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 1,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+    assert_eq!(nexts[0].1, state);
+    assert_eq!(nexts[1].1, state);
+}
+
+#[test]
+fn successors_jgt_pointer_rejected() {
+    // > on stack pointers is not allowed
+    let state = VerifierState::initial();
+    let err = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 10,
+            src: 10,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("comparing pointers"));
+}
+
+#[test]
+fn successors_mixed_types_rejected() {
+    // context pointer vs stack pointer comparison is invalid
+    let state = VerifierState::initial();
+    let err = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 10,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("different types"));
+}
+
+#[test]
+fn successors_uninit_operand_rejected() {
+    // r2 is uninitialized at entry → #14 error
+    let state = VerifierState::initial();
+    let err = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn verify_mini_call_stub() {
+    let program = vec![BpfInsn::Call { imm: 1 }, BpfInsn::Exit];
+    let err = verify_mini(&program).unwrap_err();
+    assert!(err.message.contains("#28"));
+}
+
+#[test]
+fn verify_mini_jmp_out_of_range() {
+    // branch target beyond the program → defensive error
+    let program = vec![BpfInsn::Jmp { offset: 100 }, BpfInsn::Exit];
+    let err = verify_mini(&program).unwrap_err();
+    assert!(err.message.contains("pc out of program range"));
+}
+
+#[test]
+fn verify_mini_stack_pointer_in_branch() {
+    // pointer arithmetic + stack roundtrip inside a diamond, both paths OK:
+    // 0: r10 += -8
+    // 1: r2 = 7
+    // 2: [r10-8] = r2
+    // 3: r1 = 1
+    // 4: r3 = 1
+    // 5: jeq r1, r3, +2 → taken 8, fall 6
+    // 6: r0 = [r10-8]
+    // 7: jmp +1 → 9
+    // 8: r0 = [r10-8]
+    // 9: exit
+    let program = vec![
+        BpfInsn::AddImm { dst: 10, imm: -8 },
+        BpfInsn::MovImm { dst: 2, imm: 7 },
+        BpfInsn::StStack { src: 2, offset: -8 },
+        BpfInsn::MovImm { dst: 1, imm: 1 },
+        BpfInsn::MovImm { dst: 3, imm: 1 },
+        BpfInsn::Jeq {
+            dst: 1,
+            src: 3,
+            offset: 2,
+        },
+        BpfInsn::LdStack { dst: 0, offset: -8 },
+        BpfInsn::Jmp { offset: 1 },
+        BpfInsn::LdStack { dst: 0, offset: -8 },
+        BpfInsn::Exit,
+    ];
+    assert!(verify_mini(&program).is_ok());
+}

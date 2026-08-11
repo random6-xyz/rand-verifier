@@ -279,9 +279,10 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
 /// a register move copies the source's abstract state, and `exit`
 /// terminates the path without changing the state.
 ///
-/// Instructions outside the micro subset (control flow, register-offset
-/// pointer arithmetic) are rejected with a reference to the issue that
-/// introduces them.
+/// Instructions that expand to a single successor are executed here;
+/// control flow (Jmp/Jeq/Jgt) is expanded by the worklist driver (#23),
+/// calls are not part of the subset yet (#28), and register-offset
+/// pointer arithmetic is rejected (#20).
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
     match insn {
@@ -401,13 +402,19 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             };
             Ok(next)
         }
-        // ── outside the micro subset, deferred to later issues ──
-        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } | BpfInsn::Call { .. } => {
+        // control flow is expanded by the worklist driver (#23), which
+        // produces multiple successor states — a single-state step()
+        // cannot execute it; calls are not part of the subset yet
+        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } => {
             Err(VerificationFailure::new(
                 NO_PC,
-                "control flow not supported yet (see #23)",
+                "control flow is not executed by step() (see the worklist driver #23)",
             ))
         }
+        BpfInsn::Call { .. } => Err(VerificationFailure::new(
+            NO_PC,
+            "call instruction not supported yet (see #28)",
+        )),
     }
 }
 
@@ -506,10 +513,10 @@ fn trace_step(pc: u32, insn: &BpfInsn, before: &VerifierState, after: &VerifierS
 
 /// Execute a straight-line program and render the execution trace.
 ///
-/// Micro-stage driver: steps through every instruction in order and stops
-/// at the first unsupported one (control flow, #23). The worklist driver
-/// (#23) will supersede this.
-#[allow(dead_code)] // wired into the CLI once the worklist driver lands (#23)
+/// Micro-stage trace renderer: steps through every instruction in order
+/// and stops at the first instruction step() cannot execute (control
+/// flow is expanded by the worklist driver #23 instead).
+#[allow(dead_code)] // rendered through the CLI once the worklist driver lands (#23)
 fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
     let mut out = String::new();
     let mut state = VerifierState::initial();
@@ -520,6 +527,202 @@ fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
         state = next;
     }
     Ok(out)
+}
+
+// ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
+
+/// One pending state in the path exploration: an instruction index and
+/// the verifier state carried to it (cf. the kernel's verifier stack).
+struct WorkItem {
+    pc: u32,
+    state: VerifierState,
+}
+
+/// The conditional comparisons in the mini subset.
+enum CondOp {
+    Eq,
+    Gt,
+}
+
+/// PC-relative branch target: the offset is relative to the next insn.
+fn branch_target(pc: u32, offset: i16) -> u32 {
+    (pc as i32 + 1 + offset as i32) as u32
+}
+
+/// A refined branch state is feasible unless a refined range is empty
+/// (min > max), i.e. the branch can never be taken at run time.
+fn is_feasible(state: &VerifierState, dst: u8, src: u8) -> bool {
+    [dst, src]
+        .into_iter()
+        .all(|r| match state.regs[r as usize] {
+            RegState::Scalar { min, max } => min <= max,
+            _ => true,
+        })
+}
+
+/// Expand the instruction at `pc` into its successor (pc, state) pairs.
+///
+/// Control flow is expanded here, not in `step()` (which is single-state):
+/// exit terminates the path, Jmp follows only its target, Jeq/Jgt fork
+/// into both branches with scalar range refinement (#16), and everything
+/// else falls through via `step()`.
+fn successors(
+    pc: u32,
+    insn: &BpfInsn,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    match insn {
+        BpfInsn::Exit => Ok(vec![]),
+        BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
+        BpfInsn::Jeq { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Eq, state)
+        }
+        BpfInsn::Jgt { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Gt, state)
+        }
+        BpfInsn::Call { .. } => Err(VerificationFailure::new(
+            NO_PC,
+            "call instruction not supported yet (see #28)",
+        )),
+        _ => {
+            let next = step(state, insn)?;
+            Ok(vec![(pc + 1, next)])
+        }
+    }
+}
+
+/// Fork a conditional branch into taken and fall-through successors.
+///
+/// Scalar operands are refined on both sides via #16 (like the kernel's
+/// check_cond_jmp_op / regs_refine_cond_op); a branch narrowed to an
+/// empty range is infeasible and pruned. Pointers of the same type may
+/// be compared for equality without refinement (the NULL-check
+/// foundation for #27); `>` on pointers and mixed-type comparisons are
+/// rejected, mirroring the kernel.
+fn cond_branch(
+    pc: u32,
+    dst: u8,
+    src: u8,
+    offset: i16,
+    op: CondOp,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    let dst_state = read_reg(state, dst)?;
+    let src_state = read_reg(state, src)?;
+    let taken_pc = branch_target(pc, offset);
+    let fall_pc = pc + 1;
+
+    let (taken, fall) = match (dst_state, src_state) {
+        (
+            RegState::Scalar {
+                min: dmin,
+                max: dmax,
+            },
+            RegState::Scalar {
+                min: smin,
+                max: smax,
+            },
+        ) => {
+            let ((t_dst, t_src), (f_dst, f_src)) = match op {
+                CondOp::Eq => refine_eq((dmin, dmax), (smin, smax)),
+                CondOp::Gt => refine_gt((dmin, dmax), (smin, smax)),
+            };
+            let mut taken = *state;
+            taken.regs[dst as usize] = RegState::Scalar {
+                min: t_dst.0,
+                max: t_dst.1,
+            };
+            taken.regs[src as usize] = RegState::Scalar {
+                min: t_src.0,
+                max: t_src.1,
+            };
+            let mut fall = *state;
+            fall.regs[dst as usize] = RegState::Scalar {
+                min: f_dst.0,
+                max: f_dst.1,
+            };
+            fall.regs[src as usize] = RegState::Scalar {
+                min: f_src.0,
+                max: f_src.1,
+            };
+            (taken, fall)
+        }
+        // pointers of the same type: equality is allowed without
+        // refinement; `>` on pointers is not
+        (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
+        | (RegState::PtrToCtx, RegState::PtrToCtx) => match op {
+            CondOp::Eq => (*state, *state),
+            CondOp::Gt => {
+                return Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("comparing pointers r{} > r{} is not allowed", dst, src),
+                ));
+            }
+        },
+        // read_reg rejects uninitialized registers before we get here
+        (RegState::Uninit, _) | (_, RegState::Uninit) => {
+            unreachable!("read_reg rejects uninitialized registers")
+        }
+        // scalar vs pointer, or pointers of different types
+        _ => {
+            return Err(VerificationFailure::new(
+                NO_PC,
+                format!(
+                    "invalid comparison of r{} with r{} (different types)",
+                    dst, src
+                ),
+            ));
+        }
+    };
+
+    let mut out = Vec::with_capacity(2);
+    if is_feasible(&taken, dst, src) {
+        out.push((taken_pc, taken));
+    }
+    if is_feasible(&fall, dst, src) {
+        out.push((fall_pc, fall));
+    }
+    Ok(out)
+}
+
+/// Path-sensitive verification: explore every execution path with a
+/// worklist until it is empty.
+///
+/// - states are processed LIFO (depth-first), like the kernel's
+///   push_stack/pop_stack verifier stack
+/// - every path must reach `exit` with R0 initialized (cf. the kernel's
+///   R0 !read_ok check at exit)
+/// - branches narrowed to an empty range are pruned during expansion
+/// - termination is guaranteed because the nano pass (#6) rejects loops,
+///   so the CFG is acyclic; state dedup (#25/#26) and complexity limits
+///   (#32) come later
+#[allow(dead_code)] // consumed by the mini corpus runner (#33)
+fn verify_mini(program: &[BpfInsn]) -> Result<(), VerificationFailure> {
+    let mut worklist = vec![WorkItem {
+        pc: 0,
+        state: VerifierState::initial(),
+    }];
+
+    while let Some(item) = worklist.pop() {
+        let insn = program.get(item.pc as usize).ok_or_else(|| {
+            VerificationFailure::new(item.pc, "internal error: pc out of program range")
+        })?;
+
+        // a path ends at exit; R0 must hold a valid value there
+        if matches!(insn, BpfInsn::Exit) {
+            read_reg(&item.state, 0)
+                .map_err(|_| VerificationFailure::new(item.pc, "r0 is uninitialized at exit"))?;
+            continue;
+        }
+
+        for (next_pc, next_state) in successors(item.pc, insn, &item.state)? {
+            worklist.push(WorkItem {
+                pc: next_pc,
+                state: next_state,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate and register a single call target as a subprogram entry point.
