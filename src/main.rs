@@ -66,7 +66,461 @@ fn parse_insn(bytes: &[u8]) -> BpfInsn {
     }
 }
 
-// ── Subprogram discovery ────────────────────────────────────────────────────
+// ── Abstract register state (v0.2 Micro) ─────────────────────────────────────
+
+/// Number of eBPF registers: R0..R10.
+const NUM_REGS: usize = 11;
+
+/// Abstract state of a single register during symbolic execution.
+///
+/// Instead of tracking concrete u64 values, the verifier tracks an abstract
+/// value per register (cf. kernel verifier docs):
+///
+/// - `Uninit` — the register has never been written
+/// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
+/// - `PtrToStack` — pointer into the stack frame, offset relative to R10
+/// - `PtrToCtx` — pointer to the program context
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegState {
+    Uninit,
+    Scalar { min: i64, max: i64 },
+    PtrToStack { offset: i32 },
+    PtrToCtx,
+}
+
+impl std::fmt::Display for RegState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegState::Uninit => write!(f, "UNINIT"),
+            RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
+            RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
+            RegState::PtrToCtx => write!(f, "PTR_CTX"),
+        }
+    }
+}
+
+/// Initial register state at program entry, following the eBPF calling
+/// convention: R1 receives the context pointer, R10 is the read-only stack
+/// frame pointer, all other registers start uninitialized.
+#[allow(dead_code)] // consumed by abstract execution engine (#13)
+fn initial_reg_state() -> [RegState; NUM_REGS] {
+    let mut regs = [RegState::Uninit; NUM_REGS];
+    regs[1] = RegState::PtrToCtx;
+    regs[10] = RegState::PtrToStack { offset: 0 };
+    regs
+}
+
+// ── Stack state (v0.2 Micro) ─────────────────────────────────────────────────
+
+/// BPF stack size in bytes, fixed by the eBPF spec.
+const STACK_SIZE: usize = 512;
+
+/// Size of one stack slot in bytes (8-byte access granularity).
+const STACK_SLOT_SIZE: usize = 8;
+
+/// Number of stack slots: 512 / 8 = 64.
+const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
+
+/// Abstract state of a single stack slot.
+///
+/// Slot-level granularity (not byte-level) keeps the model approachable;
+/// scalar ranges and spilled pointer states are not tracked here yet (#30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackSlot {
+    Uninit,
+    Scalar,
+}
+
+impl std::fmt::Display for StackSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StackSlot::Uninit => write!(f, "UNINIT"),
+            StackSlot::Scalar => write!(f, "SCALAR"),
+        }
+    }
+}
+
+/// Abstract stack state: one slot per 8-byte cell of the 512-byte frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackState {
+    slots: [StackSlot; STACK_SLOTS],
+}
+
+impl StackState {
+    /// A fresh stack frame: every slot uninitialized.
+    fn new() -> Self {
+        Self {
+            slots: [StackSlot::Uninit; STACK_SLOTS],
+        }
+    }
+}
+
+/// Map an r10-relative stack offset to a slot index.
+///
+/// Offsets must point into the frame (r10-512..r10-8) and be 8-byte
+/// aligned: -8 → slot 0, -16 → slot 1, ..., -512 → slot 63. Each kind
+/// of bounds violation is reported with its own message (#19).
+fn stack_slot_index(offset: i32) -> Result<usize, VerificationFailure> {
+    // wrong direction: r10 + N, or the frame pointer itself (r10 + 0)
+    if offset >= 0 {
+        return Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "stack access at r10{:+} points away from the frame (valid: r10-512..r10-8)",
+                offset
+            ),
+        ));
+    }
+    // beyond the frame
+    if offset < -(STACK_SIZE as i32) {
+        return Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "stack access at r10{:+} exceeds the {} byte frame",
+                offset, STACK_SIZE
+            ),
+        ));
+    }
+    // slot alignment
+    if offset % (STACK_SLOT_SIZE as i32) != 0 {
+        return Err(VerificationFailure::new(
+            NO_PC,
+            format!("stack access at r10{:+} is not 8-byte aligned", offset),
+        ));
+    }
+    Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
+}
+
+// ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
+
+/// Unified verifier state carried through instruction simulation.
+///
+/// Holds the abstract state of all 11 registers plus the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifierState {
+    regs: [RegState; NUM_REGS],
+    stack: StackState,
+}
+
+impl VerifierState {
+    /// Initial state at program entry: R1 = PtrToCtx, R10 = PtrToStack(0),
+    /// all other registers uninitialized, stack frame fully uninitialized.
+    #[allow(dead_code)] // consumed by the micro verifier driver (#23)
+    fn initial() -> Self {
+        Self {
+            regs: initial_reg_state(),
+            stack: StackState::new(),
+        }
+    }
+}
+
+// ── Abstract instruction execution (v0.2 Micro) ──────────────────────────────
+
+/// step() runs without program context; the driver loop assigns the real pc (#23).
+const NO_PC: u32 = 0;
+
+/// Validate a register number used as a write destination.
+fn check_reg(reg: u8) -> Result<(), VerificationFailure> {
+    if reg as usize >= NUM_REGS {
+        Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "invalid register r{} (valid range is r0..r{})",
+                reg,
+                NUM_REGS - 1
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a register's abstract state.
+///
+/// This is the single read entry point for instructions: a register must
+/// have been written before it is read, otherwise the read is rejected
+/// (cf. the kernel verifier's "R%d !read_ok" error). Later issues reuse
+/// this helper for their own read sites (#15, #17, #23, #28).
+fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFailure> {
+    check_reg(reg)?;
+    match state.regs[reg as usize] {
+        RegState::Uninit => Err(VerificationFailure::new(
+            NO_PC,
+            format!("register r{} is uninitialized", reg),
+        )),
+        other => Ok(other),
+    }
+}
+
+/// Read a register as a scalar (min, max) value.
+///
+/// ALU operations only accept scalars: uninitialized registers are
+/// rejected by `read_reg` (#14), and pointers are rejected because
+/// register-offset pointer arithmetic is not supported yet (only
+/// pointer + immediate is allowed, #20).
+fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), VerificationFailure> {
+    match read_reg(state, reg)? {
+        RegState::Scalar { min, max } => Ok((min, max)),
+        RegState::PtrToStack { .. } | RegState::PtrToCtx => Err(VerificationFailure::new(
+            NO_PC,
+            format!(
+                "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
+                reg
+            ),
+        )),
+        RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+    }
+}
+
+/// Symbolically execute a single instruction, producing the next state.
+///
+/// Instead of tracking concrete u64 values, registers are updated by
+/// abstract rules: an immediate move produces a constant scalar range,
+/// a register move copies the source's abstract state, and `exit`
+/// terminates the path without changing the state.
+///
+/// Instructions outside the micro subset (control flow, register-offset
+/// pointer arithmetic) are rejected with a reference to the issue that
+/// introduces them.
+#[allow(dead_code)] // consumed by the micro verifier driver (#23)
+fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
+    match insn {
+        // rX = imm → constant scalar
+        BpfInsn::MovImm { dst, imm } => {
+            check_reg(*dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: *imm as i64,
+                max: *imm as i64,
+            };
+            Ok(next)
+        }
+        // rX = rY → copy the source's abstract state;
+        // the source must have been written before it is read (#14)
+        BpfInsn::MovReg { dst, src } => {
+            check_reg(*dst)?;
+            let src_state = read_reg(state, *src)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = src_state;
+            Ok(next)
+        }
+        // terminal — the path ends here without changing the state
+        BpfInsn::Exit => Ok(*state),
+        // rX += imm → shift a scalar range, or a stack pointer offset:
+        // pointer + immediate is the only allowed pointer arithmetic (#20)
+        BpfInsn::AddImm { dst, imm } => {
+            check_reg(*dst)?;
+            let dst_state = read_reg(state, *dst)?;
+            match dst_state {
+                RegState::Scalar { min, max } => {
+                    let mut next = *state;
+                    next.regs[*dst as usize] = RegState::Scalar {
+                        min: min.wrapping_add(*imm as i64),
+                        max: max.wrapping_add(*imm as i64),
+                    };
+                    Ok(next)
+                }
+                // PtrToStack + Scalar => PtrToStack at the shifted offset;
+                // the pointer must stay within the frame (cf. #19)
+                RegState::PtrToStack { offset } => {
+                    let new_offset = offset.wrapping_add(*imm);
+                    if !(-(STACK_SIZE as i32)..=0).contains(&new_offset) {
+                        return Err(VerificationFailure::new(
+                            NO_PC,
+                            format!(
+                                "stack pointer r{} offset {} is out of the {} byte frame",
+                                dst, new_offset, STACK_SIZE
+                            ),
+                        ));
+                    }
+                    let mut next = *state;
+                    next.regs[*dst as usize] = RegState::PtrToStack { offset: new_offset };
+                    Ok(next)
+                }
+                RegState::PtrToCtx => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("arithmetic on context pointer r{} is not allowed", dst),
+                )),
+                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+            }
+        }
+        // rX += rY → add the two scalar ranges; exact constants propagate
+        // because a constant is a range with min == max
+        BpfInsn::AddReg { dst, src } => {
+            check_reg(*dst)?;
+            let (dmin, dmax) = read_scalar(state, *dst)?;
+            let (smin, smax) = read_scalar(state, *src)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: dmin.wrapping_add(smin),
+                max: dmax.wrapping_add(smax),
+            };
+            Ok(next)
+        }
+        // r10[offset] = rY → store the source's abstract state to a stack
+        // slot; only scalars are representable yet (pointer spill is #30)
+        BpfInsn::StStack { src, offset } => {
+            let slot = stack_slot_index(*offset as i32)?;
+            let src_state = read_reg(state, *src)?;
+            match src_state {
+                RegState::Scalar { .. } => {}
+                RegState::PtrToStack { .. } | RegState::PtrToCtx => {
+                    return Err(VerificationFailure::new(
+                        NO_PC,
+                        format!("spilling pointer r{} is not supported yet (see #30)", src),
+                    ));
+                }
+                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+            }
+            let mut next = *state;
+            next.stack.slots[slot] = StackSlot::Scalar;
+            Ok(next)
+        }
+        // rX = r10[offset] → load a stack slot; a slot must have been
+        // written before it is read (write-before-read, #18)
+        BpfInsn::LdStack { dst, offset } => {
+            check_reg(*dst)?;
+            let slot = stack_slot_index(*offset as i32)?;
+            match state.stack.slots[slot] {
+                StackSlot::Uninit => {
+                    return Err(VerificationFailure::new(
+                        NO_PC,
+                        format!(
+                            "stack slot at offset {} is uninitialized (write before read)",
+                            offset
+                        ),
+                    ));
+                }
+                StackSlot::Scalar => {}
+            }
+            // the slot carries no range yet, so a loaded scalar is unknown
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar {
+                min: i64::MIN,
+                max: i64::MAX,
+            };
+            Ok(next)
+        }
+        // ── outside the micro subset, deferred to later issues ──
+        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } | BpfInsn::Call { .. } => {
+            Err(VerificationFailure::new(
+                NO_PC,
+                "control flow not supported yet (see #23)",
+            ))
+        }
+    }
+}
+
+// ── Branch refinement (v0.2 Micro) ───────────────────────────────────────────
+
+/// A scalar value range [min, max].
+type ScalarRange = (i64, i64);
+
+/// Both operands of a comparison refined for one branch side: (dst, src).
+type RefinedPair = (ScalarRange, ScalarRange);
+
+/// Refinement result of a comparison: (true branch, false branch).
+type RefinedBranches = (RefinedPair, RefinedPair);
+
+/// Refine two scalar ranges on the `dst > src` comparison.
+///
+/// Both operands are narrowed (cf. the kernel's adjust_scalar_min_max_vals):
+///
+/// - true branch:  dst >= src.min + 1, src <= dst.max - 1
+/// - false branch: dst <= src.max,     src >= dst.min
+///
+/// A refined range with min > max means the branch is infeasible.
+/// Comparisons are interpreted as signed (the kernel splits JGT/JSGT by
+/// signedness; our subset has a single `Jgt`).
+#[allow(dead_code)] // consumed by branch exploration (#24)
+fn refine_gt(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
+    // true: dst > src
+    let true_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
+    let true_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
+    // false: dst <= src
+    let false_dst = (dst.0, dst.1.min(src.1));
+    let false_src = (src.0.max(dst.0), src.1);
+    ((true_dst, true_src), (false_dst, false_src))
+}
+
+/// Refine two scalar ranges on the `dst == src` comparison.
+///
+/// - true branch: both operands take the intersection of the two ranges
+///   (min > max means the branch is infeasible)
+/// - false branch: a single interval cannot represent the complement of
+///   another interval, so no safe narrowing is possible — both are kept
+#[allow(dead_code)] // consumed by branch exploration (#24)
+fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
+    let inter = (dst.0.max(src.0), dst.1.min(src.1));
+    ((inter, inter), (dst, src))
+}
+
+// ── Execution trace (v0.2 Micro) ─────────────────────────────────────────────
+
+/// Render a single instruction in a readable eBPF-like syntax.
+fn disassemble(insn: &BpfInsn) -> String {
+    match insn {
+        BpfInsn::MovImm { dst, imm } => format!("r{} = {}", dst, imm),
+        BpfInsn::MovReg { dst, src } => format!("r{} = r{}", dst, src),
+        BpfInsn::AddImm { dst, imm } => format!("r{} += {}", dst, imm),
+        BpfInsn::AddReg { dst, src } => format!("r{} += r{}", dst, src),
+        BpfInsn::LdStack { dst, offset } => format!("r{} = [r10{:+}]", dst, offset),
+        BpfInsn::StStack { src, offset } => format!("[r10{:+}] = r{}", offset, src),
+        BpfInsn::Jeq { dst, src, offset } => {
+            format!("if r{} == r{} goto {:+}", dst, src, offset)
+        }
+        BpfInsn::Jgt { dst, src, offset } => {
+            format!("if r{} > r{} goto {:+}", dst, src, offset)
+        }
+        BpfInsn::Jmp { offset } => format!("goto {:+}", offset),
+        BpfInsn::Call { imm } => format!("call {}", imm),
+        BpfInsn::Exit => "exit".to_string(),
+    }
+}
+
+/// Render one trace entry for a step: the disassembled instruction
+/// followed by the interesting registers.
+///
+/// The first step shows the entry-relevant state (R0, the exit-value
+/// register, plus every initialized register); later steps show only the
+/// registers whose state changed, mirroring the #21 example.
+fn trace_step(pc: u32, insn: &BpfInsn, before: &VerifierState, after: &VerifierState) -> String {
+    let mut out = format!("{}: {}\n", pc, disassemble(insn));
+    if pc == 0 {
+        // R0 is the exit value — always shown at the start
+        out.push_str(&format!("  R0 = {}\n", after.regs[0]));
+        for (i, reg) in after.regs.iter().enumerate().skip(1) {
+            if *reg != RegState::Uninit {
+                out.push_str(&format!("  R{} = {}\n", i, reg));
+            }
+        }
+    } else {
+        for (i, (before, after)) in before.regs.iter().zip(&after.regs).enumerate() {
+            if before != after {
+                out.push_str(&format!("  R{} = {}\n", i, after));
+            }
+        }
+    }
+    out
+}
+
+/// Execute a straight-line program and render the execution trace.
+///
+/// Micro-stage driver: steps through every instruction in order and stops
+/// at the first unsupported one (control flow, #23). The worklist driver
+/// (#23) will supersede this.
+#[allow(dead_code)] // wired into the CLI once the worklist driver lands (#23)
+fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
+    let mut out = String::new();
+    let mut state = VerifierState::initial();
+    for (pc, insn) in program.iter().enumerate() {
+        let next = step(&state, insn)?;
+        out.push_str(&trace_step(pc as u32, insn, &state, &next));
+        out.push('\n');
+        state = next;
+    }
+    Ok(out)
+}
 
 /// Validate and register a single call target as a subprogram entry point.
 fn register_subprog(

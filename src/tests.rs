@@ -107,6 +107,730 @@ fn parse_insn_exit() {
     assert!(matches!(insn, BpfInsn::Exit));
 }
 
+// ── RegState (v0.2) ─────────────────────────────────────────────────────
+
+#[test]
+fn reg_state_initial_state() {
+    let regs = initial_reg_state();
+    assert_eq!(regs.len(), 11);
+
+    // R0 = Uninit
+    assert_eq!(regs[0], RegState::Uninit);
+
+    // R1 = PtrToCtx
+    assert_eq!(regs[1], RegState::PtrToCtx);
+
+    // R2..R9 = Uninit
+    for reg in &regs[2..=9] {
+        assert_eq!(*reg, RegState::Uninit);
+    }
+
+    // R10 = PtrToStack(0)
+    assert_eq!(regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn reg_state_scalar_equality() {
+    let c = RegState::Scalar { min: 10, max: 10 };
+    assert_eq!(c, RegState::Scalar { min: 10, max: 10 });
+    assert_ne!(c, RegState::Scalar { min: 10, max: 11 });
+    assert_ne!(c, RegState::Uninit);
+}
+
+#[test]
+fn reg_state_display() {
+    assert_eq!(RegState::Uninit.to_string(), "UNINIT");
+    assert_eq!(
+        RegState::Scalar { min: 0, max: 100 }.to_string(),
+        "SCALAR(0..100)"
+    );
+    assert_eq!(
+        RegState::PtrToStack { offset: -8 }.to_string(),
+        "PTR_STACK(-8)"
+    );
+    assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
+}
+
+// ── VerifierState (v0.2) ─────────────────────────────────────────────────
+
+#[test]
+fn verifier_state_initial() {
+    let state = VerifierState::initial();
+
+    // registers match the #11 initial state
+    assert_eq!(state.regs, initial_reg_state());
+
+    // the stack frame starts with every slot uninitialized (#17)
+    assert_eq!(state.stack, StackState::new());
+}
+
+#[test]
+fn verifier_state_initial_matches_issue_spec() {
+    let state = VerifierState::initial();
+
+    // R0 = Uninit
+    assert_eq!(state.regs[0], RegState::Uninit);
+
+    // R1 = PtrToCtx
+    assert_eq!(state.regs[1], RegState::PtrToCtx);
+
+    // R2..R9 = Uninit
+    for reg in &state.regs[2..=9] {
+        assert_eq!(*reg, RegState::Uninit);
+    }
+
+    // R10 = PtrToStack(0)
+    assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+// ── StackState (v0.2) ────────────────────────────────────────────────────
+
+#[test]
+fn stack_state_new_all_uninit() {
+    let stack = StackState::new();
+    assert_eq!(stack.slots.len(), STACK_SLOTS);
+    assert!(stack.slots.iter().all(|s| *s == StackSlot::Uninit));
+}
+
+#[test]
+fn stack_slot_constants() {
+    // the 512-byte frame split into 8-byte slots → 64 slots
+    assert_eq!(STACK_SIZE, 512);
+    assert_eq!(STACK_SLOT_SIZE, 8);
+    assert_eq!(STACK_SLOTS, 64);
+}
+
+#[test]
+fn stack_slot_display() {
+    assert_eq!(StackSlot::Uninit.to_string(), "UNINIT");
+    assert_eq!(StackSlot::Scalar.to_string(), "SCALAR");
+}
+
+#[test]
+fn stack_state_equality() {
+    let a = StackState::new();
+    let mut b = StackState::new();
+    b.slots[0] = StackSlot::Scalar;
+    assert_ne!(a, b);
+}
+
+// ── Stack load/store (v0.2) ──────────────────────────────────────────────
+
+#[test]
+fn st_stack_writes_scalar_slot() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+    assert_eq!(next.stack.slots[0], StackSlot::Scalar);
+    // the source register is unchanged
+    assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+}
+
+#[test]
+fn st_stack_offsets_map_to_slots() {
+    // -8 → slot 0, -16 → slot 1, -512 → slot 63
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(
+        &state,
+        &BpfInsn::StStack {
+            src: 2,
+            offset: -512,
+        },
+    )
+    .unwrap();
+    assert_eq!(next.stack.slots[63], StackSlot::Scalar);
+    assert_eq!(next.stack.slots[0], StackSlot::Uninit);
+}
+
+#[test]
+fn st_stack_rejects_uninit_src() {
+    // storing r0 before it is written → #14 error
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn st_stack_rejects_pointer_spill() {
+    // storing a pointer is not representable yet → #30
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("#30"));
+}
+
+#[test]
+fn ld_stack_after_store() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let state = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap();
+    // the slot carries no range, so the loaded scalar is unknown (full range)
+    assert_eq!(
+        next.regs[0],
+        RegState::Scalar {
+            min: i64::MIN,
+            max: i64::MAX
+        }
+    );
+}
+
+#[test]
+fn ld_stack_before_store_rejected() {
+    // issue example: load [r10 - 8] with no prior store → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+    assert!(err.message.contains("write before read"));
+}
+
+#[test]
+fn ld_stack_slot_granularity() {
+    // a store at -16 does not make -8 readable (slot-level granularity)
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let state = step(
+        &state,
+        &BpfInsn::StStack {
+            src: 2,
+            offset: -16,
+        },
+    )
+    .unwrap();
+    let err = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+    assert!(err.message.contains("write before read"));
+}
+
+#[test]
+fn stack_invalid_offsets_rejected() {
+    let state = VerifierState::initial();
+    // wrong direction: r10 + N (positive) and the frame pointer itself (0)
+    for offset in [8, 0] {
+        let err = step(&state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+        assert!(err.message.contains("points away"), "offset {}", offset);
+    }
+    // beyond the 512-byte frame
+    let err = step(
+        &state,
+        &BpfInsn::LdStack {
+            dst: 0,
+            offset: -520,
+        },
+    )
+    .unwrap_err();
+    assert!(err.message.contains("exceeds"));
+    // not 8-byte aligned
+    for offset in [-7, -4] {
+        let err = step(&state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+        assert!(
+            err.message.contains("not 8-byte aligned"),
+            "offset {}",
+            offset
+        );
+    }
+    // a store with a wrong-direction offset is rejected too
+    let err = step(&state, &BpfInsn::StStack { src: 1, offset: 8 }).unwrap_err();
+    assert!(err.message.contains("points away"));
+}
+
+#[test]
+fn stack_bounds_frame_edges() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    // both frame edges are valid
+    for offset in [-8, -512] {
+        let next = step(&state, &BpfInsn::StStack { src: 2, offset }).unwrap();
+        let idx = stack_slot_index(offset as i32).unwrap();
+        assert_eq!(next.stack.slots[idx], StackSlot::Scalar);
+    }
+    // one byte beyond each edge is rejected
+    for offset in [-7, -513] {
+        assert!(
+            step(&state, &BpfInsn::StStack { src: 2, offset }).is_err(),
+            "offset {}",
+            offset
+        );
+    }
+}
+
+#[test]
+fn stack_slot_index_mapping() {
+    assert_eq!(stack_slot_index(-8).unwrap(), 0);
+    assert_eq!(stack_slot_index(-16).unwrap(), 1);
+    assert_eq!(stack_slot_index(-512).unwrap(), 63);
+}
+
+// ── step (v0.2) ──────────────────────────────────────────────────────────
+
+#[test]
+fn step_mov_imm_issue_example() {
+    // Before: R2 = Uninit;  r2 = 10;  After: R2 = Scalar(10..10)
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+    // other registers untouched
+    assert_eq!(next.regs[1], RegState::PtrToCtx);
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_mov_imm_overwrites() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
+    assert_eq!(next.regs[2], RegState::Scalar { min: 20, max: 20 });
+}
+
+#[test]
+fn step_mov_imm_negative() {
+    // i32 imm is sign-extended into the i64 scalar range
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovImm { dst: 0, imm: -7 }).unwrap();
+    assert_eq!(next.regs[0], RegState::Scalar { min: -7, max: -7 });
+}
+
+#[test]
+fn step_mov_reg_copies_scalar() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovReg { dst: 3, src: 2 }).unwrap();
+    assert_eq!(next.regs[3], RegState::Scalar { min: 10, max: 10 });
+}
+
+#[test]
+fn step_mov_reg_copies_pointers() {
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::MovReg { dst: 4, src: 1 }).unwrap();
+    assert_eq!(next.regs[4], RegState::PtrToCtx);
+    let next = step(&state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_mov_reg_uninit_rejected() {
+    // issue example: r0 = r2 with R2 uninitialized → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap_err();
+    assert!(err.message.contains("r2"));
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_mov_reg_self_copy_uninit_rejected() {
+    // r2 = r2 with R2 uninitialized is still a read → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::MovReg { dst: 2, src: 2 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_mov_reg_uninit_after_write_ok() {
+    // r2 = 10 then r0 = r2 → the read is allowed once written
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap();
+    assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
+}
+
+#[test]
+fn step_exit_unchanged() {
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::Exit).unwrap();
+    assert_eq!(next, state);
+}
+
+#[test]
+fn step_stub_errors_reference_issue() {
+    let state = VerifierState::initial();
+    // control flow → #23
+    let err = step(
+        &state,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+    )
+    .unwrap_err();
+    assert!(err.message.contains("#23"));
+}
+
+#[test]
+fn step_invalid_register_rejected() {
+    let state = VerifierState::initial();
+    // dst 11 is out of range (valid: r0..r10)
+    let err = step(&state, &BpfInsn::MovImm { dst: 11, imm: 1 }).unwrap_err();
+    assert!(err.message.contains("invalid register r11"));
+    // src 12 is out of range
+    let err = step(&state, &BpfInsn::MovReg { dst: 0, src: 12 }).unwrap_err();
+    assert!(err.message.contains("invalid register r12"));
+}
+
+#[test]
+fn step_is_pure() {
+    // the input state is not mutated
+    let state = VerifierState::initial();
+    let _ = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    assert_eq!(state.regs[2], RegState::Uninit);
+}
+
+#[test]
+fn read_reg_initialized_regs() {
+    let state = VerifierState::initial();
+    // R1 (PtrToCtx) and R10 (PtrToStack) are readable at entry
+    assert_eq!(read_reg(&state, 1).unwrap(), RegState::PtrToCtx);
+    assert_eq!(
+        read_reg(&state, 10).unwrap(),
+        RegState::PtrToStack { offset: 0 }
+    );
+}
+
+#[test]
+fn read_reg_uninit_rejected() {
+    let state = VerifierState::initial();
+    let err = read_reg(&state, 2).unwrap_err();
+    assert!(err.message.contains("register r2 is uninitialized"));
+}
+
+#[test]
+fn read_reg_out_of_range_rejected() {
+    let state = VerifierState::initial();
+    let err = read_reg(&state, 11).unwrap_err();
+    assert!(err.message.contains("invalid register r11"));
+}
+
+// ── ALU (v0.2) ───────────────────────────────────────────────────────────
+
+#[test]
+fn step_add_imm_issue_example() {
+    // issue example: r1 = 10; r1 += 20 → R1 = Scalar(30..30)
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 30, max: 30 });
+}
+
+#[test]
+fn step_add_imm_negative() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: -3 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+}
+
+#[test]
+fn step_add_reg_constants() {
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 15, max: 15 });
+    // the source register is unchanged
+    assert_eq!(next.regs[2], RegState::Scalar { min: 5, max: 5 });
+}
+
+#[test]
+fn step_add_reg_self() {
+    // r1 += r1 doubles the value
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 1 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 20, max: 20 });
+}
+
+#[test]
+fn step_add_imm_range() {
+    // range shift, a preview of #16: [0, 100] + 10 → [10, 110]
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    let next = step(&state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 10, max: 110 });
+}
+
+#[test]
+fn step_add_reg_ranges() {
+    // [0, 100] + [5, 5] → [5, 105]
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+    let next = step(&state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+    assert_eq!(next.regs[1], RegState::Scalar { min: 5, max: 105 });
+}
+
+#[test]
+fn step_add_uninit_rejected() {
+    // r0 += 1 with R0 uninitialized → #14 error
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 1 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+    // r0 += r2 with R2 uninitialized → #14 error
+    let err = step(&state, &BpfInsn::AddReg { dst: 0, src: 2 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_add_ptr_rejected() {
+    // r1 += 10 with R1 = PtrToCtx → arithmetic on a context pointer is rejected
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap_err();
+    assert!(err.message.contains("context pointer"));
+    // r0 += r10 with R10 = PtrToStack → register-offset pointer arithmetic is rejected
+    let state = step(&state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
+    let err = step(&state, &BpfInsn::AddReg { dst: 0, src: 10 }).unwrap_err();
+    assert!(err.message.contains("register-offset"));
+    // r10 += r1 with R1 = PtrToCtx → a pointer destination is rejected too
+    let err = step(&state, &BpfInsn::AddReg { dst: 10, src: 1 }).unwrap_err();
+    assert!(err.message.contains("register-offset"));
+}
+
+// ── Pointer arithmetic (v0.2) ────────────────────────────────────────────
+
+#[test]
+fn step_add_imm_ptr_stack() {
+    // r10 += -8 → PtrToStack(-8): the frame pointer moves down one slot
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: -8 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_chain() {
+    // r10 += -8; r10 += -8 → offset -16
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: -16 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_copied_reg() {
+    // r5 = r10; r5 += -16 → a copied stack pointer moves independently
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
+    let next = step(&state, &BpfInsn::AddImm { dst: 5, imm: -16 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToStack { offset: -16 });
+    // the frame pointer itself is untouched
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn step_add_imm_ptr_stack_out_of_frame() {
+    // r10 += 8 → offset 8 points above the frame → REJECT
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: 8 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+    // r10 += -520 → offset -520 exceeds the frame → REJECT
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: -520 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+}
+
+#[test]
+fn step_add_imm_ptr_stack_bounds_edges() {
+    // offset -512 is the last valid slot; one step past it → REJECT
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::AddImm { dst: 10, imm: -512 }).unwrap();
+    assert_eq!(state.regs[10], RegState::PtrToStack { offset: -512 });
+    let err = step(&state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap_err();
+    assert!(err.message.contains("out of the"));
+}
+
+#[test]
+fn step_add_imm_ptr_stack_zero() {
+    // adding 0 keeps the pointer (no-op)
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::AddImm { dst: 10, imm: 0 }).unwrap();
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+// ── Trace (v0.2) ─────────────────────────────────────────────────────────
+
+#[test]
+fn disassemble_instructions() {
+    assert_eq!(disassemble(&BpfInsn::MovImm { dst: 2, imm: 10 }), "r2 = 10");
+    assert_eq!(disassemble(&BpfInsn::MovReg { dst: 0, src: 2 }), "r0 = r2");
+    assert_eq!(disassemble(&BpfInsn::AddImm { dst: 2, imm: 5 }), "r2 += 5");
+    assert_eq!(disassemble(&BpfInsn::AddReg { dst: 1, src: 2 }), "r1 += r2");
+    assert_eq!(
+        disassemble(&BpfInsn::LdStack { dst: 0, offset: -8 }),
+        "r0 = [r10-8]"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::StStack {
+            src: 2,
+            offset: -16
+        }),
+        "[r10-16] = r2"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1
+        }),
+        "if r1 == r2 goto +1"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: -2
+        }),
+        "if r1 > r2 goto -2"
+    );
+    assert_eq!(disassemble(&BpfInsn::Jmp { offset: 3 }), "goto +3");
+    assert_eq!(disassemble(&BpfInsn::Call { imm: 2 }), "call 2");
+    assert_eq!(disassemble(&BpfInsn::Exit), "exit");
+}
+
+#[test]
+fn trace_step_issue_example() {
+    // issue example: the first step shows the entry-relevant state
+    // (R0 plus every initialized register)…
+    let state = VerifierState::initial();
+    let after = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let trace = trace_step(0, &BpfInsn::MovImm { dst: 2, imm: 10 }, &state, &after);
+    assert_eq!(
+        trace,
+        "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n"
+    );
+    // …later steps show only the changed register
+    let after2 = step(&after, &BpfInsn::AddImm { dst: 2, imm: 5 }).unwrap();
+    let trace = trace_step(1, &BpfInsn::AddImm { dst: 2, imm: 5 }, &after, &after2);
+    assert_eq!(trace, "1: r2 += 5\n  R2 = SCALAR(15..15)\n");
+}
+
+#[test]
+fn run_trace_straight_line() {
+    let program = vec![
+        BpfInsn::MovImm { dst: 2, imm: 10 },
+        BpfInsn::AddImm { dst: 2, imm: 5 },
+        BpfInsn::Exit,
+    ];
+    let trace = run_trace(&program).unwrap();
+    assert_eq!(
+        trace,
+        "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n\n\
+         1: r2 += 5\n  R2 = SCALAR(15..15)\n\n\
+         2: exit\n\n"
+    );
+}
+
+#[test]
+fn run_trace_stops_on_unsupported() {
+    // control flow is not part of the micro subset → the trace stops
+    let program = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Exit];
+    let err = run_trace(&program).unwrap_err();
+    assert!(err.message.contains("#23"));
+}
+
+#[test]
+fn run_trace_full_sequence() {
+    // registers, stack, and pointers all visible in one trace
+    let program = vec![
+        BpfInsn::MovImm { dst: 2, imm: 10 },
+        BpfInsn::StStack { src: 2, offset: -8 },
+        BpfInsn::LdStack { dst: 0, offset: -8 },
+        BpfInsn::AddImm { dst: 10, imm: -8 },
+        BpfInsn::Exit,
+    ];
+    let trace = run_trace(&program).unwrap();
+    assert!(trace.contains("1: [r10-8] = r2\n"));
+    assert!(
+        trace.contains(
+            "2: r0 = [r10-8]\n  R0 = SCALAR(-9223372036854775808..9223372036854775807)\n"
+        )
+    );
+    assert!(trace.contains("3: r10 += -8\n  R10 = PTR_STACK(-8)\n"));
+}
+
+// ── Branch refinement (v0.2) ─────────────────────────────────────────────
+
+#[test]
+fn refine_gt_issue_example() {
+    // issue example: R1 = [0, 100]; if R1 > 50
+    // true: R1 = [51, 100], false: R1 = [0, 50]
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (50, 50));
+    assert_eq!(true_dst, (51, 100));
+    assert_eq!(true_src, (50, 50));
+    assert_eq!(false_dst, (0, 50));
+    assert_eq!(false_src, (50, 50));
+}
+
+#[test]
+fn refine_gt_both_ranges() {
+    // dst = [0, 100], src = [20, 200]: on the true branch both operands
+    // narrow (dst >= src.min + 1, src <= dst.max - 1)
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (20, 200));
+    assert_eq!(true_dst, (21, 100));
+    assert_eq!(true_src, (20, 99));
+    // the false branch adds no constraint here (dst <= 200, src >= 0
+    // are already implied by the ranges)
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (20, 200));
+}
+
+#[test]
+fn refine_gt_self() {
+    // r1 > r1 with r1 = [0, 100]: both sides of the comparison are
+    // refined, so the true branch narrows to the empty range
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (0, 100));
+    assert_eq!(true_dst, (1, 100));
+    assert_eq!(true_src, (0, 99));
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (0, 100));
+}
+
+#[test]
+fn refine_gt_infeasible_true_branch() {
+    // dst = [0, 100] vs src = [100, 100]: dst > 100 is impossible,
+    // so the true branch narrows to an empty range (min > max)
+    let ((true_dst, _), _) = refine_gt((0, 100), (100, 100));
+    assert!(true_dst.0 > true_dst.1);
+}
+
+#[test]
+fn refine_eq_intersection() {
+    // dst = [0, 100], src = [40, 60]: equality means both must be in [40, 60]
+    let ((true_dst, true_src), (false_dst, false_src)) = refine_eq((0, 100), (40, 60));
+    assert_eq!(true_dst, (40, 60));
+    assert_eq!(true_src, (40, 60));
+    // false branch keeps both ranges (no safe single-interval narrowing)
+    assert_eq!(false_dst, (0, 100));
+    assert_eq!(false_src, (40, 60));
+}
+
+#[test]
+fn refine_eq_disjoint() {
+    // disjoint ranges: equality is impossible → true branch is empty
+    let ((true_dst, true_src), _) = refine_eq((0, 10), (20, 30));
+    assert!(true_dst.0 > true_dst.1);
+    assert!(true_src.0 > true_src.1);
+}
+
+#[test]
+fn refine_eq_constants() {
+    // two constants: r1 = 5, r2 = 5 → true branch keeps 5..5
+    let ((true_dst, _), _) = refine_eq((5, 5), (5, 5));
+    assert_eq!(true_dst, (5, 5));
+}
+
+#[test]
+fn refine_gt_extremes() {
+    // wrapping at i64 extremes stays sound (never panics)
+    let ((true_dst, true_src), _) = refine_gt((i64::MIN, i64::MAX), (0, 0));
+    assert_eq!(true_dst, (1, i64::MAX));
+    // src.max = 0 is already below dst.max - 1, so src stays [0, 0]
+    assert_eq!(true_src, (0, 0));
+    // src.min + 1 wraps to i64::MIN; dst is kept soundly (the branch is
+    // actually infeasible, but over-approximation is allowed)
+    let ((true_dst, _), _) = refine_gt((0, i64::MAX), (i64::MAX, i64::MAX));
+    assert_eq!(true_dst.0, 0);
+    // dst.max - 1 wraps when dst.max = i64::MIN; dst stays [MIN, MIN] so
+    // the true branch narrows to an empty range (dst > src is impossible)
+    let ((true_dst, _), _) = refine_gt((i64::MIN, i64::MIN), (i64::MIN, i64::MIN));
+    assert!(true_dst.0 > true_dst.1);
+}
+
 // ── add_subprog / register_subprog ───────────────────────────────────────
 
 #[test]
@@ -454,6 +1178,71 @@ fn corpus_reject_all() {
             continue;
         }
         match verify_corpus_program(&path) {
+            Verdict::Safe => panic!("reject program {:?} was accepted", path),
+            Verdict::Unsafe(failure) => {
+                println!("rejected as expected: {:?} → {}", path, failure);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 0, "no reject programs found in {:?}", dir);
+}
+
+// ── micro test corpus (file fixtures) ────────────────────────────────────
+
+/// Run the full pipeline on a micro corpus program: structural checks
+/// (nano) first, then straight-line abstract execution (micro).
+fn verify_micro_corpus_program(path: &std::path::Path) -> Verdict {
+    let mut env = BpfVerifierEnv::new();
+    env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+
+    // structural pass (nano): the CFG must be valid
+    if let Verdict::Unsafe(failure) = env.verify().unwrap() {
+        return Verdict::Unsafe(failure);
+    }
+
+    // semantic pass (micro): straight-line abstract execution;
+    // the worklist driver (#23) will supersede run_trace
+    match run_trace(&env.prog.insns) {
+        Ok(_) => Verdict::Safe,
+        Err(failure) => Verdict::Unsafe(failure),
+    }
+}
+
+/// Every program under tests/programs/micro/accept/ must pass verification.
+#[test]
+fn corpus_micro_accept_all() {
+    let dir = std::path::Path::new("tests/programs/micro/accept");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        let verdict = verify_micro_corpus_program(&path);
+        assert!(
+            matches!(verdict, Verdict::Safe),
+            "accept program {:?} was rejected",
+            path
+        );
+        count += 1;
+    }
+    assert!(count > 0, "no accept programs found in {:?}", dir);
+}
+
+/// Every program under tests/programs/micro/reject/ must fail verification.
+#[test]
+fn corpus_micro_reject_all() {
+    let dir = std::path::Path::new("tests/programs/micro/reject");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        match verify_micro_corpus_program(&path) {
             Verdict::Safe => panic!("reject program {:?} was accepted", path),
             Verdict::Unsafe(failure) => {
                 println!("rejected as expected: {:?} → {}", path, failure);
