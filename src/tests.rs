@@ -1187,3 +1187,68 @@ fn corpus_reject_all() {
     }
     assert!(count > 0, "no reject programs found in {:?}", dir);
 }
+
+// ── micro test corpus (file fixtures) ────────────────────────────────────
+
+/// Run the full pipeline on a micro corpus program: structural checks
+/// (nano) first, then straight-line abstract execution (micro).
+fn verify_micro_corpus_program(path: &std::path::Path) -> Verdict {
+    let mut env = BpfVerifierEnv::new();
+    env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+
+    // structural pass (nano): the CFG must be valid
+    if let Verdict::Unsafe(failure) = env.verify().unwrap() {
+        return Verdict::Unsafe(failure);
+    }
+
+    // semantic pass (micro): straight-line abstract execution;
+    // the worklist driver (#23) will supersede run_trace
+    match run_trace(&env.prog.insns) {
+        Ok(_) => Verdict::Safe,
+        Err(failure) => Verdict::Unsafe(failure),
+    }
+}
+
+/// Every program under tests/programs/micro/accept/ must pass verification.
+#[test]
+fn corpus_micro_accept_all() {
+    let dir = std::path::Path::new("tests/programs/micro/accept");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        let verdict = verify_micro_corpus_program(&path);
+        assert!(
+            matches!(verdict, Verdict::Safe),
+            "accept program {:?} was rejected",
+            path
+        );
+        count += 1;
+    }
+    assert!(count > 0, "no accept programs found in {:?}", dir);
+}
+
+/// Every program under tests/programs/micro/reject/ must fail verification.
+#[test]
+fn corpus_micro_reject_all() {
+    let dir = std::path::Path::new("tests/programs/micro/reject");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        match verify_micro_corpus_program(&path) {
+            Verdict::Safe => panic!("reject program {:?} was accepted", path),
+            Verdict::Unsafe(failure) => {
+                println!("rejected as expected: {:?} → {}", path, failure);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 0, "no reject programs found in {:?}", dir);
+}
