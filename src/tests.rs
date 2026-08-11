@@ -121,8 +121,8 @@ fn reg_state_initial_state() {
     assert_eq!(regs[1], RegState::PtrToCtx);
 
     // R2..R9 = Uninit
-    for i in 2..=9 {
-        assert_eq!(regs[i], RegState::Uninit);
+    for reg in &regs[2..=9] {
+        assert_eq!(*reg, RegState::Uninit);
     }
 
     // R10 = PtrToStack(0)
@@ -175,8 +175,8 @@ fn verifier_state_initial_matches_issue_spec() {
     assert_eq!(state.regs[1], RegState::PtrToCtx);
 
     // R2..R9 = Uninit
-    for i in 2..=9 {
-        assert_eq!(state.regs[i], RegState::Uninit);
+    for reg in &state.regs[2..=9] {
+        assert_eq!(*reg, RegState::Uninit);
     }
 
     // R10 = PtrToStack(0)
