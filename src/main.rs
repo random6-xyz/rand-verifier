@@ -455,6 +455,73 @@ fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
     ((inter, inter), (dst, src))
 }
 
+// ── Execution trace (v0.2 Micro) ─────────────────────────────────────────────
+
+/// Render a single instruction in a readable eBPF-like syntax.
+fn disassemble(insn: &BpfInsn) -> String {
+    match insn {
+        BpfInsn::MovImm { dst, imm } => format!("r{} = {}", dst, imm),
+        BpfInsn::MovReg { dst, src } => format!("r{} = r{}", dst, src),
+        BpfInsn::AddImm { dst, imm } => format!("r{} += {}", dst, imm),
+        BpfInsn::AddReg { dst, src } => format!("r{} += r{}", dst, src),
+        BpfInsn::LdStack { dst, offset } => format!("r{} = [r10{:+}]", dst, offset),
+        BpfInsn::StStack { src, offset } => format!("[r10{:+}] = r{}", offset, src),
+        BpfInsn::Jeq { dst, src, offset } => {
+            format!("if r{} == r{} goto {:+}", dst, src, offset)
+        }
+        BpfInsn::Jgt { dst, src, offset } => {
+            format!("if r{} > r{} goto {:+}", dst, src, offset)
+        }
+        BpfInsn::Jmp { offset } => format!("goto {:+}", offset),
+        BpfInsn::Call { imm } => format!("call {}", imm),
+        BpfInsn::Exit => "exit".to_string(),
+    }
+}
+
+/// Render one trace entry for a step: the disassembled instruction
+/// followed by the interesting registers.
+///
+/// The first step shows the entry-relevant state (R0, the exit-value
+/// register, plus every initialized register); later steps show only the
+/// registers whose state changed, mirroring the #21 example.
+fn trace_step(pc: u32, insn: &BpfInsn, before: &VerifierState, after: &VerifierState) -> String {
+    let mut out = format!("{}: {}\n", pc, disassemble(insn));
+    if pc == 0 {
+        // R0 is the exit value — always shown at the start
+        out.push_str(&format!("  R0 = {}\n", after.regs[0]));
+        for (i, reg) in after.regs.iter().enumerate().skip(1) {
+            if *reg != RegState::Uninit {
+                out.push_str(&format!("  R{} = {}\n", i, reg));
+            }
+        }
+    } else {
+        for (i, (before, after)) in before.regs.iter().zip(&after.regs).enumerate() {
+            if before != after {
+                out.push_str(&format!("  R{} = {}\n", i, after));
+            }
+        }
+    }
+    out
+}
+
+/// Execute a straight-line program and render the execution trace.
+///
+/// Micro-stage driver: steps through every instruction in order and stops
+/// at the first unsupported one (control flow, #23). The worklist driver
+/// (#23) will supersede this.
+#[allow(dead_code)] // wired into the CLI once the worklist driver lands (#23)
+fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
+    let mut out = String::new();
+    let mut state = VerifierState::initial();
+    for (pc, insn) in program.iter().enumerate() {
+        let next = step(&state, insn)?;
+        out.push_str(&trace_step(pc as u32, insn, &state, &next));
+        out.push('\n');
+        state = next;
+    }
+    Ok(out)
+}
+
 /// Validate and register a single call target as a subprogram entry point.
 fn register_subprog(
     call_idx: u32,

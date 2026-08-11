@@ -642,6 +642,107 @@ fn step_add_imm_ptr_stack_zero() {
     assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
 }
 
+// ── Trace (v0.2) ─────────────────────────────────────────────────────────
+
+#[test]
+fn disassemble_instructions() {
+    assert_eq!(disassemble(&BpfInsn::MovImm { dst: 2, imm: 10 }), "r2 = 10");
+    assert_eq!(disassemble(&BpfInsn::MovReg { dst: 0, src: 2 }), "r0 = r2");
+    assert_eq!(disassemble(&BpfInsn::AddImm { dst: 2, imm: 5 }), "r2 += 5");
+    assert_eq!(disassemble(&BpfInsn::AddReg { dst: 1, src: 2 }), "r1 += r2");
+    assert_eq!(
+        disassemble(&BpfInsn::LdStack { dst: 0, offset: -8 }),
+        "r0 = [r10-8]"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::StStack {
+            src: 2,
+            offset: -16
+        }),
+        "[r10-16] = r2"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1
+        }),
+        "if r1 == r2 goto +1"
+    );
+    assert_eq!(
+        disassemble(&BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: -2
+        }),
+        "if r1 > r2 goto -2"
+    );
+    assert_eq!(disassemble(&BpfInsn::Jmp { offset: 3 }), "goto +3");
+    assert_eq!(disassemble(&BpfInsn::Call { imm: 2 }), "call 2");
+    assert_eq!(disassemble(&BpfInsn::Exit), "exit");
+}
+
+#[test]
+fn trace_step_issue_example() {
+    // issue example: the first step shows the entry-relevant state
+    // (R0 plus every initialized register)…
+    let state = VerifierState::initial();
+    let after = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
+    let trace = trace_step(0, &BpfInsn::MovImm { dst: 2, imm: 10 }, &state, &after);
+    assert_eq!(
+        trace,
+        "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n"
+    );
+    // …later steps show only the changed register
+    let after2 = step(&after, &BpfInsn::AddImm { dst: 2, imm: 5 }).unwrap();
+    let trace = trace_step(1, &BpfInsn::AddImm { dst: 2, imm: 5 }, &after, &after2);
+    assert_eq!(trace, "1: r2 += 5\n  R2 = SCALAR(15..15)\n");
+}
+
+#[test]
+fn run_trace_straight_line() {
+    let program = vec![
+        BpfInsn::MovImm { dst: 2, imm: 10 },
+        BpfInsn::AddImm { dst: 2, imm: 5 },
+        BpfInsn::Exit,
+    ];
+    let trace = run_trace(&program).unwrap();
+    assert_eq!(
+        trace,
+        "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n\n\
+         1: r2 += 5\n  R2 = SCALAR(15..15)\n\n\
+         2: exit\n\n"
+    );
+}
+
+#[test]
+fn run_trace_stops_on_unsupported() {
+    // control flow is not part of the micro subset → the trace stops
+    let program = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Exit];
+    let err = run_trace(&program).unwrap_err();
+    assert!(err.message.contains("#23"));
+}
+
+#[test]
+fn run_trace_full_sequence() {
+    // registers, stack, and pointers all visible in one trace
+    let program = vec![
+        BpfInsn::MovImm { dst: 2, imm: 10 },
+        BpfInsn::StStack { src: 2, offset: -8 },
+        BpfInsn::LdStack { dst: 0, offset: -8 },
+        BpfInsn::AddImm { dst: 10, imm: -8 },
+        BpfInsn::Exit,
+    ];
+    let trace = run_trace(&program).unwrap();
+    assert!(trace.contains("1: [r10-8] = r2\n"));
+    assert!(
+        trace.contains(
+            "2: r0 = [r10-8]\n  R0 = SCALAR(-9223372036854775808..9223372036854775807)\n"
+        )
+    );
+    assert!(trace.contains("3: r10 += -8\n  R10 = PTR_STACK(-8)\n"));
+}
+
 // ── Branch refinement (v0.2) ─────────────────────────────────────────────
 
 #[test]
