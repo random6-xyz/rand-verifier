@@ -23,10 +23,16 @@ fn main() -> Result<()> {
     match bpf_verifier_env.verify()? {
         Verdict::Safe => {
             println!("Verification passed");
+            if let Some(report) = bpf_verifier_env.concrete_report_text() {
+                println!("{}", report);
+            }
             Ok(())
         }
         Verdict::Unsafe(failure) => {
             println!("{}", failure);
+            if let Some(report) = bpf_verifier_env.concrete_report_text() {
+                println!("{}", report);
+            }
             Ok(())
         }
     }

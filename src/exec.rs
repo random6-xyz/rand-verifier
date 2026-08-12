@@ -187,8 +187,13 @@ fn alu_imm(
     width: AluWidth,
 ) -> Result<VerifierState, VerificationFailure> {
     check_reg(pc, dst)?;
-    // shifts require a provable amount in 0..64 (kernel check_alu_op)
-    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && !(0..64).contains(&imm) {
+    // shifts require an amount below the width (kernel check_alu_op:
+    // "< 64 range, for 32-bit < 32 range")
+    let bitness: i32 = match width {
+        AluWidth::W64 => 64,
+        AluWidth::W32 => 32,
+    };
+    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && !(0..bitness).contains(&imm) {
         return Err(VerificationFailure::new(
             pc,
             format!("invalid shift amount {}", imm),
@@ -313,9 +318,10 @@ fn alu_reg(
         }
     };
     let s = read_scalar(pc, state, src)?;
-    // shifts require a provable amount in 0..64 (kernel check_alu_op)
+    // shifts require a provable amount below the width (kernel
+    // check_alu_op: "< 64 range, for 32-bit < 32 range")
     if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
-        check_shift_amount(pc, s)?;
+        check_shift_amount(pc, s, width)?;
     }
     let next_bounds = apply_alu(op, width, d, s);
     let mut next = *state;
@@ -505,7 +511,7 @@ fn interval_mod(lo: i64, hi: i64) -> (u32, u32) {
     }
 }
 
-/// 32-bit shift ranges; the amount is validated in 0..64 by the caller.
+/// 32-bit shift ranges; the amount is validated below 32 by the caller.
 fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
     if s.0 != s.1 {
         // unknown amount: coarse but sound
@@ -552,8 +558,9 @@ fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
 }
 
 /// Exact 64-bit ALU on constant bits (wrapping is exact bit arithmetic).
-/// Shift amounts are validated by the caller.
-fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
+/// Shift amounts are validated by the caller. Shared with the concrete
+/// interpreter (#50) so both sides use the same bit-level operation.
+pub(crate) fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
     match op {
         AluOp::Add => a.wrapping_add(b),
         AluOp::Sub => a.wrapping_sub(b),
@@ -567,7 +574,8 @@ fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
 }
 
 /// Exact 32-bit ALU on constant bits: truncate, compute, zero-extend.
-fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
+/// Shared with the concrete interpreter (#50).
+pub(crate) fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
     let a = a as u32;
     let b = b as u32;
     let r = match op {
@@ -585,11 +593,20 @@ fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
     r as u64
 }
 
-/// Validate a shift amount: the kernel rejects shifts that are not provably
-/// in `0..64` (check_alu_op's "invalid shift"). Both interpretations are
-/// consulted so a diverged state cannot smuggle an invalid amount.
-fn check_shift_amount(pc: u32, s: ScalarBounds) -> Result<(), VerificationFailure> {
-    if s.smin < 0 || s.smax >= 64 || s.umax >= 64 {
+/// Validate a shift amount: the kernel rejects shifts that are not
+/// provably below the width (check_alu_op's "invalid shift": "< 64
+/// range, for 32-bit < 32 range"). Both interpretations are consulted
+/// so a diverged state cannot smuggle an invalid amount.
+fn check_shift_amount(
+    pc: u32,
+    s: ScalarBounds,
+    width: AluWidth,
+) -> Result<(), VerificationFailure> {
+    let bitness: i64 = match width {
+        AluWidth::W64 => 64,
+        AluWidth::W32 => 32,
+    };
+    if s.smin < 0 || s.smax >= bitness || s.umax >= bitness as u64 {
         return Err(VerificationFailure::new(
             pc,
             format!("invalid shift amount range [{}, {}]", s.smin, s.smax),

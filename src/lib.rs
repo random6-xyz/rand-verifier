@@ -6,6 +6,7 @@
 //! - [`state`] — abstract register/stack state (micro pass)
 //! - [`exec`] — abstract instruction execution and branch expansion
 //! - [`cfg`] — control flow graph checks (nano pass)
+//! - [`concrete`] — concrete execution state model (v0.5)
 //! - [`mini`] — path-sensitive exploration (mini pass)
 //! - [`helper`] — helper function prototypes and argument validation
 //! - [`tnum`] — tracked number abstraction (not wired into `RegState` yet)
@@ -14,6 +15,7 @@
 //! - [`env`] — program loading and the full verification pipeline
 
 pub mod cfg;
+pub mod concrete;
 pub mod env;
 pub mod error;
 pub mod exec;
