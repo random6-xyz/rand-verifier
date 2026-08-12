@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 
@@ -80,7 +81,7 @@ const NUM_REGS: usize = 11;
 /// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RegState {
     Uninit,
     Scalar { min: i64, max: i64 },
@@ -125,7 +126,7 @@ const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 ///
 /// Slot-level granularity (not byte-level) keeps the model approachable;
 /// scalar ranges and spilled pointer states are not tracked here yet (#30).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StackSlot {
     Uninit,
     Scalar,
@@ -141,7 +142,7 @@ impl std::fmt::Display for StackSlot {
 }
 
 /// Abstract stack state: one slot per 8-byte cell of the 512-byte frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct StackState {
     slots: [StackSlot; STACK_SLOTS],
 }
@@ -196,7 +197,7 @@ fn stack_slot_index(offset: i32) -> Result<usize, VerificationFailure> {
 /// Unified verifier state carried through instruction simulation.
 ///
 /// Holds the abstract state of all 11 registers plus the stack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VerifierState {
     regs: [RegState; NUM_REGS],
     stack: StackState,
@@ -724,20 +725,36 @@ fn cond_branch(
 ///
 /// - states are processed LIFO (depth-first), like the kernel's
 ///   push_stack/pop_stack verifier stack
+/// - a (pc, state) pair is analyzed at most once (cf. the kernel's
+///   is_state_visited): step() is pure, so revisiting the same pair
+///   would only repeat the same outcome — the first defense against
+///   state explosion (#25)
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
 ///   R0 !read_ok check at exit)
 /// - branches ruled out by the static verdict (#24) are never explored
 /// - termination is guaranteed because the nano pass (#6) rejects loops,
-///   so the CFG is acyclic; state dedup (#25/#26) and complexity limits
-///   (#32) come later
+///   so the CFG is acyclic; state subsumption (#26) and complexity
+///   limits (#32) come later
+///
+/// Returns the number of distinct (pc, state) pairs analyzed.
 #[allow(dead_code)] // consumed by the mini corpus runner (#33)
-fn verify_mini(program: &[BpfInsn]) -> Result<(), VerificationFailure> {
+fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
     }];
+    // distinct (pc, state) pairs already analyzed, grouped by pc:
+    // duplicates only matter at the same instruction
+    let mut visited: HashMap<u32, HashSet<VerifierState>> = HashMap::new();
+    let mut explored = 0usize;
 
     while let Some(item) = worklist.pop() {
+        // skip pairs that were already analyzed
+        if !visited.entry(item.pc).or_default().insert(item.state) {
+            continue;
+        }
+        explored += 1;
+
         let insn = program.get(item.pc as usize).ok_or_else(|| {
             VerificationFailure::new(item.pc, "internal error: pc out of program range")
         })?;
@@ -756,7 +773,7 @@ fn verify_mini(program: &[BpfInsn]) -> Result<(), VerificationFailure> {
             });
         }
     }
-    Ok(())
+    Ok(explored)
 }
 
 /// Validate and register a single call target as a subprogram entry point.

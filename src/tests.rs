@@ -1660,3 +1660,51 @@ fn verify_mini_jgt_never_taken_prunes_taken() {
     ];
     assert!(verify_mini(&program).is_ok());
 }
+
+#[test]
+fn verify_mini_dedup_join_state() {
+    // both branches rejoin at pc 4 with the same state (r0 = 1); the
+    // second visit is skipped (is_state_visited), so 5 distinct
+    // (pc, state) pairs are analyzed instead of 6:
+    // 0: jeq r10, r10, +2 → taken 3, fall 1
+    // 1: r0 = 1
+    // 2: jmp +1 → 4
+    // 3: r0 = 1
+    // 4: exit
+    let program = vec![
+        BpfInsn::Jeq {
+            dst: 10,
+            src: 10,
+            offset: 2,
+        },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Jmp { offset: 1 },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Exit,
+    ];
+    assert_eq!(verify_mini(&program).unwrap(), 5);
+}
+
+#[test]
+fn verify_mini_dedup_distinct_join_states_not_merged() {
+    // if the two branches write different values, the join states differ
+    // and both are analyzed:
+    // 0: jeq r10, r10, +2 → taken 3, fall 1
+    // 1: r0 = 1
+    // 2: jmp +1 → 4
+    // 3: r0 = 2
+    // 4: exit
+    let program = vec![
+        BpfInsn::Jeq {
+            dst: 10,
+            src: 10,
+            offset: 2,
+        },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Jmp { offset: 1 },
+        BpfInsn::MovImm { dst: 0, imm: 2 },
+        BpfInsn::Exit,
+    ];
+    // (4, r0=1) and (4, r0=2) are distinct → both counted
+    assert_eq!(verify_mini(&program).unwrap(), 6);
+}
