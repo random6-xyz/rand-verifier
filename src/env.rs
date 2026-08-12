@@ -119,31 +119,38 @@ impl BpfVerifierEnv {
         failure: crate::error::VerificationFailure,
         loop_heads: &[u32],
     ) -> Result<Verdict> {
-        let note = match run_concrete(&self.prog.insns, loop_heads) {
-            Err(concrete_failure) => Some(format!(
-                "concrete cross-check: also fails {}",
-                concrete_failure
-            )),
-            Ok(run) if run.inconclusive => Some(
-                "concrete cross-check: inconclusive (non-terminating loop candidate)".to_string(),
-            ),
-            Ok(_) => Some(
-                "concrete cross-check: the program executes concretely — precision candidate"
-                    .to_string(),
-            ),
-        };
-        self.concrete_report = Some(ConcreteReport {
-            violations: Vec::new(),
-            inconclusive: false,
-            unexpected_failure: None,
-            reject_note: note,
-        });
+        let mut report = ConcreteReport::default();
+        match run_concrete(&self.prog.insns, loop_heads) {
+            Err(concrete_failure) => {
+                report.reject_note = Some(format!(
+                    "concrete cross-check: also fails {}",
+                    concrete_failure
+                ));
+            }
+            Ok(run) if run.inconclusive => {
+                // keep the structured flag in sync with the note
+                report.inconclusive = true;
+                report.reject_note = Some(
+                    "concrete cross-check: inconclusive (non-terminating loop candidate)"
+                        .to_string(),
+                );
+            }
+            Ok(_) => {
+                report.reject_note = Some(
+                    "concrete cross-check: the program executes concretely — precision candidate"
+                        .to_string(),
+                );
+            }
+        }
+        self.concrete_report = Some(report);
         Ok(Verdict::Unsafe(failure))
     }
 
     /// The concrete-side report of the last verification: rendered text
-    /// when something needs attention, `None` when the concrete run
-    /// agreed with the verdict.
+    /// when the concrete side has anything noteworthy — coverage
+    /// violations, an inconclusive run, an unexpected concrete failure,
+    /// or a reject cross-check note. `None` only for a clean accept
+    /// (no violations, conclusive run, no failures).
     pub fn concrete_report_text(&self) -> Option<String> {
         let report = self.concrete_report.as_ref()?;
         let mut out = String::new();
@@ -446,6 +453,8 @@ mod tests {
         let (verdict, env) = verify_temp_program(&insns, "reject_loop");
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let report = env.concrete_report.as_ref().unwrap();
+        // the structured flag stays in sync with the note
+        assert!(report.inconclusive);
         let note = report.reject_note.as_deref().expect("reject note");
         assert!(note.contains("inconclusive"), "note: {}", note);
     }

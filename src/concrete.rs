@@ -324,9 +324,13 @@ fn concrete_alu_imm(
     width: AluWidth,
 ) -> Result<ConcreteState, ConcreteFailure> {
     check_concrete_reg(pc, dst)?;
-    // shifts require a provable amount in 0..64 (mirror of the abstract
-    // alu_imm check, which applies to both widths)
-    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && !(0..64).contains(&imm) {
+    // shifts require an amount below the width (mirror of the abstract
+    // alu_imm check — kernel: "< 64 range, for 32-bit < 32 range")
+    let bitness: i32 = match width {
+        AluWidth::W64 => 64,
+        AluWidth::W32 => 32,
+    };
+    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && !(0..bitness).contains(&imm) {
         return Err(ConcreteFailure::InvalidShiftAmount {
             pc,
             amount: imm as i64 as u64,
@@ -379,10 +383,14 @@ fn concrete_alu_reg(
     let src_value = read_concrete_reg(pc, state, src)?;
     match (dst_value, src_value) {
         (ConcreteValue::Scalar(d), ConcreteValue::Scalar(s)) => {
-            // shifts require an amount in 0..64: the abstract
-            // check_shift_amount rejects smin < 0 or umax >= 64, which
-            // collapses to s >= 64 for a single value
-            if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && s >= 64 {
+            // shifts require an amount below the width (mirror of the
+            // abstract check_shift_amount, which collapses to
+            // s >= bitness for a single value)
+            let bitness = match width {
+                AluWidth::W64 => 64,
+                AluWidth::W32 => 32,
+            };
+            if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && s >= bitness as u64 {
                 return Err(ConcreteFailure::InvalidShiftAmount { pc, amount: s });
             }
             let result = alu_value(op, width, d, s);
@@ -1532,15 +1540,39 @@ mod tests {
     }
 
     #[test]
-    fn alu32_imm_shift_large_accepted() {
-        // the abstract accepts ALU32 immediate shifts up to 63 (the
-        // 0..64 check applies to both widths); a shift by 40 of a 32-bit
-        // value is 0 (checked shift semantics)
+    fn alu32_imm_shift_large_rejected() {
+        // kernel parity (review fix): ALU32 shifts require an amount
+        // below 32, while ALU64 accepts the same amount (0..64)
+        let err = concrete_step(
+            1,
+            &ConcreteState::initial(),
+            &BpfInsn::Lsh32Imm { dst: 2, imm: 40 },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConcreteFailure::InvalidShiftAmount { pc: 1, amount: 40 }
+        );
+        // the same amount is valid for ALU64
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: 1 },
-            BpfInsn::Lsh32Imm { dst: 2, imm: 40 },
+            BpfInsn::LshImm { dst: 2, imm: 40 },
         ]);
-        assert_eq!(state.regs[2], Some(ConcreteValue::Scalar(0)));
+        assert_eq!(state.regs[2], Some(ConcreteValue::Scalar(1 << 40)));
+    }
+
+    #[test]
+    fn alu32_reg_shift_large_rejected() {
+        // ALU32 register shifts also require an amount below 32
+        let state = run(&[
+            BpfInsn::MovImm { dst: 2, imm: 1 },
+            BpfInsn::MovImm { dst: 3, imm: 40 },
+        ]);
+        let err = concrete_step(2, &state, &BpfInsn::Lsh32Reg { dst: 2, src: 3 }).unwrap_err();
+        assert_eq!(
+            err,
+            ConcreteFailure::InvalidShiftAmount { pc: 2, amount: 40 }
+        );
     }
 
     #[test]
