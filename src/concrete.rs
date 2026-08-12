@@ -9,7 +9,10 @@
 //! this actual value? Since #50 the concrete side is type-aware — a scalar
 //! holding the same bits as a stack address is not a stack pointer.
 
-use crate::exec::{AluOp, AluWidth, alu_const32, alu_const64};
+use std::collections::HashMap;
+
+use crate::exec::{AluOp, AluWidth, CondOp, alu_const32, alu_const64, branch_target};
+use crate::helper::{ArgType, HelperPrototype, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
     ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOT_SIZE, STACK_SLOTS, ScalarBounds,
@@ -92,6 +95,21 @@ pub(crate) enum ConcreteFailure {
     /// A shift amount outside the accepted range (mirrors the abstract
     /// 0..64 check for both widths, `check_shift_amount`).
     InvalidShiftAmount { pc: u32, amount: u64 },
+    /// An unknown helper id (mirrors the abstract "unknown helper").
+    UnknownHelper { pc: u32, imm: i32 },
+    /// A helper argument that does not match the prototype (mirrors
+    /// `check_helper_args`, #28).
+    HelperArgMismatch { pc: u32, arg: u8 },
+    /// A comparison the abstract rejects: pointer ordering or mixed
+    /// pointer/scalar types (mirrors `cond_branch`).
+    InvalidComparison { pc: u32, dst: u8, src: u8 },
+    /// A helper whose abstract return type has no concrete counterpart
+    /// yet (pointer returns). Unreachable for the current corpus —
+    /// map_lookup fixtures fail at argument validation.
+    UnsupportedHelperReturn { pc: u32, imm: i32 },
+    /// A jump target outside the program (defensive: the structural
+    /// pass rejects invalid targets before this driver runs).
+    InternalError { pc: u32 },
 }
 
 /// Does the tnum admit the value? The known bits (`!mask`) must match;
@@ -514,6 +532,324 @@ pub(crate) fn concrete_step(
             next.regs[*dst as usize] = Some(value);
             Ok(next)
         }
+    }
+}
+
+// ── Concrete path exploration (#51) ────────────────────────────────────────
+
+/// Exploration bounds, mirroring `VerifierLimits` (#32/#46). Exceeding
+/// any of them marks the run inconclusive — concrete exploration cannot
+/// prove non-termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConcreteLimits {
+    /// Maximum number of distinct (pc, state) pairs analyzed.
+    pub(crate) max_states: usize,
+    /// Maximum number of worklist steps (states popped).
+    pub(crate) max_steps: usize,
+    /// Maximum number of distinct re-visits of one loop head: a head
+    /// that keeps producing new states is not converging. Mirrors the
+    /// abstract loop budget, so accepted programs terminate before it.
+    pub(crate) max_loop_iterations: usize,
+}
+
+impl Default for ConcreteLimits {
+    fn default() -> Self {
+        Self {
+            max_states: 1024,
+            max_steps: 100_000,
+            max_loop_iterations: 256,
+        }
+    }
+}
+
+/// The state at a reached `exit` (the exit pc plus the full state,
+/// including `R0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConcreteOutcome {
+    pub(crate) pc: u32,
+    pub(crate) state: ConcreteState,
+}
+
+/// The result of a concrete exploration: every distinct visited state
+/// (in visit order, for the coverage checker #52) plus the exit
+/// outcomes. `inconclusive` means an exploration budget was hit — the
+/// run proves nothing (non-terminating loop candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConcreteRun {
+    pub(crate) visited: Vec<(u32, ConcreteState)>,
+    pub(crate) outcomes: Vec<ConcreteOutcome>,
+    pub(crate) inconclusive: bool,
+}
+
+/// Explore a program with the default limits. `loop_heads` are the
+/// targets of back edges from the structural pass (like `verify_mini`).
+#[allow(dead_code)] // wired into the pipeline (#53); used by tests
+pub(crate) fn run_concrete(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+) -> Result<ConcreteRun, ConcreteFailure> {
+    run_concrete_with_limits(program, loop_heads, &ConcreteLimits::default())
+}
+
+/// `run_concrete` with explicit exploration limits.
+///
+/// Mirrors `verify_mini_with_limits`: a worklist of `(pc, state)` pairs,
+/// processed LIFO. Concrete states are exact, so deduplication is state
+/// equality (the abstract side uses subsumption); a deterministic loop
+/// converges by reaching its exit, and a loop that never converges hits
+/// the loop-head budget → inconclusive.
+#[allow(dead_code)] // wired into the pipeline (#53); used by tests
+pub(crate) fn run_concrete_with_limits(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+    limits: &ConcreteLimits,
+) -> Result<ConcreteRun, ConcreteFailure> {
+    let mut worklist = vec![(0u32, ConcreteState::initial())];
+    // states already visited at each pc, for exact-state deduplication
+    let mut visited: HashMap<u32, Vec<ConcreteState>> = HashMap::new();
+    // visit order of the distinct states — the input of #52
+    let mut visited_order: Vec<(u32, ConcreteState)> = Vec::new();
+    // distinct re-visits per loop head (#46): exceeding the budget means
+    // the loop never converges → inconclusive (concrete cannot prove
+    // non-termination, so this is not a REJECT)
+    let mut loop_iters: HashMap<u32, usize> = HashMap::new();
+    let mut outcomes: Vec<ConcreteOutcome> = Vec::new();
+    let mut steps = 0usize;
+    let mut explored = 0usize;
+
+    while let Some((pc, state)) = worklist.pop() {
+        // worklist bound: every pop counts, even skipped ones
+        steps += 1;
+        if steps > limits.max_steps {
+            return Ok(ConcreteRun {
+                visited: visited_order,
+                outcomes,
+                inconclusive: true,
+            });
+        }
+
+        // skip states already visited at this pc (exact equality)
+        let seen = visited.entry(pc).or_default();
+        if seen.contains(&state) {
+            continue;
+        }
+        seen.push(state);
+        visited_order.push((pc, state));
+
+        // loop-head budget: a head that keeps producing new states is
+        // not converging
+        if loop_heads.contains(&pc) {
+            let iters = loop_iters.entry(pc).or_insert(0);
+            *iters += 1;
+            if *iters > limits.max_loop_iterations {
+                return Ok(ConcreteRun {
+                    visited: visited_order,
+                    outcomes,
+                    inconclusive: true,
+                });
+            }
+        }
+        explored += 1;
+        if explored > limits.max_states {
+            return Ok(ConcreteRun {
+                visited: visited_order,
+                outcomes,
+                inconclusive: true,
+            });
+        }
+
+        let insn = program
+            .get(pc as usize)
+            .ok_or(ConcreteFailure::InternalError { pc })?;
+
+        // a path ends at exit; R0 must hold a valid value there (mirror
+        // of the abstract "r0 is uninitialized at exit")
+        if matches!(insn, BpfInsn::Exit) {
+            read_concrete_reg(pc, &state, 0)
+                .map_err(|_| ConcreteFailure::UninitializedRead { pc, reg: 0 })?;
+            // deduplicate identical exit states (e.g. converging seeds)
+            if !outcomes.iter().any(|o| o.state == state) {
+                outcomes.push(ConcreteOutcome { pc, state });
+            }
+            continue;
+        }
+
+        for (next_pc, next_state) in concrete_successors(pc, insn, &state)? {
+            worklist.push((next_pc, next_state));
+        }
+    }
+    Ok(ConcreteRun {
+        visited: visited_order,
+        outcomes,
+        inconclusive: false,
+    })
+}
+
+/// Expand the successors of one instruction, mirroring the abstract
+/// `successors()`: terminal, jumps and compares are expanded here;
+/// everything else falls through via `concrete_step`.
+fn concrete_successors(
+    pc: u32,
+    insn: &BpfInsn,
+    state: &ConcreteState,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    match insn {
+        BpfInsn::Exit => Ok(vec![]),
+        BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
+        BpfInsn::Jeq { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Eq, state)
+        }
+        BpfInsn::Jne { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Ne, state)
+        }
+        BpfInsn::Jgt { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Ugt, state)
+        }
+        BpfInsn::Jge { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Uge, state)
+        }
+        BpfInsn::Jlt { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Ult, state)
+        }
+        BpfInsn::Jle { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Ule, state)
+        }
+        BpfInsn::Jsgt { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Sgt, state)
+        }
+        BpfInsn::Jsge { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Sge, state)
+        }
+        BpfInsn::Jslt { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Slt, state)
+        }
+        BpfInsn::Jsle { dst, src, offset } => {
+            concrete_cond(pc, *dst, *src, *offset, CondOp::Sle, state)
+        }
+        BpfInsn::Call { imm } => concrete_call(pc, *imm, state),
+        // everything else falls through via concrete_step()
+        _ => Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)]),
+    }
+}
+
+/// Evaluate a conditional branch on the exact concrete values.
+///
+/// Deterministic: exactly one successor is produced, the taken or the
+/// fall-through side. Same-kind pointers may be compared for equality
+/// only; pointer ordering and mixed-type comparisons are rejected,
+/// mirroring the abstract `cond_branch`.
+fn concrete_cond(
+    pc: u32,
+    dst: u8,
+    src: u8,
+    offset: i16,
+    op: CondOp,
+    state: &ConcreteState,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    let dst_value = read_concrete_reg(pc, state, dst)?;
+    let src_value = read_concrete_reg(pc, state, src)?;
+    let taken = match (dst_value, src_value) {
+        (ConcreteValue::Scalar(d), ConcreteValue::Scalar(s)) => match op {
+            CondOp::Eq => d == s,
+            CondOp::Ne => d != s,
+            CondOp::Ugt => d > s,
+            CondOp::Uge => d >= s,
+            CondOp::Ult => d < s,
+            CondOp::Ule => d <= s,
+            CondOp::Sgt => (d as i64) > (s as i64),
+            CondOp::Sge => (d as i64) >= (s as i64),
+            CondOp::Slt => (d as i64) < (s as i64),
+            CondOp::Sle => (d as i64) <= (s as i64),
+        },
+        // same-kind pointers: equality comparisons only
+        (ConcreteValue::StackPtr(d), ConcreteValue::StackPtr(s))
+        | (ConcreteValue::CtxPtr(d), ConcreteValue::CtxPtr(s)) => match op {
+            CondOp::Eq => d == s,
+            CondOp::Ne => d != s,
+            _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
+        },
+        // mixed pointer/scalar types are never comparable
+        _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
+    };
+    let next_pc = if taken {
+        branch_target(pc, offset)
+    } else {
+        pc + 1
+    };
+    Ok(vec![(next_pc, *state)])
+}
+
+/// Model a helper call: validate the arguments, clobber R1..R5, and
+/// fork over the return seeds (the concrete counterpart of the abstract
+/// return range).
+fn concrete_call(
+    pc: u32,
+    imm: i32,
+    state: &ConcreteState,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    // helper ids are encoded as negative immediates (kernel convention)
+    let helper = helper_prototype(-imm).ok_or(ConcreteFailure::UnknownHelper { pc, imm })?;
+    check_concrete_helper_args(pc, helper, state)?;
+    // argument registers are scratch — invalidated by the call (mirror
+    // of the abstract step() Call)
+    let mut base = *state;
+    for reg in 1..=5 {
+        base.regs[reg] = None;
+    }
+    let seeds = helper_return_seeds(pc, imm, helper.return_type)?;
+    Ok(seeds
+        .into_iter()
+        .map(|seed| {
+            let mut next = base;
+            next.regs[0] = Some(seed);
+            (pc + 1, next)
+        })
+        .collect())
+}
+
+/// Validate R1..R5 against the helper's argument types, mirroring
+/// `check_helper_args` (#28) on the concrete kinds. `PtrToMap` has no
+/// concrete counterpart yet, so no actual kind can match it.
+fn check_concrete_helper_args(
+    pc: u32,
+    helper: &HelperPrototype,
+    state: &ConcreteState,
+) -> Result<(), ConcreteFailure> {
+    for (i, expected) in helper.args.iter().enumerate() {
+        let reg = (i + 1) as u8; // R1..R5
+        let actual = read_concrete_reg(pc, state, reg)?;
+        let ok = matches!(
+            (expected, actual),
+            (ArgType::PtrToStack, ConcreteValue::StackPtr(_))
+                | (ArgType::Scalar, ConcreteValue::Scalar(_))
+        );
+        if !ok {
+            return Err(ConcreteFailure::HelperArgMismatch { pc, arg: reg });
+        }
+    }
+    Ok(())
+}
+
+/// The return seeds for a helper call, derived from the abstract return
+/// type: a constant return gets exactly the constant, an unknown scalar
+/// gets the default boundary seeds (always covered by the abstract full
+/// range). Seed selection for narrow scalar ranges is a follow-up.
+fn helper_return_seeds(
+    pc: u32,
+    imm: i32,
+    return_type: RegState,
+) -> Result<Vec<ConcreteValue>, ConcreteFailure> {
+    match return_type {
+        RegState::Scalar(bounds) if bounds.is_constant() => {
+            Ok(vec![ConcreteValue::Scalar(bounds.smin as u64)])
+        }
+        RegState::Scalar(_) => Ok(vec![0, 1, u64::MAX]
+            .into_iter()
+            .map(ConcreteValue::Scalar)
+            .collect()),
+        // pointer returns have no concrete address class yet; reaching
+        // this is a model gap, not a fake value
+        _ => Err(ConcreteFailure::UnsupportedHelperReturn { pc, imm }),
     }
 }
 
@@ -1230,5 +1566,253 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::InvalidRegister { pc: 0, reg: 11 });
+    }
+
+    // ── concrete path exploration (#51) ──────────────────────────────────
+
+    #[test]
+    fn run_straight_line_outcome() {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert!(!run.inconclusive);
+        assert_eq!(run.outcomes.len(), 1);
+        assert_eq!(run.outcomes[0].pc, 1);
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(42))
+        );
+        assert_eq!(run.visited.len(), 2); // pc 0 and pc 1 (exit)
+    }
+
+    #[test]
+    fn run_deterministic_branch_taken() {
+        // r0 = 5 > r1 = 3 → taken, skipping r0 = 0
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 5 },
+            BpfInsn::MovImm { dst: 1, imm: 3 },
+            BpfInsn::Jgt {
+                dst: 0,
+                src: 1,
+                offset: 1,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert_eq!(run.outcomes.len(), 1);
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(5))
+        );
+    }
+
+    #[test]
+    fn run_deterministic_branch_fall() {
+        // r0 = 2 is not > r1 = 3 → fall-through executes r0 = 0
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 2 },
+            BpfInsn::MovImm { dst: 1, imm: 3 },
+            BpfInsn::Jgt {
+                dst: 0,
+                src: 1,
+                offset: 1,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert_eq!(run.outcomes.len(), 1);
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(0))
+        );
+    }
+
+    #[test]
+    fn run_branch_only_visits_taken_side() {
+        // taken jump skips pc 3 and pc 4 — they must not appear in visited
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 5 },
+            BpfInsn::MovImm { dst: 1, imm: 3 },
+            BpfInsn::Jgt {
+                dst: 0,
+                src: 1,
+                offset: 2,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 9 },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(5))
+        );
+        assert!(!run.visited.iter().any(|(pc, _)| *pc == 3));
+        assert!(!run.visited.iter().any(|(pc, _)| *pc == 4));
+    }
+
+    #[test]
+    fn run_bounded_loop_terminates() {
+        // #46-style loop: r0 accumulates 100 iterations
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::AddImm { dst: 0, imm: 1 }, // pc 3 = loop head
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -3,
+            },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[3]).unwrap();
+        assert!(!run.inconclusive);
+        assert_eq!(run.outcomes.len(), 1);
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(100))
+        );
+    }
+
+    #[test]
+    fn run_non_terminating_loop_inconclusive() {
+        // r0 += 1; goto -2 — the state at the loop head changes forever
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::AddImm { dst: 0, imm: 1 },
+            BpfInsn::Jmp { offset: -2 },
+        ];
+        let run = run_concrete(&program, &[1]).unwrap();
+        assert!(run.inconclusive);
+    }
+
+    #[test]
+    fn run_helper_seed_fork() {
+        // get_prandom_u32 (-7): unknown scalar → default seeds
+        let program = vec![BpfInsn::Call { imm: -7 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert!(!run.inconclusive);
+        let mut r0s: Vec<Option<ConcreteValue>> =
+            run.outcomes.iter().map(|o| o.state.regs[0]).collect();
+        r0s.sort_by_key(|r| match r {
+            Some(ConcreteValue::Scalar(v)) => *v,
+            _ => u64::MAX,
+        });
+        assert_eq!(r0s.len(), 3);
+        assert_eq!(r0s[0], Some(ConcreteValue::Scalar(0)));
+        assert_eq!(r0s[1], Some(ConcreteValue::Scalar(1)));
+        assert_eq!(r0s[2], Some(ConcreteValue::Scalar(u64::MAX)));
+    }
+
+    #[test]
+    fn run_helper_call_clobbers_args() {
+        let program = vec![
+            BpfInsn::MovImm { dst: 2, imm: 5 },
+            BpfInsn::Call { imm: -7 },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        // after the call, R1..R5 are clobbered and R0 holds a seed
+        let call_successor = run
+            .visited
+            .iter()
+            .find(|(pc, _)| *pc == 2)
+            .expect("call successor visited");
+        assert_eq!(call_successor.1.regs[2], None);
+        assert!(matches!(
+            call_successor.1.regs[0],
+            Some(ConcreteValue::Scalar(_))
+        ));
+    }
+
+    #[test]
+    fn run_unknown_helper() {
+        let program = vec![BpfInsn::Call { imm: -999 }];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(err, ConcreteFailure::UnknownHelper { pc: 0, imm: -999 });
+    }
+
+    #[test]
+    fn run_helper_arg_mismatch() {
+        // map_lookup (-1) expects R1 = PtrToMap, but R1 is the context
+        // pointer at entry (mirror of the invalid_helper_argument fixture)
+        let program = vec![BpfInsn::Call { imm: -1 }];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(err, ConcreteFailure::HelperArgMismatch { pc: 0, arg: 1 });
+    }
+
+    #[test]
+    fn run_pointer_ordering_rejected() {
+        // ordering on same-kind pointers (r10 vs r10)
+        let program = vec![BpfInsn::Jgt {
+            dst: 10,
+            src: 10,
+            offset: 1,
+        }];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(
+            err,
+            ConcreteFailure::InvalidComparison {
+                pc: 0,
+                dst: 10,
+                src: 10
+            }
+        );
+        // mixed pointer/scalar comparison
+        let program = vec![
+            BpfInsn::MovImm { dst: 2, imm: 5 },
+            BpfInsn::Jgt {
+                dst: 10,
+                src: 2,
+                offset: 1,
+            },
+        ];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(
+            err,
+            ConcreteFailure::InvalidComparison {
+                pc: 1,
+                dst: 10,
+                src: 2
+            }
+        );
+    }
+
+    #[test]
+    fn run_pointer_equality_ok() {
+        // r10 == r10 → taken, skipping r0 = 0
+        let program = vec![
+            BpfInsn::Jeq {
+                dst: 10,
+                src: 10,
+                offset: 1,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert_eq!(
+            run.outcomes[0].state.regs[0],
+            Some(ConcreteValue::Scalar(1))
+        );
+    }
+
+    #[test]
+    fn run_exit_with_uninit_r0() {
+        let program = vec![BpfInsn::Exit];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(err, ConcreteFailure::UninitializedRead { pc: 0, reg: 0 });
+    }
+
+    #[test]
+    fn run_jump_out_of_program_is_internal_error() {
+        // defensive: the structural pass rejects this before the driver
+        let program = vec![BpfInsn::Jmp { offset: 100 }, BpfInsn::Exit];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(err, ConcreteFailure::InternalError { pc: 101 });
     }
 }
