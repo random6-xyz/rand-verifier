@@ -18,6 +18,14 @@ pub(crate) struct ScalarBounds {
     pub(crate) smax: i64,
     pub(crate) umin: u64,
     pub(crate) umax: u64,
+    /// The 32-bit view (truncation) of the signed range: derived from
+    /// `smin`/`smax` by the sync (#41). Exact when the range fits in one
+    /// 32-bit window, the full 32-bit range otherwise.
+    pub(crate) s32_min: i32,
+    pub(crate) s32_max: i32,
+    /// The 32-bit view of the unsigned range, derived the same way.
+    pub(crate) u32_min: u32,
+    pub(crate) u32_max: u32,
 }
 
 impl ScalarBounds {
@@ -28,6 +36,10 @@ impl ScalarBounds {
             smax: value,
             umin: value as u64,
             umax: value as u64,
+            s32_min: value as i32,
+            s32_max: value as i32,
+            u32_min: value as u64 as u32,
+            u32_max: value as u64 as u32,
         }
     }
 
@@ -38,13 +50,17 @@ impl ScalarBounds {
     /// a sound over-approximation.
     #[allow(dead_code)] // used by tests and by #45 (pointer offsets)
     pub(crate) fn from_signed(min: i64, max: i64) -> Self {
-        if min < 0 && max >= 0 {
+        let bounds = if min < 0 && max >= 0 {
             // straddles zero: no single u64 interval exists
             Self {
                 smin: min,
                 smax: max,
                 umin: 0,
                 umax: u64::MAX,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
             }
         } else {
             // both interpretations are the same bit range
@@ -53,8 +69,13 @@ impl ScalarBounds {
                 smax: max,
                 umin: min as u64,
                 umax: max as u64,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
             }
-        }
+        };
+        bounds.synced()
     }
 
     /// Whether every bit of the value is known in both interpretations.
@@ -80,6 +101,10 @@ impl ScalarBounds {
             smax: i64::MAX,
             umin: 0,
             umax: u64::MAX,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
         }
     }
 
@@ -118,6 +143,23 @@ impl ScalarBounds {
             // the unsigned range is negative: it bounds smin
             self.smin = self.smin.max(self.umin as i64);
             self.smax = self.umax as i64;
+        }
+        // derive the 32-bit ranges from the 64-bit ones (kernel
+        // __update_reg32_bounds, simplified): exact when the range fits
+        // in one 32-bit window, the full 32-bit range otherwise
+        if self.umin >> 32 == self.umax >> 32 {
+            self.u32_min = self.umin as u32;
+            self.u32_max = self.umax as u32;
+        } else {
+            self.u32_min = 0;
+            self.u32_max = u32::MAX;
+        }
+        if (self.smin as u64) >> 32 == (self.smax as u64) >> 32 {
+            self.s32_min = self.smin as i32;
+            self.s32_max = self.smax as i32;
+        } else {
+            self.s32_min = i32::MIN;
+            self.s32_max = i32::MAX;
         }
         self
     }
@@ -485,7 +527,12 @@ mod tests {
             smax: -5,
             umin: 0,
             umax: u64::MAX,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
         }
+        .synced()
         .synced();
         assert_eq!(narrowed.signed(), (i64::MIN, -5));
         assert_eq!(narrowed.unsigned(), (1 << 63, u64::MAX - 4));
@@ -495,7 +542,12 @@ mod tests {
             smax: i64::MAX,
             umin: 0,
             umax: 100,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
         }
+        .synced()
         .synced();
         assert_eq!(narrowed.signed(), (0, 100));
         assert_eq!(narrowed.unsigned(), (0, 100));

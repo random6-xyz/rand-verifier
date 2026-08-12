@@ -323,18 +323,106 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 smax: sx,
                 umin: um,
                 umax: ux,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
             }
             .synced()
         }
-        // ALU32 with a non-constant operand: the truncated result is
-        // zero-extended, so the full 32-bit range is sound (the precise
-        // truncation of ranges lands in #41)
-        AluWidth::W32 => ScalarBounds {
-            smin: 0,
-            smax: 0xFFFF_FFFF,
-            umin: 0,
-            umax: 0xFFFF_FFFF,
-        },
+        // ALU32 with a non-constant operand: compute the result range in
+        // 32-bit space (truncating operands), then zero-extend it into
+        // the 64-bit ranges — the high 32 bits become known zero (#41).
+        // The sync derives the 32-bit sub-ranges from the result.
+        AluWidth::W32 => {
+            let (rmin, rmax) = alu32_range(op, (d.u32_min, d.u32_max), (s.u32_min, s.u32_max));
+            ScalarBounds {
+                smin: rmin as i64,
+                smax: rmax as i64,
+                umin: rmin as u64,
+                umax: rmax as u64,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
+            }
+            .synced()
+        }
+    }
+}
+
+/// ALU32 range arithmetic in 32-bit space (truncating, wrap-aware).
+/// The shift amount range is validated by the caller.
+fn alu32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
+    match op {
+        // the sum interval [d.0 + s.0, d.1 + s.1] mod 2^32 is a single
+        // interval iff it fits in one 32-bit window
+        AluOp::Add => interval_mod(d.0 as i64 + s.0 as i64, d.1 as i64 + s.1 as i64),
+        // x - y ranges over [d.0 - s.1, d.1 - s.0]
+        AluOp::Sub => interval_mod(d.0 as i64 - s.1 as i64, d.1 as i64 - s.0 as i64),
+        AluOp::And => (0, d.1.min(s.1)),
+        AluOp::Or => (d.0.max(s.0), u32::MAX),
+        AluOp::Xor => (0, u32::MAX),
+        AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift32_range(op, d, s),
+    }
+}
+
+/// Map an integer interval [lo, hi] into [0, 2^32): a single interval
+/// iff it is narrower than 2^32 and does not cross a multiple of 2^32.
+fn interval_mod(lo: i64, hi: i64) -> (u32, u32) {
+    if hi - lo < 0x1_0000_0000 && lo.rem_euclid(0x1_0000_0000) <= hi.rem_euclid(0x1_0000_0000) {
+        (
+            lo.rem_euclid(0x1_0000_0000) as u32,
+            hi.rem_euclid(0x1_0000_0000) as u32,
+        )
+    } else {
+        (0, u32::MAX)
+    }
+}
+
+/// 32-bit shift ranges; the amount is validated in 0..64 by the caller.
+fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
+    if s.0 != s.1 {
+        // unknown amount: coarse but sound
+        return match op {
+            AluOp::Lsh => (0, u32::MAX),
+            AluOp::Rsh => (0, d.1),
+            AluOp::Arsh => (0, u32::MAX),
+            _ => unreachable!(),
+        };
+    }
+    let k = s.0;
+    match op {
+        AluOp::Lsh => {
+            if k >= 32 {
+                (0, 0)
+            } else if d.1 < 1u32 << (32 - k) {
+                (d.0 << k, d.1 << k)
+            } else {
+                // the shift can overflow the 32-bit window
+                (0, u32::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if k >= 32 {
+                (0, 0)
+            } else {
+                (d.0 >> k, d.1 >> k)
+            }
+        }
+        AluOp::Arsh => {
+            if k >= 32 {
+                // sign fill: the whole range becomes one sign
+                if (d.0 as i32) < 0 {
+                    (u32::MAX, u32::MAX)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                ((d.0 as i32 >> k) as u32, (d.1 as i32 >> k) as u32)
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -682,7 +770,12 @@ pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         smax: dst.smax.min(src.smax),
         umin: dst.umin.max(src.umin),
         umax: dst.umax.min(src.umax),
-    };
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
+    }
+    .synced();
     ((inter, inter), (dst, src))
 }
 
@@ -715,6 +808,10 @@ fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
         smax: s.1,
         umin: u.0,
         umax: u.1,
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
     }
 }
 
@@ -729,7 +826,12 @@ pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         smax: dst.smax.min(src.smax),
         umin: dst.umin.max(src.umin),
         umax: dst.umax.min(src.umax),
-    };
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
+    }
+    .synced();
     (
         (
             exclude_bounds(dst, src).synced(),
@@ -1481,6 +1583,160 @@ mod tests {
             next.regs[1],
             RegState::Scalar(ScalarBounds::from_signed(0, 0xFFFF_FFFF))
         );
+    }
+
+    #[test]
+    fn step_alu32_vs_alu64_divergence() {
+        // r1 = 0x1_0000_0001 (built via adds): ALU64 keeps the high bits,
+        // ALU32 truncates them away and zero-extends
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
+        // ALU64: r1 += 1 → 0x1_0000_0002
+        let w64 = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(
+            w64.regs[1],
+            RegState::Scalar(ScalarBounds::constant(0x1_0000_0002))
+        );
+        // ALU32: w1 += 1 → trunc32(0x1_0000_0001) + 1 = 2
+        let w32 = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(w32.regs[1], RegState::Scalar(ScalarBounds::constant(2)));
+    }
+
+    #[test]
+    fn step_alu32_known_zero_high_bits() {
+        // an ALU32 result always lies in [0, 0xFFFFFFFF]: the high 32
+        // bits are known zero (#41)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xFFFF_FFFF));
+        assert_eq!(b.unsigned(), (0, 0xFFFF_FFFF));
+        // and the 32-bit sub-ranges carry the same bits
+        assert_eq!((b.u32_min, b.u32_max), (0, u32::MAX));
+    }
+
+    #[test]
+    fn step_alu32_tracks_32_bit_ranges() {
+        // a "negative" 32-bit constant zero-extends: 0x80000000 as u64 is
+        // positive, while its s32 view is negative (i32 truncation)
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: -0x8000_0000,
+            },
+        )
+        .unwrap();
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0x8000_0000, 0x8000_0000));
+        assert_eq!(b.s32_min, -0x8000_0000);
+        assert_eq!(b.u32_min, 0x8000_0000);
+        // a 64-bit constant outside 32 bits truncates into the 32-bit view
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
+        let RegState::Scalar(b) = state.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0x1_0000_0001, 0x1_0000_0001));
+        assert_eq!(b.u32_min, 1);
+        assert_eq!(b.u32_max, 1);
+        assert_eq!(b.s32_min, 1);
+        assert_eq!(b.s32_max, 1);
+    }
+
+    #[test]
+    fn step_alu32_range_wrap() {
+        // w1: [0xFFFFFFF0, 0xFFFFFFFF] += 0x10 wraps to [0, 0xF]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0xFFFF_FFF0,
+            smax: 0xFFFF_FFFF,
+            umin: 0xFFFF_FFF0,
+            umax: 0xFFFF_FFFF,
+            s32_min: -0x10,
+            s32_max: -1,
+            u32_min: 0xFFFF_FFF0,
+            u32_max: 0xFFFF_FFFF,
+        });
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0x10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xF));
+        assert_eq!(b.unsigned(), (0, 0xF));
+        // a range crossing the 32-bit boundary widens to the full range
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0xFFFF_FFF0,
+            smax: 0x1_0000_0010,
+            umin: 0xFFFF_FFF0,
+            umax: 0x1_0000_0010,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
+        });
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn step_alu32_range_addition_exact() {
+        // [0, 10] + [5, 5] in 32-bit space stays exact
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 10));
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (5, 15));
+        assert_eq!((b.u32_min, b.u32_max), (5, 15));
     }
 
     #[test]

@@ -67,6 +67,8 @@ result into the 64-bit register; `w` notation is used for the destination.
 | alu_and_or_xor           | `r2 = 12; r2 &= 10; r2 |= 3; r2 ^= 12; r0 = r2; exit`         | AND/OR/XOR propagation          |
 | alu_shift                | `r2 = 1; r2 <<= 4; r2 >>= 2; r2 s>>= 1; r0 = r2; exit`        | shift propagation               |
 | alu32                    | `r2 = 2147483647; r2 += 2147483647; r2 += 3; w2 += 0; r0 = r2; exit` | ALU32 truncation + zero-extension |
+| alu32_roundtrip          | `r2 = -1; w2 += 0; w2 += 1; r0 = r2; exit`                       | ALU32 overflow wraps to 0        |
+| alu32_zero_extend        | `r2 = -2147483648; w2 += 0; r2 += 1; r0 = r2; exit`               | ALU32 zero-extension of sign bit |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
@@ -96,3 +98,4 @@ result into the 64-bit register; `w` notation is used for the destination.
 | complexity_limit              | 11 stacked diamonds (2^11 states)                   | exploration complexity limit        |
 | sub_on_pointer                | `r10 -= 8; exit`                                    | SUB on a stack pointer              |
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
+| alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |

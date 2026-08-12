@@ -446,31 +446,31 @@ mod tests {
 
     #[test]
     fn subsumes_dual_ranges() {
-        // subsumption requires containment in both interpretations (#40)
+        // subsumption requires containment in both interpretations (#40).
+        // The states here are constructed directly (bypassing the sync)
+        // to pin the predicate itself.
+        let bounds = |smin: i64, smax: i64, umin: u64, umax: u64| ScalarBounds {
+            smin,
+            smax,
+            umin,
+            umax,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
+        };
         let mut old = VerifierState::initial();
-        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        old.regs[1] = RegState::Scalar(bounds(0, 100, 0, 100));
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
+        new.regs[1] = RegState::Scalar(bounds(10, 20, 10, 20));
         assert!(subsumes(&old, &new));
         // the signed range contains the new one but the unsigned range
         // does not → not subsumed
-        let mut wider_unsigned = new;
-        wider_unsigned.regs[1] = RegState::Scalar(ScalarBounds {
-            smin: 10,
-            smax: 20,
-            umin: 0,
-            umax: 1000,
-        });
-        assert!(!subsumes(&old, &wider_unsigned));
+        new.regs[1] = RegState::Scalar(bounds(10, 20, 0, 1000));
+        assert!(!subsumes(&old, &new));
         // and vice versa
-        let mut wider_signed = new;
-        wider_signed.regs[1] = RegState::Scalar(ScalarBounds {
-            smin: -100,
-            smax: 20,
-            umin: 10,
-            umax: 20,
-        });
-        assert!(!subsumes(&old, &wider_signed));
+        new.regs[1] = RegState::Scalar(bounds(-50, 20, 0, 100));
+        assert!(!subsumes(&old, &new));
     }
 
     #[test]
