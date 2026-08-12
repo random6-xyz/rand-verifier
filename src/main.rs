@@ -539,6 +539,7 @@ struct WorkItem {
 }
 
 /// The conditional comparisons in the mini subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CondOp {
     Eq,
     Gt,
@@ -549,15 +550,45 @@ fn branch_target(pc: u32, offset: i16) -> u32 {
     (pc as i32 + 1 + offset as i32) as u32
 }
 
-/// A refined branch state is feasible unless a refined range is empty
-/// (min > max), i.e. the branch can never be taken at run time.
-fn is_feasible(state: &VerifierState, dst: u8, src: u8) -> bool {
-    [dst, src]
-        .into_iter()
-        .all(|r| match state.regs[r as usize] {
-            RegState::Scalar { min, max } => min <= max,
-            _ => true,
-        })
+/// Static verdict of a comparison over two scalar ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchVerdict {
+    /// The condition holds for every concrete value in the ranges.
+    AlwaysTaken,
+    /// The condition fails for every concrete value in the ranges.
+    AlwaysNotTaken,
+    /// Both outcomes are possible.
+    Unknown,
+}
+
+/// Decide whether a conditional branch is statically always taken,
+/// never taken, or unknown for the given scalar ranges (cf. the
+/// kernel's is_branch_taken()).
+fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerdict {
+    match op {
+        // dst > src: always true iff dst.min > src.max,
+        // always false iff dst.max <= src.min
+        CondOp::Gt => {
+            if dst.0 > src.1 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.1 <= src.0 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+        // dst == src: always true iff both are the same constant,
+        // always false iff the ranges are disjoint
+        CondOp::Eq => {
+            if dst.0 == dst.1 && src.0 == src.1 && dst.0 == src.0 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.1 < src.0 || dst.0 > src.1 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+    }
 }
 
 /// Expand the instruction at `pc` into its successor (pc, state) pairs.
@@ -594,11 +625,12 @@ fn successors(
 /// Fork a conditional branch into taken and fall-through successors.
 ///
 /// Scalar operands are refined on both sides via #16 (like the kernel's
-/// check_cond_jmp_op / regs_refine_cond_op); a branch narrowed to an
-/// empty range is infeasible and pruned. Pointers of the same type may
-/// be compared for equality without refinement (the NULL-check
-/// foundation for #27); `>` on pointers and mixed-type comparisons are
-/// rejected, mirroring the kernel.
+/// check_cond_jmp_op / regs_refine_cond_op); a branch that the static
+/// verdict (#24) rules out is not explored at all, mirroring the
+/// kernel's is_branch_taken(). Pointers of the same type may be
+/// compared for equality without refinement (the NULL-check foundation
+/// for #27); `>` on pointers and mixed-type comparisons are rejected,
+/// mirroring the kernel.
 fn cond_branch(
     pc: u32,
     dst: u8,
@@ -612,7 +644,7 @@ fn cond_branch(
     let taken_pc = branch_target(pc, offset);
     let fall_pc = pc + 1;
 
-    let (taken, fall) = match (dst_state, src_state) {
+    let out = match (dst_state, src_state) {
         (
             RegState::Scalar {
                 min: dmin,
@@ -623,35 +655,44 @@ fn cond_branch(
                 max: smax,
             },
         ) => {
+            let verdict = is_branch_taken(op, (dmin, dmax), (smin, smax));
             let ((t_dst, t_src), (f_dst, f_src)) = match op {
                 CondOp::Eq => refine_eq((dmin, dmax), (smin, smax)),
                 CondOp::Gt => refine_gt((dmin, dmax), (smin, smax)),
             };
-            let mut taken = *state;
-            taken.regs[dst as usize] = RegState::Scalar {
-                min: t_dst.0,
-                max: t_dst.1,
-            };
-            taken.regs[src as usize] = RegState::Scalar {
-                min: t_src.0,
-                max: t_src.1,
-            };
-            let mut fall = *state;
-            fall.regs[dst as usize] = RegState::Scalar {
-                min: f_dst.0,
-                max: f_dst.1,
-            };
-            fall.regs[src as usize] = RegState::Scalar {
-                min: f_src.0,
-                max: f_src.1,
-            };
-            (taken, fall)
+            let mut out = Vec::with_capacity(2);
+            // a statically impossible branch is never explored
+            if !matches!(verdict, BranchVerdict::AlwaysNotTaken) {
+                let mut taken = *state;
+                taken.regs[dst as usize] = RegState::Scalar {
+                    min: t_dst.0,
+                    max: t_dst.1,
+                };
+                taken.regs[src as usize] = RegState::Scalar {
+                    min: t_src.0,
+                    max: t_src.1,
+                };
+                out.push((taken_pc, taken));
+            }
+            if !matches!(verdict, BranchVerdict::AlwaysTaken) {
+                let mut fall = *state;
+                fall.regs[dst as usize] = RegState::Scalar {
+                    min: f_dst.0,
+                    max: f_dst.1,
+                };
+                fall.regs[src as usize] = RegState::Scalar {
+                    min: f_src.0,
+                    max: f_src.1,
+                };
+                out.push((fall_pc, fall));
+            }
+            out
         }
         // pointers of the same type: equality is allowed without
         // refinement; `>` on pointers is not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
         | (RegState::PtrToCtx, RegState::PtrToCtx) => match op {
-            CondOp::Eq => (*state, *state),
+            CondOp::Eq => vec![(taken_pc, *state), (fall_pc, *state)],
             CondOp::Gt => {
                 return Err(VerificationFailure::new(
                     NO_PC,
@@ -675,13 +716,6 @@ fn cond_branch(
         }
     };
 
-    let mut out = Vec::with_capacity(2);
-    if is_feasible(&taken, dst, src) {
-        out.push((taken_pc, taken));
-    }
-    if is_feasible(&fall, dst, src) {
-        out.push((fall_pc, fall));
-    }
     Ok(out)
 }
 
@@ -692,7 +726,7 @@ fn cond_branch(
 ///   push_stack/pop_stack verifier stack
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
 ///   R0 !read_ok check at exit)
-/// - branches narrowed to an empty range are pruned during expansion
+/// - branches ruled out by the static verdict (#24) are never explored
 /// - termination is guaranteed because the nano pass (#6) rejects loops,
 ///   so the CFG is acyclic; state dedup (#25/#26) and complexity limits
 ///   (#32) come later

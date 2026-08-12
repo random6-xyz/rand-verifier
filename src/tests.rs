@@ -1297,17 +1297,18 @@ fn verify_mini_diamond_both_paths() {
 }
 
 #[test]
-fn verify_mini_r0_set_on_one_path_only_rejected() {
-    // the fall path reaches exit without writing R0 → REJECT:
+fn verify_mini_feasible_path_missing_r0_rejected() {
+    // r1=1 vs r2=2: jeq is always false (is_branch_taken), so only the
+    // fall path runs — and it reaches exit without writing R0 → REJECT:
     // 0: r1 = 1
-    // 1: r2 = 1
-    // 2: jeq r1, r2, +1 → taken 4, fall 3
+    // 1: r2 = 2
+    // 2: jeq r1, r2, +1 → taken 4 (pruned), fall 3
     // 3: jmp +1 → 5
     // 4: r0 = 42
     // 5: exit
     let program = vec![
         BpfInsn::MovImm { dst: 1, imm: 1 },
-        BpfInsn::MovImm { dst: 2, imm: 1 },
+        BpfInsn::MovImm { dst: 2, imm: 2 },
         BpfInsn::Jeq {
             dst: 1,
             src: 2,
@@ -1502,6 +1503,159 @@ fn verify_mini_stack_pointer_in_branch() {
         BpfInsn::LdStack { dst: 0, offset: -8 },
         BpfInsn::Jmp { offset: 1 },
         BpfInsn::LdStack { dst: 0, offset: -8 },
+        BpfInsn::Exit,
+    ];
+    assert!(verify_mini(&program).is_ok());
+}
+
+// ── Branch verdict (v0.3) ────────────────────────────────────────────────
+
+#[test]
+fn is_branch_taken_gt() {
+    // always true: dst.min > src.max
+    assert!(matches!(
+        is_branch_taken(CondOp::Gt, (30, 40), (10, 20)),
+        BranchVerdict::AlwaysTaken
+    ));
+    // always false: dst.max <= src.min (boundary included)
+    assert!(matches!(
+        is_branch_taken(CondOp::Gt, (10, 20), (20, 30)),
+        BranchVerdict::AlwaysNotTaken
+    ));
+    // overlapping ranges → unknown
+    assert!(matches!(
+        is_branch_taken(CondOp::Gt, (0, 100), (50, 50)),
+        BranchVerdict::Unknown
+    ));
+}
+
+#[test]
+fn is_branch_taken_eq() {
+    // both the same constant → always taken
+    assert!(matches!(
+        is_branch_taken(CondOp::Eq, (5, 5), (5, 5)),
+        BranchVerdict::AlwaysTaken
+    ));
+    // disjoint ranges → never taken
+    assert!(matches!(
+        is_branch_taken(CondOp::Eq, (0, 10), (20, 30)),
+        BranchVerdict::AlwaysNotTaken
+    ));
+    // overlapping ranges → unknown
+    assert!(matches!(
+        is_branch_taken(CondOp::Eq, (0, 100), (40, 60)),
+        BranchVerdict::Unknown
+    ));
+    // a non-constant range is never 'always taken'
+    assert!(matches!(
+        is_branch_taken(CondOp::Eq, (5, 7), (5, 5)),
+        BranchVerdict::Unknown
+    ));
+}
+
+#[test]
+fn successors_jgt_always_taken() {
+    // dst = [30, 40] > src = [10, 20] is always true → only taken
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 30, max: 40 };
+    state.regs[2] = RegState::Scalar { min: 10, max: 20 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 1);
+    assert_eq!(nexts[0].0, 2);
+}
+
+#[test]
+fn successors_jgt_never_taken() {
+    // dst = [10, 20] > src = [30, 40] is always false → only fall-through
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 10, max: 20 };
+    state.regs[2] = RegState::Scalar { min: 30, max: 40 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 1);
+    assert_eq!(nexts[0].0, 1);
+}
+
+#[test]
+fn successors_jeq_always_taken() {
+    // r1 == r2 with both constant 5 → only the taken successor
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 5, max: 5 };
+    state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 1);
+    assert_eq!(nexts[0].0, 2);
+}
+
+#[test]
+fn verify_mini_jgt_always_taken_prunes_fall() {
+    // 35 > 10 is always true: the fall path (exit without R0) must be
+    // pruned, otherwise verification would reject:
+    // 0: r1 = 35
+    // 1: r2 = 10
+    // 2: jgt r1, r2, +1 → taken 4, fall 3 (pruned)
+    // 3: exit
+    // 4: r0 = 1
+    // 5: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 1, imm: 35 },
+        BpfInsn::MovImm { dst: 2, imm: 10 },
+        BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        BpfInsn::Exit,
+        BpfInsn::MovImm { dst: 0, imm: 1 },
+        BpfInsn::Exit,
+    ];
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn verify_mini_jgt_never_taken_prunes_taken() {
+    // 5 > 40 is always false: the taken path (exit without R0) must be
+    // pruned:
+    // 0: r1 = 5
+    // 1: r2 = 40
+    // 2: jgt r1, r2, +1 → taken 4 (pruned), fall 3
+    // 3: r0 = 1
+    // 4: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 1, imm: 5 },
+        BpfInsn::MovImm { dst: 2, imm: 40 },
+        BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        BpfInsn::MovImm { dst: 0, imm: 1 },
         BpfInsn::Exit,
     ];
     assert!(verify_mini(&program).is_ok());
