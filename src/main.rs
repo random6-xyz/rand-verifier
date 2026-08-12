@@ -1020,6 +1020,26 @@ fn reg_subsumes(old: RegState, new: RegState) -> bool {
     }
 }
 
+/// Bounds for the exploration (#32): exceeding either rejects the
+/// program with a complexity error, mirroring the kernel's
+/// BPF_COMPLEXITY_LIMIT_* checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifierLimits {
+    /// Maximum number of distinct (pc, state) pairs analyzed.
+    max_states: usize,
+    /// Maximum number of worklist steps (states popped).
+    max_steps: usize,
+}
+
+impl Default for VerifierLimits {
+    fn default() -> Self {
+        Self {
+            max_states: 1024,
+            max_steps: 100_000,
+        }
+    }
+}
+
 /// Path-sensitive verification: explore every execution path with a
 /// worklist until it is empty.
 ///
@@ -1034,11 +1054,20 @@ fn reg_subsumes(old: RegState, new: RegState) -> bool {
 ///   R0 !read_ok check at exit)
 /// - branches ruled out by the static verdict (#24) are never explored
 /// - termination is guaranteed because the nano pass (#6) rejects loops,
-///   so the CFG is acyclic; complexity limits (#32) come later
+///   so the CFG is acyclic; the exploration is additionally bounded by
+///   `limits` (#32)
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
 #[allow(dead_code)] // consumed by the mini corpus runner (#33)
 fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
+    verify_mini_with_limits(program, &VerifierLimits::default())
+}
+
+/// `verify_mini` with explicit exploration limits (#32).
+fn verify_mini_with_limits(
+    program: &[BpfInsn],
+    limits: &VerifierLimits,
+) -> Result<usize, VerificationFailure> {
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
@@ -1047,8 +1076,21 @@ fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
     // analyzed one subsumes it, like the kernel's per-pc state list
     let mut visited: HashMap<u32, Vec<VerifierState>> = HashMap::new();
     let mut explored = 0usize;
+    let mut steps = 0usize;
 
     while let Some(item) = worklist.pop() {
+        // worklist bound: every pop counts, even skipped ones
+        steps += 1;
+        if steps > limits.max_steps {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!(
+                    "verification complexity limit exceeded (max_steps {})",
+                    limits.max_steps
+                ),
+            ));
+        }
+
         // skip states subsumed by an already-analyzed state at this pc
         let seen = visited.entry(item.pc).or_default();
         if seen.iter().any(|old| subsumes(old, &item.state)) {
@@ -1056,6 +1098,17 @@ fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
         }
         seen.push(item.state);
         explored += 1;
+        // analyzed-state bound: this is where pruning pays off — without
+        // subsumption (#26), diamond chains would hit this limit fast
+        if explored > limits.max_states {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!(
+                    "verification complexity limit exceeded (max_states {})",
+                    limits.max_states
+                ),
+            ));
+        }
 
         let insn = program.get(item.pc as usize).ok_or_else(|| {
             VerificationFailure::new(item.pc, "internal error: pc out of program range")

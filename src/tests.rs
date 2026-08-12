@@ -2191,6 +2191,62 @@ fn verify_mini_prandom_branch() {
     assert!(verify_mini(&program).is_ok());
 }
 
+// ── Verifier limits (v0.3) ───────────────────────────────────────────────
+
+#[test]
+fn verify_mini_limits_default_ok() {
+    // the default limits accept normal programs
+    let program = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn verify_mini_max_states_exceeded() {
+    // r0 = 1; exit needs two distinct states (pc 0 and pc 1)
+    let program = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
+    let tight = VerifierLimits {
+        max_states: 1,
+        max_steps: 100,
+    };
+    let err = verify_mini_with_limits(&program, &tight).unwrap_err();
+    assert!(
+        err.message
+            .contains("verification complexity limit exceeded")
+    );
+    assert!(err.message.contains("max_states"));
+
+    // with enough room the same program is accepted
+    let roomy = VerifierLimits {
+        max_states: 2,
+        max_steps: 100,
+    };
+    assert!(verify_mini_with_limits(&program, &roomy).is_ok());
+}
+
+#[test]
+fn verify_mini_max_steps_exceeded() {
+    let program = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
+    let limits = VerifierLimits {
+        max_states: 100,
+        max_steps: 1,
+    };
+    let err = verify_mini_with_limits(&program, &limits).unwrap_err();
+    assert!(
+        err.message
+            .contains("verification complexity limit exceeded")
+    );
+    assert!(err.message.contains("max_steps"));
+}
+
+#[test]
+fn verify_mini_limits_defaults() {
+    // sane defaults: generous enough for the corpus, small enough to
+    // catch runaway exploration
+    let limits = VerifierLimits::default();
+    assert_eq!(limits.max_states, 1024);
+    assert_eq!(limits.max_steps, 100_000);
+}
+
 #[test]
 fn step_call_clobbers_r1_to_r5_preserves_r6_to_r9() {
     // the eBPF calling convention: R1..R5 are scratch, R6..R9 callee-saved
