@@ -48,10 +48,7 @@ pub(crate) fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailu
     for (pc, insn) in program.iter().enumerate() {
         // exit ends the trace (no state change); control flow is not
         // part of the straight-line subset
-        if matches!(
-            insn,
-            BpfInsn::Exit | BpfInsn::Jmp { .. } | BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. }
-        ) {
+        if insn.is_control_flow() {
             if matches!(insn, BpfInsn::Exit) {
                 out.push_str(&trace_step(pc as u32, insn, &state, &state));
                 out.push('\n');
@@ -89,12 +86,15 @@ mod tests {
         let trace = trace_step(0, &BpfInsn::MovImm { dst: 2, imm: 10 }, &state, &after);
         assert_eq!(
             trace,
-            "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n"
+            "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(s:10..10,u:0xa..0xa,t:0xa/0x0)\n  R10 = PTR_STACK(0)\n"
         );
         // …later steps show only the changed register
         let after2 = step(1, &after, &BpfInsn::AddImm { dst: 2, imm: 5 }).unwrap();
         let trace = trace_step(1, &BpfInsn::AddImm { dst: 2, imm: 5 }, &after, &after2);
-        assert_eq!(trace, "1: r2 += 5\n  R2 = SCALAR(15..15)\n");
+        assert_eq!(
+            trace,
+            "1: r2 += 5\n  R2 = SCALAR(s:15..15,u:0xf..0xf,t:0xf/0x0)\n"
+        );
     }
 
     #[test]
@@ -107,8 +107,8 @@ mod tests {
         let trace = run_trace(&program).unwrap();
         assert_eq!(
             trace,
-            "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(10..10)\n  R10 = PTR_STACK(0)\n\n\
-         1: r2 += 5\n  R2 = SCALAR(15..15)\n\n\
+            "0: r2 = 10\n  R0 = UNINIT\n  R1 = PTR_CTX\n  R2 = SCALAR(s:10..10,u:0xa..0xa,t:0xa/0x0)\n  R10 = PTR_STACK(0)\n\n\
+         1: r2 += 5\n  R2 = SCALAR(s:15..15,u:0xf..0xf,t:0xf/0x0)\n\n\
          2: exit\n\n"
         );
     }
@@ -135,7 +135,7 @@ mod tests {
         let trace = run_trace(&program).unwrap();
         assert!(trace.contains("1: [r10-8] = r2\n"));
         // the spilled scalar range survives the round-trip (#30)
-        assert!(trace.contains("2: r0 = [r10-8]\n  R0 = SCALAR(10..10)\n"));
+        assert!(trace.contains("2: r0 = [r10-8]\n  R0 = SCALAR(s:10..10,u:0xa..0xa,t:0xa/0x0)\n"));
         assert!(trace.contains("3: r10 += -8\n  R10 = PTR_STACK(-8)\n"));
     }
 

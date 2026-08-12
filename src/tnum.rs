@@ -4,19 +4,17 @@
 /// ones (a 1 in `mask` means the bit may be either 0 or 1).
 ///
 /// This is the simplified counterpart of the kernel's `struct tnum`
-/// (tnum_var_off); it is not wired into RegState yet — that happens in
-/// Meso, alongside the min/max ranges the kernel keeps next to it.
-#[allow(dead_code)] // wired into RegState in Meso
+/// (tnum_var_off), wired into [`crate::state::ScalarBounds`] (Meso #42)
+/// next to the min/max ranges the kernel keeps beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Tnum {
     pub(crate) value: u64,
     pub(crate) mask: u64,
 }
 
-#[allow(dead_code)] // wired into RegState in Meso
 impl Tnum {
     /// A fully known constant.
-    pub(crate) fn constant(value: u64) -> Self {
+    pub(crate) const fn constant(value: u64) -> Self {
         Self { value, mask: 0 }
     }
 
@@ -34,6 +32,7 @@ impl Tnum {
     }
 
     /// Whether no bit is known.
+    #[allow(dead_code)] // used by tests
     pub(crate) fn is_unknown(&self) -> bool {
         self.mask == u64::MAX
     }
@@ -56,6 +55,92 @@ impl Tnum {
         Self {
             value: sv & !mu,
             mask: mu,
+        }
+    }
+
+    /// Subtraction, following the kernel's tnum_sub() (the same carry
+    /// folding as `add`, with the borrow handled by wrapping).
+    pub(crate) fn sub(self, other: Tnum) -> Self {
+        let sm = self.mask.wrapping_add(other.mask);
+        let sv = self.value.wrapping_sub(other.value);
+        let sigma = sm.wrapping_add(sv);
+        let chi = sigma ^ sv;
+        let mu = chi | self.mask | other.mask;
+        Self {
+            value: sv & !mu,
+            mask: mu,
+        }
+    }
+
+    /// Bitwise XOR: a bit is known 1 if the operands differ there and
+    /// both are known; it is unknown if either operand could differ.
+    pub(crate) fn xor(self, other: Tnum) -> Self {
+        let value = self.value ^ other.value;
+        let mask = self.mask | other.mask;
+        Self {
+            value: value & !mask,
+            mask,
+        }
+    }
+
+    /// Shift left: the kernel shifts both fields (bits shifted out of
+    /// the u64 vanish — they are determined).
+    pub(crate) fn lshift(self, k: u32) -> Self {
+        Self {
+            value: self.value.checked_shl(k).unwrap_or(0),
+            mask: self.mask.checked_shl(k).unwrap_or(0),
+        }
+    }
+
+    /// Logical shift right, kernel tnum_rshift.
+    pub(crate) fn rshift(self, k: u32) -> Self {
+        Self {
+            value: self.value.checked_shr(k).unwrap_or(0),
+            mask: self.mask.checked_shr(k).unwrap_or(0),
+        }
+    }
+
+    /// Arithmetic shift right, kernel tnum_arshift: the mask is shifted
+    /// with sign extension, like the value.
+    pub(crate) fn arshift(self, k: u32) -> Self {
+        let v = (self.value as i64).checked_shr(k);
+        let m = (self.mask as i64).checked_shr(k);
+        Self {
+            value: v
+                .map(|x| x as u64)
+                .unwrap_or_else(|| if (self.value as i64) < 0 { u64::MAX } else { 0 }),
+            mask: m
+                .map(|x| x as u64)
+                .unwrap_or_else(|| if (self.mask as i64) < 0 { u64::MAX } else { 0 }),
+        }
+    }
+
+    /// Truncate to the low 32 bits (kernel tnum_subreg): the result of
+    /// an ALU32 operation.
+    pub(crate) fn subreg(self) -> Self {
+        Self {
+            value: self.value as u32 as u64,
+            mask: self.mask as u32 as u64,
+        }
+    }
+
+    /// The smallest tnum covering a u64 interval [min, max] (kernel
+    /// tnum_range): bits above the highest differing bit are fixed,
+    /// the rest are unknown.
+    pub(crate) fn from_range(min: u64, max: u64) -> Self {
+        let chi = min ^ max;
+        if chi == 0 {
+            return Self::constant(min);
+        }
+        let bits = 64 - chi.leading_zeros();
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        Self {
+            value: min & !mask,
+            mask,
         }
     }
 
@@ -213,6 +298,91 @@ mod tests {
         // unknown subsumes everything
         assert!(Tnum::unknown().subsumes(Tnum::constant(0)));
         assert!(Tnum::unknown().subsumes(Tnum::unknown()));
+    }
+
+    #[test]
+    fn tnum_sub() {
+        // constants subtract exactly
+        assert_eq!(Tnum::constant(10).sub(Tnum::constant(3)), Tnum::constant(7));
+        // {0, 1} - 1 = {u64::MAX, 0}: every bit unknown
+        let a = Tnum { value: 0, mask: 1 };
+        assert_eq!(a.sub(Tnum::constant(1)), Tnum::unknown());
+    }
+
+    #[test]
+    fn tnum_xor() {
+        // a = {101, 111} (bit1 unknown) ^ 001 → {100, 110}
+        let a = Tnum {
+            value: 0b101,
+            mask: 0b010,
+        };
+        assert_eq!(
+            a.xor(Tnum::constant(0b001)),
+            Tnum {
+                value: 0b100,
+                mask: 0b010
+            }
+        );
+        // unknown ^ constant = unknown
+        assert_eq!(Tnum::unknown().xor(Tnum::constant(5)), Tnum::unknown());
+    }
+
+    #[test]
+    fn tnum_shifts() {
+        // 1 << 4 = 16; unknown bits shift along
+        let a = Tnum {
+            value: 0b001,
+            mask: 0b010,
+        };
+        assert_eq!(
+            a.lshift(2),
+            Tnum {
+                value: 0b100,
+                mask: 0b1000
+            }
+        );
+        assert_eq!(Tnum::constant(16).rshift(4), Tnum::constant(1));
+        // arithmetic shift sign-extends the mask
+        assert_eq!(
+            Tnum::constant(-8i64 as u64).arshift(1),
+            Tnum::constant(-4i64 as u64)
+        );
+        // shifts >= 64 yield zero
+        assert_eq!(Tnum::constant(5).lshift(64), Tnum::constant(0));
+        assert_eq!(Tnum::constant(5).rshift(64), Tnum::constant(0));
+    }
+
+    #[test]
+    fn tnum_subreg() {
+        // truncation to 32 bits: the high bits become determined zero
+        let a = Tnum {
+            value: 0x1_0000_0001,
+            mask: 0xFFFF_FFFF_0000_0000,
+        };
+        assert_eq!(a.subreg(), Tnum::constant(1));
+        assert_eq!(
+            Tnum::unknown().subreg(),
+            Tnum {
+                value: 0,
+                mask: 0xFFFF_FFFF,
+            }
+        );
+    }
+
+    #[test]
+    fn tnum_from_range() {
+        // [0, 100]: bits 0..6 unknown, bit 7+ known zero
+        let t = Tnum::from_range(0, 100);
+        assert_eq!(t.value, 0);
+        assert_eq!(t.mask, 0x7F);
+        // a constant range is exact
+        assert_eq!(Tnum::from_range(42, 42), Tnum::constant(42));
+        // [0, u64::MAX] is fully unknown
+        assert_eq!(Tnum::from_range(0, u64::MAX), Tnum::unknown());
+        // [0x100, 0x1FF] → bits 8+ fixed, low 8 unknown
+        let t = Tnum::from_range(0x100, 0x1FF);
+        assert_eq!(t.value, 0x100);
+        assert_eq!(t.mask, 0xFF);
     }
 
     #[test]

@@ -112,7 +112,16 @@ pub(crate) fn visit_insn(
             vec![target]
         }
         // conditional branches — branch target + fall-through
-        BpfInsn::Jeq { offset, .. } | BpfInsn::Jgt { offset, .. } => {
+        BpfInsn::Jeq { offset, .. }
+        | BpfInsn::Jne { offset, .. }
+        | BpfInsn::Jgt { offset, .. }
+        | BpfInsn::Jge { offset, .. }
+        | BpfInsn::Jlt { offset, .. }
+        | BpfInsn::Jle { offset, .. }
+        | BpfInsn::Jsgt { offset, .. }
+        | BpfInsn::Jsge { offset, .. }
+        | BpfInsn::Jslt { offset, .. }
+        | BpfInsn::Jsle { offset, .. } => {
             // BPF branch target is PC-relative to the next insn: idx + 1 + offset
             let target = (idx as i32 + 1 + *offset as i32) as u32;
             if target < start || target >= end {
@@ -160,15 +169,36 @@ pub(crate) fn visit_insn(
 /// - every instruction must be reachable from the entry (insn 0)
 /// - branches must stay within their subprogram
 /// - no instruction may fall through into another subprogram
-/// - no back edges: every reachable path must terminate with EXIT
+/// - back edges (loops) are allowed — bounded-loop support (#46) moves
+///   the termination reasoning into the path exploration, which tracks
+///   loop convergence and a re-entry budget
 ///
 /// The stack holds (insn_idx, next_child) pairs so the DFS mimics recursion:
 /// a node stays "Discovering" (gray) until all of its children are fully
-/// explored, so an edge to a gray node is exactly a back edge (loop).
-pub(crate) fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<(), VerificationFailure> {
+/// explored, so an edge to a gray node is exactly a back edge. Returns the
+/// loop heads (the targets of back edges) for the path exploration.
+pub(crate) fn check_cfg(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+) -> Result<Vec<u32>, VerificationFailure> {
     let insn_cnt = insns.len();
+
+    // every subprogram must end with EXIT (cf. the kernel's "last insn
+    // is not exit"): this is what guarantees that accepted programs
+    // actually reach an exit, even when the CFG contains loops
+    for (i, &start) in subprogs.iter().enumerate() {
+        let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt as u32);
+        if !matches!(insns[(end - 1) as usize], BpfInsn::Exit) {
+            return Err(VerificationFailure::new(
+                end - 1,
+                format!("subprogram [{}..{}) does not end with exit", start, end),
+            ));
+        }
+    }
+
     let mut state = vec![VisitState::NotVisited; insn_cnt];
     let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+    let mut loop_heads = Vec::new();
     state[0] = VisitState::Discovering;
 
     while let Some((idx, child)) = stack.pop() {
@@ -184,12 +214,12 @@ pub(crate) fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<(), Verif
                     stack.push((nxt, 0));
                 }
                 // edge to a node still being explored = back edge = loop:
-                // this path can never terminate with EXIT
+                // its target is a loop head that the path exploration
+                // must bound (#46)
                 VisitState::Discovering => {
-                    return Err(VerificationFailure::new(
-                        idx,
-                        format!("back edge to insn {} creates an unbounded loop", nxt),
-                    ));
+                    if !loop_heads.contains(&nxt) {
+                        loop_heads.push(nxt);
+                    }
                 }
                 VisitState::Explored => {}
             }
@@ -209,7 +239,7 @@ pub(crate) fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<(), Verif
         }
     }
 
-    Ok(())
+    Ok(loop_heads)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -434,9 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn check_cfg_back_edge_rejected() {
+    fn check_cfg_back_edge_allowed() {
         // Jeq R1==R1, offset -1 → jump to itself (target = 0 + 1 - 1 = 0):
-        // this path never reaches EXIT → must be rejected with a loop error
+        // back edges are allowed (#46); the target is reported as a loop
+        // head and the exit stays reachable
         let insns = vec![
             BpfInsn::Jeq {
                 dst: 1,
@@ -445,17 +476,71 @@ mod tests {
             },
             BpfInsn::Exit,
         ];
-        let err = check_cfg(&insns, &[0]).unwrap_err();
-        assert_eq!(err.insn_idx, 0);
-        assert!(err.message.contains("loop"));
+        let loop_heads = check_cfg(&insns, &[0]).unwrap();
+        assert_eq!(loop_heads, vec![0]);
     }
 
     #[test]
-    fn check_cfg_multi_insn_loop_rejected() {
-        // 0: jmp +0 → 1    (target = 0 + 1 + 0 = 1)
-        // 1: jmp -2 → 0    (target = 1 + 1 - 2 = 0) — 2-instruction loop
+    fn check_cfg_multi_insn_loop_allowed() {
+        // 0: jmp +0 → 1            (target = 0 + 1 + 0 = 1)
+        // 1: jeq r1, r1, -2 → 0    (target = 1 + 1 - 2 = 0) — back edge
+        // 2: exit                  (reachable via the fall-through)
+        let insns = vec![
+            BpfInsn::Jmp { offset: 0 },
+            BpfInsn::Jeq {
+                dst: 1,
+                src: 1,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        let loop_heads = check_cfg(&insns, &[0]).unwrap();
+        assert_eq!(loop_heads, vec![0]);
+    }
+
+    #[test]
+    fn check_cfg_subprogram_must_end_with_exit() {
+        // a loop that never reaches exit: the last instruction of the
+        // (only) subprogram is a jump, not EXIT → rejected (cf. the
+        // kernel's "last insn is not exit")
         let insns = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Jmp { offset: -2 }];
-        assert!(check_cfg(&insns, &[0]).is_err());
+        let err = check_cfg(&insns, &[0]).unwrap_err();
+        assert!(
+            err.message.contains("does not end with exit"),
+            "{}",
+            err.message
+        );
+        // every subprogram of a call chain must end with EXIT too
+        let insns = vec![
+            BpfInsn::Call { imm: 2 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 0, imm: 1 }, // subprog [2..4) without exit
+            BpfInsn::MovImm { dst: 0, imm: 2 },
+        ];
+        let err = check_cfg(&insns, &[0, 2]).unwrap_err();
+        assert!(err.message.contains("does not end with exit"));
+    }
+
+    #[test]
+    fn check_cfg_loop_head_detection() {
+        // a counter loop: 0: r1 = 0; 1: r1 += 1; 2: jlt r1, r2, -2 → 1;
+        // 3: exit — the back edge targets pc 1
+        let insns = vec![
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        let loop_heads = check_cfg(&insns, &[0]).unwrap();
+        assert_eq!(loop_heads, vec![1]);
+        // a program without loops reports no loop heads
+        let insns = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
+        let loop_heads = check_cfg(&insns, &[0]).unwrap();
+        assert!(loop_heads.is_empty());
     }
 
     #[test]

@@ -73,12 +73,12 @@ impl BpfVerifierEnv {
         };
         self.prog.subprogs = subprogs;
 
-        match check_cfg(&self.prog.insns, &self.prog.subprogs) {
-            Ok(()) => {}
+        let loop_heads = match check_cfg(&self.prog.insns, &self.prog.subprogs) {
+            Ok(loop_heads) => loop_heads,
             Err(failure) => return Ok(Verdict::Unsafe(failure)),
-        }
+        };
 
-        match verify_mini(&self.prog.insns) {
+        match verify_mini(&self.prog.insns, &loop_heads) {
             Ok(_) => Ok(Verdict::Safe),
             Err(failure) => Ok(Verdict::Unsafe(failure)),
         }

@@ -20,24 +20,32 @@ pub(crate) fn subsumes(old: &VerifierState, new: &VerifierState) -> bool {
         && old.stack == new.stack
 }
 
-/// Per-register part of `subsumes`: the old range must contain the new one.
+/// Per-register part of `subsumes`: the old bounds must contain the new
+/// ones in both interpretations (#40).
 pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
     match (old, new) {
         (RegState::Uninit, RegState::Uninit) => true,
+        (RegState::Scalar(old), RegState::Scalar(new)) => {
+            // both interpretations must be contained, and the tnum must
+            // be a superset of the new one (#42)
+            old.smin <= new.smin
+                && old.smax >= new.smax
+                && old.umin <= new.umin
+                && old.umax >= new.umax
+                && old.tnum.subsumes(new.tnum)
+        }
         (
-            RegState::Scalar {
-                min: old_min,
-                max: old_max,
+            RegState::PtrToStack {
+                min_offset: old_min,
+                max_offset: old_max,
+                align_off: old_align,
             },
-            RegState::Scalar {
-                min: new_min,
-                max: new_max,
+            RegState::PtrToStack {
+                min_offset: new_min,
+                max_offset: new_max,
+                align_off: new_align,
             },
-        ) => old_min <= new_min && old_max >= new_max,
-        (
-            RegState::PtrToStack { offset: old_offset },
-            RegState::PtrToStack { offset: new_offset },
-        ) => old_offset == new_offset,
+        ) => old_min == new_min && old_max == new_max && old_align == new_align,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
         (RegState::PtrToMap, RegState::PtrToMap) => true,
         (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
@@ -49,15 +57,20 @@ pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
     }
 }
 
-/// Bounds for the exploration (#32): exceeding either rejects the
-/// program with a complexity error, mirroring the kernel's
-/// BPF_COMPLEXITY_LIMIT_* checks.
+/// Bounds for the exploration (#32, #46): exceeding any of them rejects
+/// the program with a complexity error, mirroring the kernel's
+/// BPF_COMPLEXITY_LIMIT_* checks and BPF_MAX_LOOPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VerifierLimits {
     /// Maximum number of distinct (pc, state) pairs analyzed.
     pub(crate) max_states: usize,
     /// Maximum number of worklist steps (states popped).
     pub(crate) max_steps: usize,
+    /// Maximum number of re-analyses of one loop head (#46): a
+    /// simplified stand-in for the kernel's BPF_MAX_LOOPS (1 << 23) —
+    /// deliberately smaller than `max_states` so the loop budget fires
+    /// before the state budget for non-converging loops.
+    pub(crate) max_loop_iterations: usize,
 }
 
 impl Default for VerifierLimits {
@@ -65,6 +78,9 @@ impl Default for VerifierLimits {
         Self {
             max_states: 1024,
             max_steps: 100_000,
+            // each loop iteration consumes ~2 analyzed states, so the
+            // loop budget must stay below max_states / 2 to fire first
+            max_loop_iterations: 256,
         }
     }
 }
@@ -80,20 +96,35 @@ impl Default for VerifierLimits {
 ///   monotone, so the subsumed state cannot reach a new outcome — the
 ///   first defense against state explosion (#25/#26)
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
-///   R0 !read_ok check at exit)
+///   R0 !read_ok check at exit); the structural pass guarantees that
+///   every accepted program has a reachable exit (unreachable
+///   instructions and subprograms whose last instruction is not exit
+///   are rejected)
 /// - branches ruled out by the static verdict (#24) are never explored
-/// - termination is guaranteed because the nano pass (#6) rejects loops,
-///   so the CFG is acyclic; the exploration is additionally bounded by
-///   `limits` (#32)
+/// - termination is guaranteed by the exploration bounds (#32, #46):
+///   loops converge when a new state at the loop head is subsumed by an
+///   already-analyzed one; a non-converging loop head hits the
+///   `max_loop_iterations` budget and is rejected; `max_states` and
+///   `max_steps` remain the outer bounds
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
-pub(crate) fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
-    verify_mini_with_limits(program, &VerifierLimits::default())
+pub(crate) fn verify_mini(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+) -> Result<usize, VerificationFailure> {
+    verify_mini_with_limits(program, loop_heads, &VerifierLimits::default())
 }
 
-/// `verify_mini` with explicit exploration limits (#32).
+/// `verify_mini` with explicit exploration limits (#32, #46). `loop_heads`
+/// are the targets of back edges (from the structural pass): the
+/// exploration bounds how many times each loop head may be re-analyzed,
+/// and relies on state subsumption for convergence — when a new state at
+/// the head is subsumed by an already-analyzed one, the loop has reached
+/// a fixed point and exploration stops (the kernel's loop convergence via
+/// states_equal at the loop head).
 pub(crate) fn verify_mini_with_limits(
     program: &[BpfInsn],
+    loop_heads: &[u32],
     limits: &VerifierLimits,
 ) -> Result<usize, VerificationFailure> {
     let mut worklist = vec![WorkItem {
@@ -103,6 +134,10 @@ pub(crate) fn verify_mini_with_limits(
     // states already analyzed at each pc: a new state is skipped when an
     // analyzed one subsumes it, like the kernel's per-pc state list
     let mut visited: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+    // re-analyses per loop head (#46): exceeding the budget means the
+    // loop never converges — REJECT like the kernel's "back-edge exceeds
+    // max loops"
+    let mut loop_iters: HashMap<u32, usize> = HashMap::new();
     let mut explored = 0usize;
     let mut steps = 0usize;
 
@@ -125,6 +160,24 @@ pub(crate) fn verify_mini_with_limits(
             continue;
         }
         seen.push(item.state);
+
+        // loop-head budget: a loop head that keeps producing new (not
+        // subsumed) states is not converging — bound it before the state
+        // budget so the loop error is reported, like the kernel's
+        // "back-edge exceeds max loops" (#46)
+        if loop_heads.contains(&item.pc) {
+            let iters = loop_iters.entry(item.pc).or_insert(0);
+            *iters += 1;
+            if *iters > limits.max_loop_iterations {
+                return Err(VerificationFailure::new(
+                    item.pc,
+                    format!(
+                        "back-edge exceeds max loops ({}) — the loop does not converge",
+                        limits.max_loop_iterations
+                    ),
+                ));
+            }
+        }
         explored += 1;
         // analyzed-state bound: this is where pruning pays off — without
         // subsumption (#26), diamond chains would hit this limit fast
@@ -167,12 +220,14 @@ mod tests {
     use crate::exec::*;
     use crate::insn::*;
     use crate::state::*;
+    use crate::testutil::*;
+    use crate::tnum::Tnum;
 
     #[test]
     fn verify_mini_straight_line() {
         // r0 = 42; exit → R0 is set before exit
         let program = vec![BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]
@@ -183,7 +238,7 @@ mod tests {
             BpfInsn::AddReg { dst: 0, src: 2 },
             BpfInsn::Exit,
         ];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert_eq!(err.insn_idx, 1);
         assert!(err.to_string().contains("at insn 1"));
     }
@@ -196,7 +251,7 @@ mod tests {
             BpfInsn::LdStack { dst: 0, offset: -8 },
             BpfInsn::Exit,
         ];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert_eq!(err.insn_idx, 1);
     }
 
@@ -204,7 +259,7 @@ mod tests {
     fn verify_mini_exit_r0_uninit_rejected() {
         // exit with R0 never written → REJECT
         let program = vec![BpfInsn::Exit];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("r0 is uninitialized at exit"));
     }
 
@@ -231,7 +286,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 2 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]
@@ -256,7 +311,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 42 },
             BpfInsn::Exit,
         ];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("r0 is uninitialized at exit"));
     }
 
@@ -280,7 +335,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
 
         // the expansion itself yields a single (fall) successor
         let mut state = VerifierState::initial();
@@ -303,7 +358,7 @@ mod tests {
     #[test]
     fn verify_mini_unknown_helper() {
         let program = vec![BpfInsn::Call { imm: -99 }, BpfInsn::Exit];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("unknown helper"));
     }
 
@@ -311,7 +366,7 @@ mod tests {
     fn verify_mini_jmp_out_of_range() {
         // branch target beyond the program → defensive error
         let program = vec![BpfInsn::Jmp { offset: 100 }, BpfInsn::Exit];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("pc out of program range"));
     }
 
@@ -344,7 +399,118 @@ mod tests {
             BpfInsn::LdStack { dst: 0, offset: -8 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
+    }
+
+    // ── Bounded loops (Meso #46) ─────────────────────────────────────────────
+
+    #[test]
+    fn verify_mini_bounded_counter_loop() {
+        // the issue example: r0 = 0; r1 = 0; loop: r1 += 1; if r1 < 100
+        // goto loop; exit — 100 iterations, all within the loop budget
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2, // target = 4 + 1 - 2 = 3 (loop head)
+            },
+            BpfInsn::Exit,
+        ];
+        assert!(verify_mini(&program, &[3]).is_ok());
+    }
+
+    #[test]
+    fn verify_mini_bounded_loop_without_declared_head() {
+        // a genuinely bounded loop terminates even without a declared
+        // loop head: the counter exits by its value range, so the
+        // exploration completes on its own (the head budget only bounds
+        // loops that never converge)
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        assert!(verify_mini_with_limits(&program, &[], &VerifierLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn verify_mini_non_converging_loop_rejected() {
+        // the counter never stops changing and the loop never exits:
+        // the loop-head budget fires → REJECT with the kernel's message
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jeq {
+                dst: 1,
+                src: 1,
+                offset: -2, // always taken back to pc 2 (loop head)
+            },
+            BpfInsn::Exit,
+        ];
+        let err = verify_mini(&program, &[2]).unwrap_err();
+        assert!(
+            err.message.contains("back-edge exceeds max loops"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn verify_mini_converging_loop_stops() {
+        // a loop whose state converges at the head is analyzed once: the
+        // second visit is subsumed and exploration stops (the exit path
+        // was already explored from the first visit)
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jeq {
+                dst: 1,
+                src: 2, // r2 is uninit → rejected later; use r1 == r1?
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        // r2 uninit: the loop is rejected for the read, not for looping
+        let err = verify_mini(&program, &[2]).unwrap_err();
+        assert!(err.message.contains("uninitialized"), "{}", err.message);
+    }
+
+    #[test]
+    fn verify_mini_loop_limits_are_bounded() {
+        // a tiny loop budget rejects even a small counter loop
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        let tight = VerifierLimits {
+            max_states: 1024,
+            max_steps: 100_000,
+            max_loop_iterations: 10,
+        };
+        // (the default also works: 512 < max_states 1024 fires first)
+        let err = verify_mini_with_limits(&program, &[3], &tight).unwrap_err();
+        assert!(err.message.contains("back-edge exceeds max loops"));
     }
 
     // ── Branch verdict (v0.3) ────────────────────────────────────────────────
@@ -371,7 +537,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]
@@ -394,7 +560,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]
@@ -418,7 +584,7 @@ mod tests {
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
         ];
-        assert_eq!(verify_mini(&program).unwrap(), 5);
+        assert_eq!(verify_mini(&program, &[]).unwrap(), 5);
     }
 
     #[test]
@@ -442,18 +608,74 @@ mod tests {
             BpfInsn::Exit,
         ];
         // (4, r0=1) and (4, r0=2) are distinct → both counted
-        assert_eq!(verify_mini(&program).unwrap(), 6);
+        assert_eq!(verify_mini(&program, &[]).unwrap(), 6);
     }
 
     // ── Subsumption (v0.3) ──────────────────────────────────────────────────
 
     #[test]
+    fn subsumes_dual_ranges() {
+        // subsumption requires containment in both interpretations (#40).
+        // The states here are constructed directly (bypassing the sync)
+        // to pin the predicate itself.
+        let bounds = |smin: i64, smax: i64, umin: u64, umax: u64| ScalarBounds {
+            smin,
+            smax,
+            umin,
+            umax,
+            s32_min: i32::MIN,
+            s32_max: i32::MAX,
+            u32_min: 0,
+            u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
+        };
+        let mut old = VerifierState::initial();
+        old.regs[1] = RegState::Scalar(bounds(0, 100, 0, 100));
+        let mut new = VerifierState::initial();
+        new.regs[1] = RegState::Scalar(bounds(10, 20, 10, 20));
+        assert!(subsumes(&old, &new));
+        // the signed range contains the new one but the unsigned range
+        // does not → not subsumed
+        new.regs[1] = RegState::Scalar(bounds(10, 20, 0, 1000));
+        assert!(!subsumes(&old, &new));
+        // and vice versa
+        new.regs[1] = RegState::Scalar(bounds(-50, 20, 0, 100));
+        assert!(!subsumes(&old, &new));
+    }
+
+    #[test]
+    fn subsumes_tnum() {
+        // a state with a narrower tnum is subsumed by one with a wider
+        // tnum when the ranges also contain it (#42)
+        let tnum_bounds = |value: u64, mask: u64| ScalarBounds {
+            smin: 0,
+            smax: 3,
+            umin: 0,
+            umax: 3,
+            s32_min: 0,
+            s32_max: 3,
+            u32_min: 0,
+            u32_max: 3,
+            tnum: Tnum { value, mask },
+        };
+        let mut wide = VerifierState::initial();
+        wide.regs[1] = RegState::Scalar(tnum_bounds(0, 0b011));
+        let mut narrow = VerifierState::initial();
+        narrow.regs[1] = RegState::Scalar(tnum_bounds(0b001, 0));
+        assert!(subsumes(&wide, &narrow));
+        // the narrower tnum never subsumes the wider one
+        assert!(!subsumes(&narrow, &wide));
+        // equal tnums subsume each other
+        assert!(subsumes(&wide, &wide));
+    }
+
+    #[test]
     fn subsumes_issue_example() {
         // issue example: old R1 = [0, 100] subsumes new R1 = [10, 20]
         let mut old = VerifierState::initial();
-        old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
         assert!(subsumes(&old, &new));
     }
 
@@ -461,18 +683,18 @@ mod tests {
     fn subsumes_scalar_ranges() {
         let old = VerifierState::initial();
         let mut old = old;
-        old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
 
         // subsumption is reflexive: a state subsumes itself
         assert!(subsumes(&old, &old));
         assert!(subsumes(&new, &new));
         // a wider new range is not subsumed
-        new.regs[1] = RegState::Scalar { min: -50, max: 200 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-50, 200));
         assert!(!subsumes(&old, &new));
         // equal ranges subsume each other
-        new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         assert!(subsumes(&old, &new));
         assert!(subsumes(&new, &old));
     }
@@ -482,13 +704,13 @@ mod tests {
         // different types are never comparable
         let old = VerifierState::initial();
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         assert!(!subsumes(&old, &new)); // Uninit vs Scalar
         assert!(!subsumes(&new, &old));
 
         // pointer offsets must match exactly
         let mut shifted = VerifierState::initial();
-        shifted.regs[10] = RegState::PtrToStack { offset: -8 };
+        shifted.regs[10] = ptr_stack(-8);
         assert!(!subsumes(&old, &shifted));
         assert!(subsumes(&old, &old));
     }
@@ -496,7 +718,7 @@ mod tests {
     #[test]
     fn subsumes_stack_mismatch() {
         let mut old = VerifierState::initial();
-        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar { min: 1, max: 1 });
+        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
         let new = VerifierState::initial();
         // stack states differ → not subsumed even though the registers match
         assert!(!subsumes(&old, &new));
@@ -508,8 +730,8 @@ mod tests {
         // the refined branches of [0, 100] > 50 (R1 = [51, 100] / [0, 50])
         // are both subsumed by the original R1 = [0, 100]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {
@@ -564,7 +786,7 @@ mod tests {
             BpfInsn::Exit,
         ];
         // both branches reach exit with R0 set (scalar in both cases)
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     // ── Verifier limits (v0.3) ───────────────────────────────────────────────
@@ -573,7 +795,7 @@ mod tests {
     fn verify_mini_limits_default_ok() {
         // the default limits accept normal programs
         let program = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]
@@ -583,8 +805,9 @@ mod tests {
         let tight = VerifierLimits {
             max_states: 1,
             max_steps: 100,
+            max_loop_iterations: 4096,
         };
-        let err = verify_mini_with_limits(&program, &tight).unwrap_err();
+        let err = verify_mini_with_limits(&program, &[], &tight).unwrap_err();
         assert!(
             err.message
                 .contains("verification complexity limit exceeded")
@@ -595,8 +818,9 @@ mod tests {
         let roomy = VerifierLimits {
             max_states: 2,
             max_steps: 100,
+            max_loop_iterations: 4096,
         };
-        assert!(verify_mini_with_limits(&program, &roomy).is_ok());
+        assert!(verify_mini_with_limits(&program, &[], &roomy).is_ok());
     }
 
     #[test]
@@ -605,8 +829,9 @@ mod tests {
         let limits = VerifierLimits {
             max_states: 100,
             max_steps: 1,
+            max_loop_iterations: 4096,
         };
-        let err = verify_mini_with_limits(&program, &limits).unwrap_err();
+        let err = verify_mini_with_limits(&program, &[], &limits).unwrap_err();
         assert!(
             err.message
                 .contains("verification complexity limit exceeded")
@@ -621,6 +846,7 @@ mod tests {
         let limits = VerifierLimits::default();
         assert_eq!(limits.max_states, 1024);
         assert_eq!(limits.max_steps, 100_000);
+        assert_eq!(limits.max_loop_iterations, 256);
     }
 
     #[test]
@@ -634,7 +860,7 @@ mod tests {
             BpfInsn::MovReg { dst: 0, src: 1 },
             BpfInsn::Exit,
         ];
-        let err = verify_mini(&program).unwrap_err();
+        let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("r1 is uninitialized"));
     }
 
@@ -651,7 +877,7 @@ mod tests {
             BpfInsn::MovReg { dst: 0, src: 6 },
             BpfInsn::Exit,
         ];
-        assert!(verify_mini(&program).is_ok());
+        assert!(verify_mini(&program, &[]).is_ok());
     }
 
     #[test]

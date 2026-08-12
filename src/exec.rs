@@ -4,9 +4,30 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    RegState, STACK_SIZE, StackSlot, VerifierState, check_reg, read_reg, read_scalar,
-    stack_slot_index,
+    ALIGN_UNKNOWN, RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg,
+    read_reg, read_scalar, stack_slot_index,
 };
+use crate::tnum::Tnum;
+
+/// ALU operations of the custom opcode space (Meso #39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AluOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Lsh,
+    Rsh,
+    Arsh,
+}
+
+/// ALU width: ALU64 (full 64-bit) or ALU32 (truncating, zero-extended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AluWidth {
+    W64,
+    W32,
+}
 
 /// Symbolically execute a single instruction, producing the next state.
 ///
@@ -26,14 +47,12 @@ pub(crate) fn step(
     insn: &BpfInsn,
 ) -> Result<VerifierState, VerificationFailure> {
     match insn {
-        // rX = imm → constant scalar
+        // rX = imm → constant scalar (both interpretations carry the
+        // same bits: -1 is -1 signed and u64::MAX unsigned, #40)
         BpfInsn::MovImm { dst, imm } => {
             check_reg(pc, *dst)?;
             let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: *imm as i64,
-                max: *imm as i64,
-            };
+            next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::constant(*imm as i64));
             Ok(next)
         }
         // rX = rY → copy the source's abstract state;
@@ -47,77 +66,58 @@ pub(crate) fn step(
         }
         // terminal and control flow are expanded by successors();
         // reaching them here is a driver bug
-        BpfInsn::Exit | BpfInsn::Jmp { .. } | BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } => {
+        BpfInsn::Exit
+        | BpfInsn::Jmp { .. }
+        | BpfInsn::Jeq { .. }
+        | BpfInsn::Jne { .. }
+        | BpfInsn::Jgt { .. }
+        | BpfInsn::Jge { .. }
+        | BpfInsn::Jlt { .. }
+        | BpfInsn::Jle { .. }
+        | BpfInsn::Jsgt { .. }
+        | BpfInsn::Jsge { .. }
+        | BpfInsn::Jslt { .. }
+        | BpfInsn::Jsle { .. } => {
             unreachable!("exit and control flow are expanded by successors(), not step()")
         }
-        // rX += imm → shift a scalar range, or a stack pointer offset:
-        // pointer + immediate is the only allowed pointer arithmetic (#20)
-        BpfInsn::AddImm { dst, imm } => {
-            check_reg(pc, *dst)?;
-            let dst_state = read_reg(pc, state, *dst)?;
-            match dst_state {
-                RegState::Scalar { min, max } => {
-                    let mut next = *state;
-                    next.regs[*dst as usize] = RegState::Scalar {
-                        min: min.wrapping_add(*imm as i64),
-                        max: max.wrapping_add(*imm as i64),
-                    };
-                    Ok(next)
-                }
-                // PtrToStack + Scalar => PtrToStack at the shifted offset;
-                // the pointer must stay within the frame (cf. #19)
-                RegState::PtrToStack { offset } => {
-                    let new_offset = offset.wrapping_add(*imm);
-                    if !(-(STACK_SIZE as i32)..=0).contains(&new_offset) {
-                        return Err(VerificationFailure::new(
-                            pc,
-                            format!(
-                                "stack pointer r{} offset {} is out of the {} byte frame",
-                                dst, new_offset, STACK_SIZE
-                            ),
-                        ));
-                    }
-                    let mut next = *state;
-                    next.regs[*dst as usize] = RegState::PtrToStack { offset: new_offset };
-                    Ok(next)
-                }
-                RegState::PtrToCtx => Err(VerificationFailure::new(
-                    pc,
-                    format!("arithmetic on context pointer r{} is not allowed", dst),
-                )),
-                RegState::PtrToMap => Err(VerificationFailure::new(
-                    pc,
-                    format!("arithmetic on map pointer r{} is not allowed", dst),
-                )),
-                RegState::PtrToMapValue => Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "arithmetic on map value pointer r{} is not supported yet",
-                        dst
-                    ),
-                )),
-                RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "arithmetic on nullable pointer r{} is not allowed (check for NULL first)",
-                        dst
-                    ),
-                )),
-                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
-            }
+        // ALU64: rX += imm (pointer + immediate stays the only pointer
+        // arithmetic, #20)
+        BpfInsn::AddImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Add, AluWidth::W64),
+        BpfInsn::AddReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Add, AluWidth::W64),
+        BpfInsn::SubImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Sub, AluWidth::W64),
+        BpfInsn::SubReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Sub, AluWidth::W64),
+        BpfInsn::AndImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::And, AluWidth::W64),
+        BpfInsn::AndReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::And, AluWidth::W64),
+        BpfInsn::OrImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Or, AluWidth::W64),
+        BpfInsn::OrReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Or, AluWidth::W64),
+        BpfInsn::XorImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Xor, AluWidth::W64),
+        BpfInsn::XorReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Xor, AluWidth::W64),
+        BpfInsn::LshImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Lsh, AluWidth::W64),
+        BpfInsn::LshReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Lsh, AluWidth::W64),
+        BpfInsn::RshImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Rsh, AluWidth::W64),
+        BpfInsn::RshReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Rsh, AluWidth::W64),
+        BpfInsn::ArshImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Arsh, AluWidth::W64),
+        BpfInsn::ArshReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W64),
+        // ALU32 (#39): the same operations, truncating and zero-extending
+        BpfInsn::Add32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Add, AluWidth::W32),
+        BpfInsn::Add32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Add, AluWidth::W32),
+        BpfInsn::Sub32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Sub, AluWidth::W32),
+        BpfInsn::Sub32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Sub, AluWidth::W32),
+        BpfInsn::And32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::And, AluWidth::W32),
+        BpfInsn::And32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::And, AluWidth::W32),
+        BpfInsn::Or32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Or, AluWidth::W32),
+        BpfInsn::Or32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Or, AluWidth::W32),
+        BpfInsn::Xor32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Xor, AluWidth::W32),
+        BpfInsn::Xor32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Xor, AluWidth::W32),
+        BpfInsn::Lsh32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Lsh, AluWidth::W32),
+        BpfInsn::Lsh32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Lsh, AluWidth::W32),
+        BpfInsn::Rsh32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Rsh, AluWidth::W32),
+        BpfInsn::Rsh32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Rsh, AluWidth::W32),
+        BpfInsn::Arsh32Imm { dst, imm } => {
+            alu_imm(pc, state, *dst, *imm, AluOp::Arsh, AluWidth::W32)
         }
-        // rX += rY → add the two scalar ranges; exact constants propagate
-        // because a constant is a range with min == max
-        BpfInsn::AddReg { dst, src } => {
-            check_reg(pc, *dst)?;
-            let (dmin, dmax) = read_scalar(pc, state, *dst)?;
-            let (smin, smax) = read_scalar(pc, state, *src)?;
-            let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: dmin.wrapping_add(smin),
-                max: dmax.wrapping_add(smax),
-            };
-            Ok(next)
+        BpfInsn::Arsh32Reg { dst, src } => {
+            alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
         // r10[offset] = rY → spill the source's full abstract state,
         // including pointers and scalar ranges (#30)
@@ -171,46 +171,913 @@ pub(crate) fn step(
     }
 }
 
-// ── Branch refinement (v0.2 Micro) ───────────────────────────────────────────
+// ── ALU helpers (Meso #39) ──────────────────────────────────────────────────
 
-/// A scalar value range [min, max].
-pub(crate) type ScalarRange = (i64, i64);
+/// Execute an ALU operation with an immediate operand.
+///
+/// Scalar destinations get the (possibly over-approximated) result range;
+/// stack pointers only support `rX += imm` (#20), and every other pointer
+/// type rejects arithmetic (mirroring the kernel's check_alu_op).
+fn alu_imm(
+    pc: u32,
+    state: &VerifierState,
+    dst: u8,
+    imm: i32,
+    op: AluOp,
+    width: AluWidth,
+) -> Result<VerifierState, VerificationFailure> {
+    check_reg(pc, dst)?;
+    // shifts require a provable amount in 0..64 (kernel check_alu_op)
+    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && !(0..64).contains(&imm) {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("invalid shift amount {}", imm),
+        ));
+    }
+    let dst_state = read_reg(pc, state, dst)?;
+    match dst_state {
+        RegState::Scalar(d) => {
+            let next_bounds = apply_alu(op, width, d, ScalarBounds::constant(imm as i64));
+            let mut next = *state;
+            next.regs[dst as usize] = RegState::Scalar(next_bounds);
+            Ok(next)
+        }
+        // PtrToStack + imm => PtrToStack at the shifted offset; the
+        // pointer must stay within the frame (cf. #19). Only ADD is
+        // allowed on stack pointers — like the kernel's check_alu_op.
+        RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } => {
+            if op != AluOp::Add || width != AluWidth::W64 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "arithmetic on stack pointer r{} is not allowed (only ADD supports stack pointer arithmetic)",
+                        dst
+                    ),
+                ));
+            }
+            let new_min = min_offset.wrapping_add(imm);
+            let new_max = max_offset.wrapping_add(imm);
+            if new_min < -(STACK_SIZE as i32) || new_max > 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "stack pointer r{} offsets {}..{} are out of the {} byte frame",
+                        dst, new_min, new_max, STACK_SIZE
+                    ),
+                ));
+            }
+            let mut next = *state;
+            next.regs[dst as usize] = RegState::PtrToStack {
+                min_offset: new_min,
+                max_offset: new_max,
+                align_off: (align_off as i32 + imm.rem_euclid(8)).rem_euclid(8) as u8,
+            };
+            Ok(next)
+        }
+        RegState::PtrToCtx => Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on context pointer r{} is not allowed", dst),
+        )),
+        RegState::PtrToMap => Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on map pointer r{} is not allowed", dst),
+        )),
+        RegState::PtrToMapValue => Err(VerificationFailure::new(
+            pc,
+            format!(
+                "arithmetic on map value pointer r{} is not supported yet",
+                dst
+            ),
+        )),
+        RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+            pc,
+            format!(
+                "arithmetic on nullable pointer r{} is not allowed (check for NULL first)",
+                dst
+            ),
+        )),
+        RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
+    }
+}
+
+/// Execute an ALU operation with a register operand.
+///
+/// Both operands must be scalars; register-offset pointer arithmetic is
+/// not supported yet (only immediate offsets, #20) — the real bounds and
+/// alignment checks for `PtrToStack + ScalarRange` land in #45.
+fn alu_reg(
+    pc: u32,
+    state: &VerifierState,
+    dst: u8,
+    src: u8,
+    op: AluOp,
+    width: AluWidth,
+) -> Result<VerifierState, VerificationFailure> {
+    check_reg(pc, dst)?;
+    let dst_state = read_reg(pc, state, dst)?;
+    // computed stack pointer arithmetic: PtrToStack + ScalarRange is
+    // accepted when the result provably stays in the frame and the
+    // alignment of the computed offset is provable (#45)
+    if let RegState::PtrToStack {
+        min_offset,
+        max_offset,
+        align_off,
+    } = dst_state
+    {
+        if op != AluOp::Add || width != AluWidth::W64 {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "arithmetic on stack pointer r{} is not allowed (only ADD supports stack pointer arithmetic)",
+                    dst
+                ),
+            ));
+        }
+        let s = read_scalar(pc, state, src)?;
+        return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, s, state);
+    }
+    let d = match dst_state {
+        RegState::Scalar(bounds) => bounds,
+        _ => {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
+                    dst
+                ),
+            ));
+        }
+    };
+    let s = read_scalar(pc, state, src)?;
+    // shifts require a provable amount in 0..64 (kernel check_alu_op)
+    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
+        check_shift_amount(pc, s)?;
+    }
+    let next_bounds = apply_alu(op, width, d, s);
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::Scalar(next_bounds);
+    Ok(next)
+}
+
+/// The out-of-frame error for computed pointer arithmetic.
+fn out_of_frame_error(pc: u32, dst: u8) -> VerificationFailure {
+    VerificationFailure::new(
+        pc,
+        format!(
+            "stack pointer r{} may leave the {} byte frame (computed offsets)",
+            dst, STACK_SIZE
+        ),
+    )
+}
+
+/// `PtrToStack + ScalarRange` (#45): the resulting offsets must provably
+/// stay within the frame, and a computed (non-exact) offset must be
+/// provably 8-byte aligned (the scalar's tnum determines the low three
+/// bits of the added amount).
+fn add_scalar_to_stack_ptr(
+    pc: u32,
+    dst: u8,
+    min_offset: i32,
+    max_offset: i32,
+    align_off: u8,
+    s: ScalarBounds,
+    state: &VerifierState,
+) -> Result<VerifierState, VerificationFailure> {
+    // the offset range shifts by the scalar's signed range; a sum that
+    // overflows i64 means some resulting offset is far out of the frame
+    let new_min = match (min_offset as i64).checked_add(s.smin) {
+        Some(v) => v,
+        None => return Err(out_of_frame_error(pc, dst)),
+    };
+    let new_max = match (max_offset as i64).checked_add(s.smax) {
+        Some(v) => v,
+        None => return Err(out_of_frame_error(pc, dst)),
+    };
+    if new_min < -(STACK_SIZE as i64) || new_max > 0 {
+        return Err(out_of_frame_error(pc, dst));
+    }
+    // alignment: the low three bits of the scalar's tnum, when known
+    let new_align = if s.tnum.mask & 7 == 0 {
+        (align_off as i32 + (s.tnum.value & 7) as i32).rem_euclid(8) as u8
+    } else {
+        ALIGN_UNKNOWN
+    };
+    // a computed (non-exact) offset must be provably 8-byte aligned —
+    // this is the model's access-time requirement: every stack access
+    // is an 8-byte slot access, so every possible concrete offset must
+    // be aligned
+    if new_min != new_max && new_align == ALIGN_UNKNOWN {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack pointer r{} alignment is not provable (computed offsets must be 8-byte aligned)",
+                dst
+            ),
+        ));
+    }
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::PtrToStack {
+        min_offset: new_min as i32,
+        max_offset: new_max as i32,
+        align_off: new_align,
+    };
+    Ok(next)
+}
+
+/// Apply an ALU operation to scalar bounds: both interpretations are
+/// updated (#40). Exact constants propagate bit-exactly; ranges get a
+/// sound per-family over-approximation; ALU32 truncates to 32 bits and
+/// zero-extends (the result always lies in `[0, 0xFFFFFFFF]`). The result
+/// is re-synced (kernel reg_bounds_sync) so the two interpretations stay
+/// consistent.
+fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> ScalarBounds {
+    // exact constants propagate bit-exactly in both interpretations
+    if d.is_constant() && s.is_constant() {
+        let bits = match width {
+            AluWidth::W64 => alu_const64(op, d.smin as u64, s.smin as u64),
+            AluWidth::W32 => alu_const32(op, d.smin as u64, s.smin as u64),
+        };
+        return ScalarBounds::constant(bits as i64);
+    }
+    match width {
+        AluWidth::W64 => {
+            let (sm, sx) = alu64_signed(op, d.signed(), s.signed());
+            // the shift amount is validated on the signed family; the
+            // unsigned family uses the same amount range
+            let amount = if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
+                (s.smin as u64, s.smax as u64)
+            } else {
+                s.unsigned()
+            };
+            let (um, ux) = alu64_unsigned(op, d.unsigned(), amount);
+            ScalarBounds {
+                smin: sm,
+                smax: sx,
+                umin: um,
+                umax: ux,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
+                tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax),
+            }
+            .synced()
+        }
+        // ALU32 with a non-constant operand: compute the result range in
+        // 32-bit space (truncating operands), then zero-extend it into
+        // the 64-bit ranges — the high 32 bits become known zero (#41).
+        // The sync derives the 32-bit sub-ranges from the result.
+        AluWidth::W32 => {
+            let (rmin, rmax) = alu32_range(op, (d.u32_min, d.u32_max), (s.u32_min, s.u32_max));
+            ScalarBounds {
+                smin: rmin as i64,
+                smax: rmax as i64,
+                umin: rmin as u64,
+                umax: rmax as u64,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
+                tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax).subreg(),
+            }
+            .synced()
+        }
+    }
+}
+
+/// The tnum result of an ALU operation (kernel tnum_*).
+///
+/// For shifts the amount must be a constant — with a variable amount
+/// every bit of the result may be anything (sound over-approximation).
+/// The 32-bit path truncates the result with `subreg`.
+fn alu_tnum(op: AluOp, d: Tnum, s: Tnum, amount_min: i64, amount_max: i64) -> Tnum {
+    match op {
+        AluOp::Add => d.add(s),
+        AluOp::Sub => d.sub(s),
+        AluOp::And => d.and(s),
+        AluOp::Or => d.or(s),
+        AluOp::Xor => d.xor(s),
+        AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => {
+            if amount_min != amount_max {
+                Tnum::unknown()
+            } else {
+                match op {
+                    AluOp::Lsh => d.lshift(amount_min as u32),
+                    AluOp::Rsh => d.rshift(amount_min as u32),
+                    AluOp::Arsh => d.arshift(amount_min as u32),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+/// ALU32 range arithmetic in 32-bit space (truncating, wrap-aware).
+/// The shift amount range is validated by the caller.
+fn alu32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
+    match op {
+        // the sum interval [d.0 + s.0, d.1 + s.1] mod 2^32 is a single
+        // interval iff it fits in one 32-bit window
+        AluOp::Add => interval_mod(d.0 as i64 + s.0 as i64, d.1 as i64 + s.1 as i64),
+        // x - y ranges over [d.0 - s.1, d.1 - s.0]
+        AluOp::Sub => interval_mod(d.0 as i64 - s.1 as i64, d.1 as i64 - s.0 as i64),
+        AluOp::And => (0, d.1.min(s.1)),
+        AluOp::Or => (d.0.max(s.0), u32::MAX),
+        AluOp::Xor => (0, u32::MAX),
+        AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift32_range(op, d, s),
+    }
+}
+
+/// Map an integer interval [lo, hi] into [0, 2^32): a single interval
+/// iff it is narrower than 2^32 and does not cross a multiple of 2^32.
+fn interval_mod(lo: i64, hi: i64) -> (u32, u32) {
+    if hi - lo < 0x1_0000_0000 && lo.rem_euclid(0x1_0000_0000) <= hi.rem_euclid(0x1_0000_0000) {
+        (
+            lo.rem_euclid(0x1_0000_0000) as u32,
+            hi.rem_euclid(0x1_0000_0000) as u32,
+        )
+    } else {
+        (0, u32::MAX)
+    }
+}
+
+/// 32-bit shift ranges; the amount is validated in 0..64 by the caller.
+fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
+    if s.0 != s.1 {
+        // unknown amount: coarse but sound
+        return match op {
+            AluOp::Lsh => (0, u32::MAX),
+            AluOp::Rsh => (0, d.1),
+            AluOp::Arsh => (0, u32::MAX),
+            _ => unreachable!(),
+        };
+    }
+    let k = s.0;
+    match op {
+        AluOp::Lsh => {
+            if k >= 32 {
+                (0, 0)
+            } else if d.1 < 1u32 << (32 - k) {
+                (d.0 << k, d.1 << k)
+            } else {
+                // the shift can overflow the 32-bit window
+                (0, u32::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if k >= 32 {
+                (0, 0)
+            } else {
+                (d.0 >> k, d.1 >> k)
+            }
+        }
+        AluOp::Arsh => {
+            if k >= 32 {
+                // sign fill: the whole range becomes one sign
+                if (d.0 as i32) < 0 {
+                    (u32::MAX, u32::MAX)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                ((d.0 as i32 >> k) as u32, (d.1 as i32 >> k) as u32)
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Exact 64-bit ALU on constant bits (wrapping is exact bit arithmetic).
+/// Shift amounts are validated by the caller.
+fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
+    match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub => a.wrapping_sub(b),
+        AluOp::And => a & b,
+        AluOp::Or => a | b,
+        AluOp::Xor => a ^ b,
+        AluOp::Lsh => a.wrapping_shl(b as u32),
+        AluOp::Rsh => a.wrapping_shr(b as u32),
+        AluOp::Arsh => ((a as i64) >> b) as u64,
+    }
+}
+
+/// Exact 32-bit ALU on constant bits: truncate, compute, zero-extend.
+fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
+    let a = a as u32;
+    let b = b as u32;
+    let r = match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub => a.wrapping_sub(b),
+        AluOp::And => a & b,
+        AluOp::Or => a | b,
+        AluOp::Xor => a ^ b,
+        AluOp::Lsh => a.checked_shl(b).unwrap_or(0),
+        AluOp::Rsh => a.checked_shr(b).unwrap_or(0),
+        AluOp::Arsh => (a as i32)
+            .checked_shr(b)
+            .unwrap_or(if (a as i32) < 0 { -1 } else { 0 }) as u32,
+    };
+    r as u64
+}
+
+/// Validate a shift amount: the kernel rejects shifts that are not provably
+/// in `0..64` (check_alu_op's "invalid shift"). Both interpretations are
+/// consulted so a diverged state cannot smuggle an invalid amount.
+fn check_shift_amount(pc: u32, s: ScalarBounds) -> Result<(), VerificationFailure> {
+    if s.smin < 0 || s.smax >= 64 || s.umax >= 64 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("invalid shift amount range [{}, {}]", s.smin, s.smax),
+        ));
+    }
+    Ok(())
+}
+
+/// 64-bit signed-family range arithmetic (#39, the signed view of #40).
+///
+/// Constants propagate exactly; ranges get a sound over-approximation
+/// where an exact interval is not easy to derive. Overflow handling
+/// lands in #43. Shift amounts are validated by the caller.
+fn alu64_signed(op: AluOp, d: (i64, i64), s: (i64, i64)) -> (i64, i64) {
+    let (dmin, dmax) = d;
+    let (smin, smax) = s;
+    // constants propagate exactly (wrapping is exact bit arithmetic)
+    if dmin == dmax && smin == smax {
+        let bits = alu_const64(op, dmin as u64, smin as u64);
+        return (bits as i64, bits as i64);
+    }
+    match op {
+        // overflow falls back to the full range (kernel
+        // signed_add_overflows / signed_sub_overflows, #43): a wrapped
+        // interval would not contain the true results
+        AluOp::Add => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_add(smin), dmax.checked_add(smax)) {
+                (lo, hi)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Sub => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_sub(smax), dmax.checked_sub(smin)) {
+                (lo, hi)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        // AND of non-negative ranges stays in [0, min(max1, max2)];
+        // with a possible negative operand the sign bits make the result
+        // unbounded (e.g. -1 & x)
+        AluOp::And => {
+            if dmin >= 0 && smin >= 0 {
+                (0, dmax.min(smax))
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        // OR of non-negative ranges is at least the larger lower bound
+        // and never negative; the upper bits are unknown
+        AluOp::Or => {
+            if dmin >= 0 && smin >= 0 {
+                (dmin.max(smin), i64::MAX)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Xor => {
+            if dmin >= 0 && smin >= 0 {
+                (0, i64::MAX)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift64_range(op, dmin, dmax, smin, smax),
+    }
+}
+
+/// 64-bit unsigned-family range arithmetic (the u64 view, #40). The
+/// shift amount range is passed in by the caller (validated on the
+/// signed family).
+fn alu64_unsigned(op: AluOp, d: (u64, u64), s: (u64, u64)) -> (u64, u64) {
+    let (dmin, dmax) = d;
+    let (smin, smax) = s;
+    match op {
+        // overflow falls back to the full range (kernel
+        // unsigned_add_overflows / unsigned_sub_overflows, #43)
+        AluOp::Add => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_add(smin), dmax.checked_add(smax)) {
+                (lo, hi)
+            } else {
+                (0, u64::MAX)
+            }
+        }
+        AluOp::Sub => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_sub(smax), dmax.checked_sub(smin)) {
+                (lo, hi)
+            } else {
+                (0, u64::MAX)
+            }
+        }
+        // u64 values are never negative: AND clears bits, OR sets them,
+        // XOR is unbounded below the mask
+        AluOp::And => (0, dmax.min(smax)),
+        AluOp::Or => (dmin.max(smin), u64::MAX),
+        AluOp::Xor => (0, u64::MAX),
+        AluOp::Lsh => {
+            if smin == smax && dmax <= (u64::MAX >> smin as u32) {
+                (dmin << smin as u32, dmax << smin as u32)
+            } else {
+                (0, u64::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if smin == smax {
+                (dmin >> smin as u32, dmax >> smin as u32)
+            } else {
+                (0, dmax)
+            }
+        }
+        // arithmetic shift on the unsigned view is unbounded
+        AluOp::Arsh => (0, u64::MAX),
+    }
+}
+
+/// Shift a range by a constant shift amount (validated in `0..64`).
+fn shift64_by_const(op: AluOp, dmin: i64, dmax: i64, k: u32) -> (i64, i64) {
+    match op {
+        // logical shift: the u64 view is monotone; a result that crosses
+        // the sign bit cannot be represented as one i64 interval
+        AluOp::Lsh => {
+            if dmin < 0 {
+                return (i64::MIN, i64::MAX);
+            }
+            if k == 0 {
+                return (dmin, dmax);
+            }
+            // x << k mod 2^64 is monotone within one block of size
+            // 2^(64-k); a range spanning a block boundary can wrap
+            // multiple times and must widen to the full range (#43)
+            if (dmin as u64) >> (64 - k) != (dmax as u64) >> (64 - k) {
+                return (i64::MIN, i64::MAX);
+            }
+            let lo = (dmin as u64) << k;
+            let hi = (dmax as u64) << k;
+            // a result crossing the sign bit has no i64 interval view
+            if lo >= 1 << 63 || hi < 1 << 63 {
+                (lo as i64, hi as i64)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if dmin < 0 {
+                (i64::MIN, i64::MAX)
+            } else {
+                (((dmin as u64) >> k) as i64, ((dmax as u64) >> k) as i64)
+            }
+        }
+        // arithmetic shift is monotone on i64 for a fixed k
+        AluOp::Arsh => (dmin >> k, dmax >> k),
+        _ => unreachable!("shift64_by_const only handles shifts"),
+    }
+}
+
+/// Shift a range by a validated shift range: coarse but sound.
+fn shift64_range(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64, i64) {
+    if smin == smax {
+        return shift64_by_const(op, dmin, dmax, smin as u32);
+    }
+    match op {
+        // some shift amount in [smin, smax] applies; only the extremes
+        // that hold for every amount are usable
+        AluOp::Lsh => {
+            if dmin >= 0 {
+                (0, i64::MAX)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if dmin >= 0 {
+                (0, dmax)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Arsh => (dmin >> 63, dmax),
+        _ => unreachable!("shift64_range only handles shifts"),
+    }
+}
+
+// ── Branch refinement (v0.2 Micro, dual ranges in Meso #40) ────────────────
+
+/// Minimal numeric operations for the refinement equations, shared by
+/// the i64 (signed) and u64 (unsigned) interval families.
+trait WrapInt: Copy + Ord {
+    const MIN: Self;
+    const MAX: Self;
+    const ONE: Self;
+    fn wrapping_add(self, rhs: Self) -> Self;
+    fn wrapping_sub(self, rhs: Self) -> Self;
+}
+
+impl WrapInt for i64 {
+    const MIN: Self = i64::MIN;
+    const MAX: Self = i64::MAX;
+    const ONE: Self = 1;
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        self.wrapping_sub(rhs)
+    }
+}
+
+impl WrapInt for u64 {
+    const MIN: Self = u64::MIN;
+    const MAX: Self = u64::MAX;
+    const ONE: Self = 1;
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        self.wrapping_sub(rhs)
+    }
+}
+
+/// Ordered comparison shape without signedness (the kernel equations are
+/// shared by both interval families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrdOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
 
 /// Both operands of a comparison refined for one branch side: (dst, src).
-type RefinedPair = (ScalarRange, ScalarRange);
+type RefinedPair = (ScalarBounds, ScalarBounds);
 
 /// Refinement result of a comparison: (true branch, false branch).
 type RefinedBranches = (RefinedPair, RefinedPair);
 
-/// Refine two scalar ranges on the `dst > src` comparison.
-///
-/// Both operands are narrowed (cf. the kernel's adjust_scalar_min_max_vals):
-///
-/// - true branch:  dst >= src.min + 1, src <= dst.max - 1
-/// - false branch: dst <= src.max,     src >= dst.min
-///
-/// A refined range with min > max means the branch is infeasible.
-/// Comparisons are interpreted as signed (the kernel splits JGT/JSGT by
-/// signedness; our subset has a single `Jgt`).
-pub(crate) fn refine_gt(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    // true: dst > src
-    let true_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
-    let true_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
-    // false: dst <= src
-    let false_dst = (dst.0, dst.1.min(src.1));
-    let false_src = (src.0.max(dst.0), src.1);
-    ((true_dst, true_src), (false_dst, false_src))
+/// Refined intervals of one interval family: (true, false) × (dst, src).
+type RefinedFamily<T> = (((T, T), (T, T)), ((T, T), (T, T)));
+
+/// The kernel's refinement equations (reg_set_min_max / inv) for one
+/// ordered comparison on one interval family.
+fn refine_ordered<T: WrapInt>(op: OrdOp, dst: (T, T), src: (T, T)) -> RefinedFamily<T> {
+    match op {
+        // true: dst > src → dst >= src.min + 1, src <= dst.max - 1
+        // false: dst <= src → dst <= src.max, src >= dst.min
+        OrdOp::Gt => {
+            let true_dst = (dst.0.max(src.0.wrapping_add(T::ONE)), dst.1);
+            let true_src = (src.0, src.1.min(dst.1.wrapping_sub(T::ONE)));
+            let false_dst = (dst.0, dst.1.min(src.1));
+            let false_src = (src.0.max(dst.0), src.1);
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst >= src → dst >= src.min, src <= dst.max
+        // false: dst < src → dst <= src.min - 1, src >= dst.min + 1
+        OrdOp::Ge => {
+            let true_dst = (dst.0.max(src.0), dst.1);
+            let true_src = (src.0, src.1.min(dst.1));
+            let false_dst = (dst.0, dst.1.min(src.0.wrapping_sub(T::ONE)));
+            let false_src = (src.0.max(dst.0.wrapping_add(T::ONE)), src.1);
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst < src → dst <= src.max - 1, src >= dst.min + 1
+        // false: dst >= src → dst >= src.min, src <= dst.max
+        OrdOp::Lt => {
+            let true_dst = (dst.0, dst.1.min(src.1.wrapping_sub(T::ONE)));
+            let true_src = (src.0.max(dst.0.wrapping_add(T::ONE)), src.1);
+            let false_dst = (dst.0.max(src.0), dst.1);
+            let false_src = (src.0, src.1.min(dst.1));
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst <= src → dst <= src.max, src >= dst.min
+        // false: dst > src → dst >= src.min + 1, src <= dst.max - 1
+        OrdOp::Le => {
+            let true_dst = (dst.0, dst.1.min(src.1));
+            let true_src = (src.0.max(dst.0), src.1);
+            let false_dst = (dst.0.max(src.0.wrapping_add(T::ONE)), dst.1);
+            let false_src = (src.0, src.1.min(dst.1.wrapping_sub(T::ONE)));
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+    }
 }
 
-/// Refine two scalar ranges on the `dst == src` comparison.
+/// Refine two scalar bounds for both branch sides of `dst OP src`.
 ///
-/// - true branch: both operands take the intersection of the two ranges
-///   (min > max means the branch is infeasible)
+/// The opcode family decides which interval family is narrowed (kernel
+/// regs_refine_cond_op): unsigned compares narrow `umin`/`umax`, signed
+/// compares narrow `smin`/`smax`; equality and inequality narrow both.
+/// Every refined state is re-synced so the interpretations stay
+/// consistent (kernel reg_bounds_sync). A refined range with min > max
+/// means the branch is infeasible.
+pub(crate) fn refine_cmp(op: CondOp, dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    match op {
+        CondOp::Eq => refine_eq(dst, src),
+        CondOp::Ne => refine_ne(dst, src),
+        _ => {
+            let ord = op.ord().expect("ordered comparison");
+            if op.is_signed() {
+                let ((td, ts), (fd, fs)) = refine_ordered(ord, dst.signed(), src.signed());
+                (
+                    (with_signed(dst, td).synced(), with_signed(src, ts).synced()),
+                    (with_signed(dst, fd).synced(), with_signed(src, fs).synced()),
+                )
+            } else {
+                let ((td, ts), (fd, fs)) = refine_ordered(ord, dst.unsigned(), src.unsigned());
+                (
+                    (
+                        with_unsigned(dst, td).synced(),
+                        with_unsigned(src, ts).synced(),
+                    ),
+                    (
+                        with_unsigned(dst, fd).synced(),
+                        with_unsigned(src, fs).synced(),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+fn with_signed(b: ScalarBounds, r: (i64, i64)) -> ScalarBounds {
+    let mut b = b;
+    b.smin = r.0;
+    b.smax = r.1;
+    b
+}
+
+fn with_unsigned(b: ScalarBounds, r: (u64, u64)) -> ScalarBounds {
+    let mut b = b;
+    b.umin = r.0;
+    b.umax = r.1;
+    b
+}
+
+/// Refine two scalar bounds on the `dst == src` comparison.
+///
+/// - true branch: both operands take the intersection of the two bounds
+///   per interval family (min > max means the branch is infeasible)
 /// - false branch: a single interval cannot represent the complement of
 ///   another interval, so no safe narrowing is possible — both are kept
-pub(crate) fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    let inter = (dst.0.max(src.0), dst.1.min(src.1));
-    ((inter, inter), (dst, src))
+pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    let inter = ScalarBounds {
+        smin: dst.smin.max(src.smin),
+        smax: dst.smax.min(src.smax),
+        umin: dst.umin.max(src.umin),
+        umax: dst.umax.min(src.umax),
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
+        // equality narrows the tnum to the common values (kernel
+        // tnum_intersect in regs_refine_cond_op)
+        tnum: dst.tnum.intersect(src.tnum),
+    }
+    .synced();
+    // the fall-through (dst != src) excludes the other operand's values
+    // where a single interval still represents the complement — e.g.
+    // r1 = [0, 42] == 42 → fall r1 = [0, 41] (#44)
+    (
+        (inter, inter),
+        (
+            exclude_bounds(dst, src).synced(),
+            exclude_bounds(src, dst).synced(),
+        ),
+    )
+}
+
+/// Narrow `a` by excluding `b`'s values, when the complement is still a
+/// single interval. `None` means no narrowing is representable.
+fn exclude_interval<T: WrapInt>(a: (T, T), b: (T, T)) -> Option<(T, T)> {
+    // b covers everything of a → the branch is infeasible (empty range)
+    if b.0 <= a.0 && b.1 >= a.1 {
+        return Some((T::MAX, T::MIN));
+    }
+    // b sits at the low end of a → a ∈ [b.1 + 1, a.1]
+    if b.0 <= a.0 {
+        return Some((b.1.wrapping_add(T::ONE), a.1));
+    }
+    // b sits at the high end of a → a ∈ [a.0, b.0 - 1]
+    if b.1 >= a.1 {
+        return Some((a.0, b.0.wrapping_sub(T::ONE)));
+    }
+    // b is strictly inside a → the complement is two intervals
+    None
+}
+
+/// Narrow every interval family of `a` by excluding `b`'s values where
+/// a single interval still represents the complement.
+///
+/// This is only sound when `b` is a constant: with a non-constant
+/// operand, for every value of `a` there exists a differing value of
+/// `b` (the inequality constraint never forces `a` to a smaller set).
+fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
+    if !b.is_constant() {
+        return a;
+    }
+    let s = exclude_interval(a.signed(), (b.smin, b.smin)).unwrap_or(a.signed());
+    let u = exclude_interval(a.unsigned(), (b.umin, b.umin)).unwrap_or(a.unsigned());
+    ScalarBounds {
+        smin: s.0,
+        smax: s.1,
+        umin: u.0,
+        umax: u.1,
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
+        // inequality cannot narrow the tnum: the complement of a tnum
+        // is not representable — keep the sound over-approximation
+        tnum: a.tnum,
+    }
+}
+
+/// Refine two scalar bounds on the `dst != src` comparison.
+///
+/// - true branch: each operand excludes the other's bounds, where a
+///   single interval still represents the complement
+/// - false branch: both operands take the intersection (equality)
+pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    let inter = ScalarBounds {
+        smin: dst.smin.max(src.smin),
+        smax: dst.smax.min(src.smax),
+        umin: dst.umin.max(src.umin),
+        umax: dst.umax.min(src.umax),
+        s32_min: i32::MIN,
+        s32_max: i32::MAX,
+        u32_min: 0,
+        u32_max: u32::MAX,
+        tnum: dst.tnum.intersect(src.tnum),
+    }
+    .synced();
+    (
+        (
+            exclude_bounds(dst, src).synced(),
+            exclude_bounds(src, dst).synced(),
+        ),
+        (inter, inter),
+    )
+}
+
+/// The conditional comparisons of the mini/meso subset.
+///
+/// The unsigned family (JGT/JGE/JLT/JLE) compares values as u64, the
+/// signed family (JSGT/JSGE/JSLT/JSLE) as i64; equality is the same in
+/// both interpretations. The pre-#39 single `Jgt` was interpreted as
+/// signed — the split into distinct opcodes happened in #39.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CondOp {
+    Eq,
+    Ne,
+    /// Unsigned comparisons (JGT/JGE/JLT/JLE).
+    Ugt,
+    Uge,
+    Ult,
+    Ule,
+    /// Signed comparisons (JSGT/JSGE/JSLT/JSLE).
+    Sgt,
+    Sge,
+    Slt,
+    Sle,
+}
+
+impl CondOp {
+    /// The operator symbol used in error messages.
+    pub(crate) fn symbol(self) -> &'static str {
+        match self {
+            CondOp::Eq => "==",
+            CondOp::Ne => "!=",
+            CondOp::Ugt | CondOp::Sgt => ">",
+            CondOp::Uge | CondOp::Sge => ">=",
+            CondOp::Ult | CondOp::Slt => "<",
+            CondOp::Ule | CondOp::Sle => "<=",
+        }
+    }
+
+    /// The ordered comparison shape, or `None` for equality/inequality.
+    pub(crate) fn ord(self) -> Option<OrdOp> {
+        match self {
+            CondOp::Ugt | CondOp::Sgt => Some(OrdOp::Gt),
+            CondOp::Uge | CondOp::Sge => Some(OrdOp::Ge),
+            CondOp::Ult | CondOp::Slt => Some(OrdOp::Lt),
+            CondOp::Ule | CondOp::Sle => Some(OrdOp::Le),
+            CondOp::Eq | CondOp::Ne => None,
+        }
+    }
+
+    /// Whether this opcode belongs to the signed family (JSGT/JSGE/…).
+    pub(crate) fn is_signed(self) -> bool {
+        matches!(self, CondOp::Sgt | CondOp::Sge | CondOp::Slt | CondOp::Sle)
+    }
 }
 
 // ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
@@ -220,13 +1087,6 @@ pub(crate) fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
 pub(crate) struct WorkItem {
     pub(crate) pc: u32,
     pub(crate) state: VerifierState,
-}
-
-/// The conditional comparisons in the mini subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CondOp {
-    Eq,
-    Gt,
 }
 
 /// PC-relative branch target: the offset is relative to the next insn.
@@ -245,14 +1105,11 @@ pub(crate) enum BranchVerdict {
     Unknown,
 }
 
-/// Decide whether a conditional branch is statically always taken,
-/// never taken, or unknown for the given scalar ranges (cf. the
-/// kernel's is_branch_taken()).
-pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerdict {
+/// The static verdict for one ordered comparison on one interval family
+/// (sound for any `Ord` type).
+fn ordered_verdict<T: Ord>(op: OrdOp, dst: (T, T), src: (T, T)) -> BranchVerdict {
     match op {
-        // dst > src: always true iff dst.min > src.max,
-        // always false iff dst.max <= src.min
-        CondOp::Gt => {
+        OrdOp::Gt => {
             if dst.0 > src.1 {
                 BranchVerdict::AlwaysTaken
             } else if dst.1 <= src.0 {
@@ -261,15 +1118,93 @@ pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) ->
                 BranchVerdict::Unknown
             }
         }
-        // dst == src: always true iff both are the same constant,
-        // always false iff the ranges are disjoint
-        CondOp::Eq => {
-            if dst.0 == dst.1 && src.0 == src.1 && dst.0 == src.0 {
+        OrdOp::Ge => {
+            if dst.0 >= src.1 {
                 BranchVerdict::AlwaysTaken
-            } else if dst.1 < src.0 || dst.0 > src.1 {
+            } else if dst.1 < src.0 {
                 BranchVerdict::AlwaysNotTaken
             } else {
                 BranchVerdict::Unknown
+            }
+        }
+        OrdOp::Lt => {
+            if dst.1 < src.0 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.0 >= src.1 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+        OrdOp::Le => {
+            if dst.1 <= src.0 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.0 > src.1 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+    }
+}
+
+/// Whether two ranges of one interval family are disjoint.
+fn ranges_disjoint<T: Ord>(a: (T, T), b: (T, T)) -> bool {
+    a.1 < b.0 || a.0 > b.1
+}
+
+/// Decide whether a conditional branch is statically always taken,
+/// never taken, or unknown for the given scalar bounds (cf. the
+/// kernel's is_branch_taken()).
+///
+/// Ordered comparisons decide on the opcode's interval family: the
+/// unsigned family (JGT/JGE/JLT/JLE) on `umin`/`umax`, the signed
+/// family (JSGT/JSGE/JSLT/JSLE) on `smin`/`smax`. Equality needs both
+/// families: it always holds only for the same constant, and can never
+/// hold when either family pair is disjoint (sound because a scalar's
+/// value set is contained in both of its intervals; synced states keep
+/// this precise).
+pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarBounds, src: ScalarBounds) -> BranchVerdict {
+    match op {
+        // dst == src: always true iff both are the same constant in both
+        // interpretations, always false iff either family is disjoint
+        CondOp::Eq => {
+            if dst.is_constant()
+                && src.is_constant()
+                && dst.smin == src.smin
+                && dst.umin == src.umin
+            {
+                BranchVerdict::AlwaysTaken
+            } else if ranges_disjoint(dst.signed(), src.signed())
+                || ranges_disjoint(dst.unsigned(), src.unsigned())
+            {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+        // dst != src: the dual of equality
+        CondOp::Ne => {
+            if dst.is_constant()
+                && src.is_constant()
+                && dst.smin == src.smin
+                && dst.umin == src.umin
+            {
+                BranchVerdict::AlwaysNotTaken
+            } else if ranges_disjoint(dst.signed(), src.signed())
+                || ranges_disjoint(dst.unsigned(), src.unsigned())
+            {
+                BranchVerdict::AlwaysTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+        _ => {
+            let ord = op.ord().expect("ordered comparison");
+            if op.is_signed() {
+                ordered_verdict(ord, dst.signed(), src.signed())
+            } else {
+                ordered_verdict(ord, dst.unsigned(), src.unsigned())
             }
         }
     }
@@ -292,8 +1227,32 @@ pub(crate) fn successors(
         BpfInsn::Jeq { dst, src, offset } => {
             cond_branch(pc, *dst, *src, *offset, CondOp::Eq, state)
         }
+        BpfInsn::Jne { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Ne, state)
+        }
         BpfInsn::Jgt { dst, src, offset } => {
-            cond_branch(pc, *dst, *src, *offset, CondOp::Gt, state)
+            cond_branch(pc, *dst, *src, *offset, CondOp::Ugt, state)
+        }
+        BpfInsn::Jge { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Uge, state)
+        }
+        BpfInsn::Jlt { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Ult, state)
+        }
+        BpfInsn::Jle { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Ule, state)
+        }
+        BpfInsn::Jsgt { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Sgt, state)
+        }
+        BpfInsn::Jsge { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Sge, state)
+        }
+        BpfInsn::Jslt { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Slt, state)
+        }
+        BpfInsn::Jsle { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Sle, state)
         }
         // everything else falls through via step() (this includes
         // helper calls, which step() validates — #28)
@@ -329,85 +1288,100 @@ pub(crate) fn cond_branch(
     let fall_pc = pc + 1;
 
     let out = match (dst_state, src_state) {
-        (
-            RegState::Scalar {
-                min: dmin,
-                max: dmax,
-            },
-            RegState::Scalar {
-                min: smin,
-                max: smax,
-            },
-        ) => {
-            let verdict = is_branch_taken(op, (dmin, dmax), (smin, smax));
-            let ((t_dst, t_src), (f_dst, f_src)) = match op {
-                CondOp::Eq => refine_eq((dmin, dmax), (smin, smax)),
-                CondOp::Gt => refine_gt((dmin, dmax), (smin, smax)),
-            };
+        (RegState::Scalar(d), RegState::Scalar(s)) => {
+            let verdict = is_branch_taken(op, d, s);
+            let ((t_dst, t_src), (f_dst, f_src)) = refine_cmp(op, d, s);
             let mut out = Vec::with_capacity(2);
             // a statically impossible branch is never explored
             if !matches!(verdict, BranchVerdict::AlwaysNotTaken) {
                 let mut taken = *state;
-                taken.regs[dst as usize] = RegState::Scalar {
-                    min: t_dst.0,
-                    max: t_dst.1,
-                };
-                taken.regs[src as usize] = RegState::Scalar {
-                    min: t_src.0,
-                    max: t_src.1,
-                };
+                taken.regs[dst as usize] = RegState::Scalar(t_dst);
+                taken.regs[src as usize] = RegState::Scalar(t_src);
                 out.push((taken_pc, taken));
             }
             if !matches!(verdict, BranchVerdict::AlwaysTaken) {
                 let mut fall = *state;
-                fall.regs[dst as usize] = RegState::Scalar {
-                    min: f_dst.0,
-                    max: f_dst.1,
-                };
-                fall.regs[src as usize] = RegState::Scalar {
-                    min: f_src.0,
-                    max: f_src.1,
-                };
+                fall.regs[dst as usize] = RegState::Scalar(f_dst);
+                fall.regs[src as usize] = RegState::Scalar(f_src);
                 out.push((fall_pc, fall));
             }
             out
         }
-        // NULL check: a nullable pointer compared to the constant 0
-        (RegState::PtrToMapValueOrNull, RegState::Scalar { min: 0, max: 0 })
-        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValueOrNull) => {
-            let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
-                dst
-            } else {
-                src
-            };
-            // taken (== 0): the pointer becomes the constant 0 (kernel
-            // style — NULL is a scalar zero, not a pointer type)
-            let mut taken = *state;
-            taken.regs[ptr_reg as usize] = RegState::Scalar { min: 0, max: 0 };
-            // fall (!= 0): refined to a valid map value pointer
-            let mut not_null = *state;
-            not_null.regs[ptr_reg as usize] = RegState::PtrToMapValue;
-            vec![(taken_pc, taken), (fall_pc, not_null)]
+        // NULL check: a nullable pointer compared to the constant 0. For
+        // `== 0` the taken branch becomes the scalar 0 and the fall-through
+        // a valid map value pointer; for `!= 0` the roles are swapped.
+        (RegState::PtrToMapValueOrNull, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull)
+            if s.is_zero() =>
+        {
+            match op {
+                CondOp::Eq | CondOp::Ne => {
+                    let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
+                        dst
+                    } else {
+                        src
+                    };
+                    let (null_side, valid_side) = match op {
+                        // == 0: taken is NULL, fall is the valid pointer
+                        CondOp::Eq => (taken_pc, fall_pc),
+                        // != 0: taken is the valid pointer, fall is NULL
+                        CondOp::Ne => (fall_pc, taken_pc),
+                        _ => unreachable!(),
+                    };
+                    let mut null_state = *state;
+                    null_state.regs[ptr_reg as usize] = RegState::Scalar(ScalarBounds::constant(0));
+                    let mut valid = *state;
+                    valid.regs[ptr_reg as usize] = RegState::PtrToMapValue;
+                    vec![(null_side, null_state), (valid_side, valid)]
+                }
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "invalid comparison of r{} with r{} (different types)",
+                            dst, src
+                        ),
+                    ));
+                }
+            }
         }
-        // a non-null map value pointer compared to 0: both branches are
-        // kept without refinement (simplified — the kernel marks the
-        // taken branch infeasible)
-        (RegState::PtrToMapValue, RegState::Scalar { min: 0, max: 0 })
-        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValue) => {
-            vec![(taken_pc, *state), (fall_pc, *state)]
+        // a non-null map value pointer compared to 0: equality and
+        // inequality are kept without refinement (simplified — the kernel
+        // marks the taken branch of == 0 infeasible)
+        (RegState::PtrToMapValue, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValue)
+            if s.is_zero() =>
+        {
+            match op {
+                CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "invalid comparison of r{} with r{} (different types)",
+                            dst, src
+                        ),
+                    ));
+                }
+            }
         }
-        // pointers of the same type: equality is allowed without
-        // refinement; `>` on pointers is not
+        // pointers of the same type: equality and inequality are allowed
+        // without refinement; ordered comparisons on pointers are not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
         | (RegState::PtrToCtx, RegState::PtrToCtx)
         | (RegState::PtrToMap, RegState::PtrToMap)
         | (RegState::PtrToMapValue, RegState::PtrToMapValue)
         | (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => match op {
-            CondOp::Eq => vec![(taken_pc, *state), (fall_pc, *state)],
-            CondOp::Gt => {
+            CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
+            _ => {
                 return Err(VerificationFailure::new(
                     pc,
-                    format!("comparing pointers r{} > r{} is not allowed", dst, src),
+                    format!(
+                        "comparing pointers r{} {} r{} is not allowed",
+                        dst,
+                        op.symbol(),
+                        src
+                    ),
                 ));
             }
         },
@@ -444,10 +1418,10 @@ mod tests {
         // Before: R2 = Uninit;  r2 = 10;  After: R2 = Scalar(10..10)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
-        assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(10)));
         // other registers untouched
         assert_eq!(next.regs[1], RegState::PtrToCtx);
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     #[test]
@@ -455,7 +1429,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
-        assert_eq!(next.regs[2], RegState::Scalar { min: 20, max: 20 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(20)));
     }
 
     #[test]
@@ -463,7 +1437,7 @@ mod tests {
         // i32 imm is sign-extended into the i64 scalar range
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: -7 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: -7, max: -7 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(-7)));
     }
 
     #[test]
@@ -471,7 +1445,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovReg { dst: 3, src: 2 }).unwrap();
-        assert_eq!(next.regs[3], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[3], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -480,7 +1454,7 @@ mod tests {
         let next = step(0, &state, &BpfInsn::MovReg { dst: 4, src: 1 }).unwrap();
         assert_eq!(next.regs[4], RegState::PtrToCtx);
         let next = step(0, &state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[5], ptr_stack(0));
     }
 
     #[test]
@@ -506,7 +1480,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -543,7 +1517,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 30, max: 30 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(30)));
     }
 
     #[test]
@@ -551,7 +1525,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: -3 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
     }
 
     #[test]
@@ -560,9 +1534,9 @@ mod tests {
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 15, max: 15 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(15)));
         // the source register is unchanged
-        assert_eq!(next.regs[2], RegState::Scalar { min: 5, max: 5 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(5)));
     }
 
     #[test]
@@ -571,26 +1545,32 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 1 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 20, max: 20 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(20)));
     }
 
     #[test]
     fn step_add_imm_range() {
         // range shift, a preview of #16: [0, 100] + 10 → [10, 110]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 10, max: 110 });
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(10, 110))
+        );
     }
 
     #[test]
     fn step_add_reg_ranges() {
         // [0, 100] + [5, 5] → [5, 105]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(5));
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 5, max: 105 });
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(5, 105))
+        );
     }
 
     #[test]
@@ -619,14 +1599,1135 @@ mod tests {
         assert!(err.message.contains("register-offset"));
     }
 
+    // ── ALU extension (Meso #39) ─────────────────────────────────────────────
+
+    #[test]
+    fn step_alu_dual_ranges_propagate() {
+        // r1 = -1; r1 += -1 → -2 in both interpretations (u64 wraps too)
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: -1 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (-2, -2));
+        assert_eq!(b.unsigned(), (u64::MAX - 1, u64::MAX - 1));
+    }
+
+    #[test]
+    fn step_alu_overflow_falls_back_to_full_range() {
+        // [MIN, MAX] - 100 overflows the signed range: the result is the
+        // full range, never a wrapped min > max state (#43)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
+        let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 100 }).unwrap();
+        let next = step(0, &next, &BpfInsn::SubReg { dst: 1, src: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (i64::MIN, i64::MAX));
+        assert_eq!(b.unsigned(), (0, u64::MAX));
+    }
+
+    #[test]
+    fn step_add_overflow_issue_example() {
+        // issue example: [MAX-5, MAX] + 10 must never produce an empty
+        // (min > max) range. The signed family overflows and falls back
+        // to the full range, but the unsigned family did not overflow —
+        // the sync then recovers the exact wrapped interval (kernel
+        // __reg64_deduce_bounds, "negative" unsigned view).
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(i64::MAX - 5, i64::MAX));
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.smin <= b.smax);
+        // (MAX-5..MAX) + 10 mod 2^64 = (MIN+4..MIN+9) — exact
+        assert_eq!(b.signed(), (i64::MIN + 4, i64::MIN + 9));
+        assert_eq!(b.unsigned(), (i64::MAX as u64 + 5, i64::MAX as u64 + 10));
+    }
+
+    #[test]
+    fn step_add_overflow_unsigned_only() {
+        // [MAX-5, MAX] + 10 as u64 overflows; the signed view of the same
+        // state is negative and does not overflow
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: -10,
+            smax: -1,
+            umin: u64::MAX - 9,
+            umax: u64::MAX,
+            s32_min: -10,
+            s32_max: -1,
+            u32_min: u32::MAX - 9,
+            u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
+        });
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // signed: [-10, -1] + 10 = [0, 9]
+        assert_eq!(b.signed(), (0, 9));
+        // unsigned: MAX-9..MAX + 10 wraps; the full-range fallback is
+        // intersected with the signed view by the sync → [0, 9] exact
+        assert_eq!(b.unsigned(), (0, 9));
+    }
+
+    #[test]
+    fn step_sub_overflow_falls_back() {
+        // [MIN, MIN + 5] - 10 overflows the signed family: never an empty
+        // range; the unsigned view (which did not overflow) recovers the
+        // exact wrapped interval through the sync
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(i64::MIN, i64::MIN + 5));
+        let next = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.smin <= b.smax && b.umin <= b.umax);
+        // MIN - 10 mod 2^64 = 2^63 - 10, which is positive in the signed
+        // view — the sync recovers the exact interval from the unsigned
+        // family (which did not overflow)
+        assert_eq!(
+            b.signed(),
+            (((1u64 << 63) - 10) as i64, ((1u64 << 63) - 5) as i64)
+        );
+        assert_eq!(b.unsigned(), ((1u64 << 63) - 10, (1u64 << 63) - 5));
+    }
+
+    #[test]
+    fn step_add_non_overflowing_unchanged() {
+        // no behavior change for non-overflowing arithmetic
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(30)));
+        // build the i64::MAX constant: 0x80000000 << 32 - 1
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: -0x8000_0000,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 32 }).unwrap();
+        let state = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 1 }).unwrap();
+        let RegState::Scalar(b) = state.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (i64::MAX, i64::MAX));
+        // a constant that wraps stays exact (wrapping is the eBPF ALU
+        // semantics: i64::MAX + 1 == i64::MIN)
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::constant(i64::MIN))
+        );
+    }
+
+    #[test]
+    fn alu_matrix_keeps_range_invariant() {
+        // the min <= max invariant holds across an ALU test matrix (#43):
+        // no operation may produce an empty (wrapped) range
+        let cases: [(AluOp, AluWidth, i64, i64, i64, i64); 12] = [
+            // (op, width, dmin, dmax, smin, smax)
+            (AluOp::Add, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Add, AluWidth::W64, i64::MAX - 5, i64::MAX, 10, 10),
+            (AluOp::Sub, AluWidth::W64, i64::MIN, i64::MIN + 5, 10, 10),
+            (AluOp::Sub, AluWidth::W64, i64::MIN, i64::MAX, -1, -1),
+            (AluOp::And, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Or, AluWidth::W64, i64::MIN, i64::MAX, 8, 8),
+            (AluOp::Xor, AluWidth::W64, -100, 100, -50, 50),
+            (AluOp::Lsh, AluWidth::W64, 1, i64::MAX, 1, 1),
+            (AluOp::Lsh, AluWidth::W64, 1 << 61, i64::MAX, 2, 2),
+            (AluOp::Rsh, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Arsh, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Add, AluWidth::W32, i64::MIN, i64::MAX, 1, 1),
+        ];
+        for (op, width, dmin, dmax, smin, smax) in cases {
+            let mut state = VerifierState::initial();
+            state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(dmin, dmax));
+            state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(smin, smax));
+            let result = apply_alu(
+                op,
+                width,
+                as_scalar(state.regs[1]),
+                as_scalar(state.regs[2]),
+            );
+            assert!(
+                result.smin <= result.smax && result.umin <= result.umax,
+                "{:?} {:?} on [{}, {}] x [{}, {}] → {:?}",
+                op,
+                width,
+                dmin,
+                dmax,
+                smin,
+                smax,
+                result
+            );
+            assert!(
+                result.s32_min <= result.s32_max && result.u32_min <= result.u32_max,
+                "32-bit invariant {:?} {:?} on [{}, {}] x [{}, {}] → {:?}",
+                op,
+                width,
+                dmin,
+                dmax,
+                smin,
+                smax,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn step_alu_shift_block_boundary_sound() {
+        // a range spanning a 2^(64-k) block boundary wraps multiple
+        // times: the range must widen instead of claiming [MIN, -4]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(1i64 << 61, i64::MAX));
+        let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // the true results include 0, so a narrow wrapped interval would
+        // be unsound — the full range is the only sound answer
+        assert_eq!(b.signed(), (i64::MIN, i64::MAX));
+        // within one block the shift stays exact
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(1 << 60, (1 << 60) + 3));
+        let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (1 << 62, (1 << 62) + 12));
+    }
+
+    #[test]
+    fn step_sub_imm_issue_example() {
+        // r1 = 10; r1 -= 3 → R1 = Scalar(7..7)
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+        let next = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 3 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
+    }
+
+    #[test]
+    fn step_sub_reg_negative_result() {
+        // 10 - 20 = -10, wrapped arithmetic is exact bit arithmetic
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
+        let next = step(0, &state, &BpfInsn::SubReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(-10)));
+    }
+
+    #[test]
+    fn step_and_or_xor_imm() {
+        // 12 & 10 = 8, 12 | 3 = 15, 12 ^ 10 = 6
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 12 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 10 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(8)));
+        let next = step(0, &next, &BpfInsn::OrImm { dst: 1, imm: 3 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(11)));
+        let next = step(0, &next, &BpfInsn::XorImm { dst: 1, imm: 12 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
+    }
+
+    #[test]
+    fn step_and_reg_tnum_like_precision() {
+        // r2 = [0, 100]; r2 &= 1 → the result is bounded by the AND mask
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        let next = step(0, &state, &BpfInsn::AndImm { dst: 2, imm: 1 }).unwrap();
+        assert_eq!(
+            next.regs[2],
+            RegState::Scalar(ScalarBounds::from_signed(0, 1))
+        );
+    }
+
+    #[test]
+    fn step_shifts_imm() {
+        // 1 << 4 = 16, >> 2 = 4, s>> 1 = 2
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 4 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(16)));
+        let next = step(0, &next, &BpfInsn::RshImm { dst: 1, imm: 2 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(4)));
+        let next = step(0, &next, &BpfInsn::ArshImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(2)));
+        // arithmetic shift sign-extends: -8 s>> 1 = -4
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -8 }).unwrap();
+        let next = step(0, &state, &BpfInsn::ArshImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(-4)));
+    }
+
+    #[test]
+    fn step_shift_reg() {
+        // r1 = 1; r2 = 4; r1 <<= r2 → 16
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 4 }).unwrap();
+        let next = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(16)));
+    }
+
+    #[test]
+    fn step_shift_imm_out_of_range_rejected() {
+        // shifts by >= 64 or negative amounts are invalid (kernel check_alu_op)
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
+        for imm in [64, 100, -1] {
+            let err = step(0, &state, &BpfInsn::LshImm { dst: 1, imm }).unwrap_err();
+            assert!(err.message.contains("invalid shift"), "imm {}", imm);
+        }
+        // a register shift amount that may exceed 63 is rejected too
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 64 }).unwrap();
+        let err = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("invalid shift"));
+    }
+
+    #[test]
+    fn step_alu32_constants_truncate_and_zero_extend() {
+        // w1 = 0x1_0000_0001 (via two adds) then w1 += 0 → trunc32 = 1
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
+        assert_eq!(
+            state.regs[1],
+            RegState::Scalar(ScalarBounds::constant(0x1_0000_0001))
+        );
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        // the high 32 bits are zero-extended away
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(1)));
+    }
+
+    #[test]
+    fn step_alu32_overflow_wraps_to_zero() {
+        // w1 = 0xFFFFFFFF; w1 += 1 → 0x1_0000_0000 trunc32 → 0
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(0)));
+    }
+
+    #[test]
+    fn step_alu32_range_zero_extended() {
+        // a non-constant ALU32 result is zero-extended: [0, 0xFFFFFFFF]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-100, 100));
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 0xFFFF_FFFF))
+        );
+    }
+
+    #[test]
+    fn step_alu32_vs_alu64_divergence() {
+        // r1 = 0x1_0000_0001 (built via adds): ALU64 keeps the high bits,
+        // ALU32 truncates them away and zero-extends
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
+        // ALU64: r1 += 1 → 0x1_0000_0002
+        let w64 = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(
+            w64.regs[1],
+            RegState::Scalar(ScalarBounds::constant(0x1_0000_0002))
+        );
+        // ALU32: w1 += 1 → trunc32(0x1_0000_0001) + 1 = 2
+        let w32 = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(w32.regs[1], RegState::Scalar(ScalarBounds::constant(2)));
+    }
+
+    #[test]
+    fn step_alu32_known_zero_high_bits() {
+        // an ALU32 result always lies in [0, 0xFFFFFFFF]: the high 32
+        // bits are known zero (#41)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xFFFF_FFFF));
+        assert_eq!(b.unsigned(), (0, 0xFFFF_FFFF));
+        // and the 32-bit sub-ranges carry the same bits
+        assert_eq!((b.u32_min, b.u32_max), (0, u32::MAX));
+    }
+
+    #[test]
+    fn step_alu32_tracks_32_bit_ranges() {
+        // a "negative" 32-bit constant zero-extends: 0x80000000 as u64 is
+        // positive, while its s32 view is negative (i32 truncation)
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: -0x8000_0000,
+            },
+        )
+        .unwrap();
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0x8000_0000, 0x8000_0000));
+        assert_eq!(b.s32_min, -0x8000_0000);
+        assert_eq!(b.u32_min, 0x8000_0000);
+        // a 64-bit constant outside 32 bits truncates into the 32-bit view
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 0x7FFF_FFFF,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
+        let RegState::Scalar(b) = state.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0x1_0000_0001, 0x1_0000_0001));
+        assert_eq!(b.u32_min, 1);
+        assert_eq!(b.u32_max, 1);
+        assert_eq!(b.s32_min, 1);
+        assert_eq!(b.s32_max, 1);
+    }
+
+    #[test]
+    fn step_alu_tnum_bitwise_issue_example() {
+        // issue example: r1 = 0b1xx (values {1, 3}); r1 &= 1 yields a
+        // constant 1 in the tnum
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 1,
+            smax: 3,
+            umin: 1,
+            umax: 3,
+            s32_min: 1,
+            s32_max: 3,
+            u32_min: 1,
+            u32_max: 3,
+            tnum: Tnum {
+                value: 0b001,
+                mask: 0b010,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 1 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.tnum.is_constant());
+        assert_eq!(b.tnum.value, 1);
+    }
+
+    #[test]
+    fn step_alu_tnum_or_keeps_known_bits() {
+        // r1 = {0, 1} (bit0 unknown); r1 |= 0b100 keeps bit2 known
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::OrImm { dst: 1, imm: 0b100 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // values {100, 101}: bit2 known one, bit0 unknown
+        assert_eq!(
+            b.tnum,
+            Tnum {
+                value: 0b100,
+                mask: 0b001
+            }
+        );
+    }
+
+    #[test]
+    fn step_alu32_truncates_tnum() {
+        // 0x1_0000_0001 truncates to 1 in the tnum as well
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0x1_0000_0001,
+            smax: 0x1_0000_0001,
+            umin: 0x1_0000_0001,
+            umax: 0x1_0000_0001,
+            s32_min: 1,
+            s32_max: 1,
+            u32_min: 1,
+            u32_max: 1,
+            tnum: Tnum::constant(0x1_0000_0001),
+        });
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn cond_branch_eq_narrows_tnum() {
+        // r1 = {0, 1} (tnum) == 1: the taken side intersects the tnum
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jeq {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        let (_, taken) = &nexts[0];
+        let RegState::Scalar(b) = taken.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn cond_branch_jne_keeps_tnum() {
+        // r1 = {0, 1} != 1: the taken side keeps the sound over-approximation
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jne {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        let (_, taken) = &nexts[0];
+        let RegState::Scalar(b) = taken.regs[1] else {
+            panic!("expected scalar");
+        };
+        // the exclusion narrows the range to [0, 0] and the sync pins the
+        // tnum down to the constant 0 — exact, not just over-approximated
+        assert_eq!(b.tnum, Tnum::constant(0));
+        // the fall-through (equality) intersects
+        let (_, fall) = &nexts[1];
+        let RegState::Scalar(b) = fall.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn spill_fill_preserves_tnum() {
+        // the stack slot stores the full RegState, tnum included (#42)
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        let state = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+        let next = step(0, &state, &BpfInsn::LdStack { dst: 3, offset: -8 }).unwrap();
+        assert_eq!(next.regs[3], state.regs[2]);
+        let RegState::Scalar(b) = next.regs[3] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(
+            b.tnum,
+            Tnum {
+                value: 0,
+                mask: 0b001
+            }
+        );
+    }
+
+    #[test]
+    fn step_alu32_range_wrap() {
+        // w1: [0xFFFFFFF0, 0xFFFFFFFF] += 0x10 wraps to [0, 0xF]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(
+            ScalarBounds {
+                smin: 0xFFFF_FFF0,
+                smax: 0xFFFF_FFFF,
+                umin: 0xFFFF_FFF0,
+                umax: 0xFFFF_FFFF,
+                s32_min: -0x10,
+                s32_max: -1,
+                u32_min: 0xFFFF_FFF0,
+                u32_max: 0xFFFF_FFFF,
+                tnum: Tnum::unknown(),
+            }
+            .synced(),
+        );
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0x10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xF));
+        assert_eq!(b.unsigned(), (0, 0xF));
+        // a range crossing the 32-bit boundary widens to the full range
+        state.regs[1] = RegState::Scalar(
+            ScalarBounds {
+                smin: 0xFFFF_FFF0,
+                smax: 0x1_0000_0010,
+                umin: 0xFFFF_FFF0,
+                umax: 0x1_0000_0010,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
+                tnum: Tnum::unknown(),
+            }
+            .synced(),
+        );
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (0, 0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn step_alu32_range_addition_exact() {
+        // [0, 10] + [5, 5] in 32-bit space stays exact
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 10));
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (5, 15));
+        assert_eq!((b.u32_min, b.u32_max), (5, 15));
+    }
+
+    #[test]
+    fn step_alu32_pointer_rejected() {
+        // 32-bit arithmetic on a context pointer is rejected
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 1 }).unwrap_err();
+        assert!(err.message.contains("context pointer"));
+    }
+
+    #[test]
+    fn step_sub_on_stack_pointer_rejected() {
+        // only ADD supports stack pointer arithmetic (kernel check_alu_op)
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::SubImm { dst: 10, imm: 8 }).unwrap_err();
+        assert!(err.message.contains("stack pointer"));
+        assert!(err.message.contains("only ADD"));
+        // ... and ADD32 on the frame pointer is rejected too
+        let err = step(0, &state, &BpfInsn::Add32Imm { dst: 10, imm: 1 }).unwrap_err();
+        assert!(err.message.contains("stack pointer"));
+    }
+
+    #[test]
+    fn step_alu_uninit_rejected() {
+        // every new ALU op reads the destination first (#14)
+        let state = VerifierState::initial();
+        for insn in [
+            BpfInsn::SubImm { dst: 0, imm: 1 },
+            BpfInsn::AndReg { dst: 0, src: 1 },
+            BpfInsn::Xor32Imm { dst: 0, imm: 1 },
+            BpfInsn::LshImm { dst: 0, imm: 1 },
+        ] {
+            let err = step(0, &state, &insn).unwrap_err();
+            assert!(err.message.contains("uninitialized"));
+        }
+    }
+
+    #[test]
+    fn step_alu_reg_pointer_src_rejected() {
+        // register-offset arithmetic stays rejected for every new op
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
+        let err = step(0, &state, &BpfInsn::SubReg { dst: 0, src: 10 }).unwrap_err();
+        assert!(err.message.contains("register-offset"));
+    }
+
+    // ── New compare opcodes (Meso #39) ───────────────────────────────────────
+
+    #[test]
+    fn successors_jne_issue_example() {
+        // r1 = 5 != r2 = 7 is always true: only the taken branch
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(5));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(7));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jne {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 2);
+    }
+
+    #[test]
+    fn successors_jne_refines_equality_side() {
+        // r1 = [0, 100] != 42: the fall-through (== 42) keeps both in [42, 42]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(42));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jne {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        // taken: r1 = [0, 100] (complement not representable)
+        assert_eq!(
+            nexts[0].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 100))
+        );
+        // fall: equality narrows to the constant
+        assert_eq!(
+            nexts[1].1.regs[1],
+            RegState::Scalar(ScalarBounds::constant(42))
+        );
+    }
+
+    #[test]
+    fn successors_jsgt_vs_jgt_negative_constants() {
+        // r1 = -1: signed says never taken, unsigned says always taken
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(-1));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jsgt {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 1); // fall-through only
+        let nexts = successors(
+            0,
+            &BpfInsn::Jgt {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 2); // taken only
+    }
+
+    #[test]
+    fn successors_unsigned_refines_on_non_negative() {
+        // JGE: r1 = [0, 100] >= 50 → taken r1 = [50, 100], fall r1 = [0, 49]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jge {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        assert_eq!(
+            nexts[0].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(50, 100))
+        );
+        assert_eq!(
+            nexts[1].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 49))
+        );
+    }
+
+    #[test]
+    fn successors_signed_lt_negative_refines() {
+        // JSLT: r1 = [-10, -1] < 0 is always true → only taken
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-10, -1));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jslt {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 2);
+    }
+
+    #[test]
+    fn successors_jne_null_check() {
+        // r0 != 0 on a nullable pointer: taken is the valid pointer,
+        // fall-through is NULL (scalar 0)
+        let mut state = VerifierState::initial();
+        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jne {
+                dst: 0,
+                src: 1,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        // fall (r0 == 0): the constant 0 comes first
+        let (null_pc, null) = &nexts[0];
+        assert_eq!(*null_pc, 1);
+        assert_eq!(null.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
+        // taken (r0 != 0): a valid map value pointer
+        let (valid_pc, valid) = &nexts[1];
+        assert_eq!(*valid_pc, 2);
+        assert_eq!(valid.regs[0], RegState::PtrToMapValue);
+    }
+
+    #[test]
+    fn successors_ordered_pointer_compare_rejected() {
+        // every ordered comparison on pointers is rejected
+        let state = VerifierState::initial();
+        for insn in [
+            BpfInsn::Jsgt {
+                dst: 10,
+                src: 10,
+                offset: 1,
+            },
+            BpfInsn::Jle {
+                dst: 1,
+                src: 1,
+                offset: 1,
+            },
+        ] {
+            let err = successors(0, &insn, &state).unwrap_err();
+            assert!(err.message.contains("comparing pointers"), "{:?}", insn);
+        }
+        // equality and inequality on same-type pointers stay allowed
+        for insn in [
+            BpfInsn::Jne {
+                dst: 1,
+                src: 1,
+                offset: 1,
+            },
+            BpfInsn::Jeq {
+                dst: 1,
+                src: 1,
+                offset: 1,
+            },
+        ] {
+            let nexts = successors(0, &insn, &state).unwrap();
+            assert_eq!(nexts.len(), 2, "{:?}", insn);
+        }
+    }
+
     // ── Pointer arithmetic (v0.2) ────────────────────────────────────────────
+
+    #[test]
+    fn step_add_reg_stack_ptr_computed_aligned() {
+        // r1 = r10; r1 += -32; r1 += r2 with r2 = {0, 8} (tnum low three
+        // bits known zero): every resulting offset is in-frame and
+        // 8-byte aligned → ACCEPT (#45)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 8,
+            umin: 0,
+            umax: 8,
+            s32_min: 0,
+            s32_max: 8,
+            u32_min: 0,
+            u32_max: 8,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b1000,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(
+            next.regs[1],
+            RegState::PtrToStack {
+                min_offset: -32,
+                max_offset: -24,
+                align_off: 0,
+            }
+        );
+        // the frame pointer itself is untouched
+        assert_eq!(next.regs[10], ptr_stack(0));
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_exact_result() {
+        // r2 = 8 (constant): the result is exact; alignment is not even
+        // needed for the acceptance
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], ptr_stack(-24));
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_out_of_frame() {
+        // the range can exceed the frame → REJECT with a bounds message
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1000,
+            umin: 0,
+            umax: 1000,
+            s32_min: 0,
+            s32_max: 1000,
+            u32_min: 0,
+            u32_max: 1000,
+            tnum: Tnum::unknown(),
+        });
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
+        // r1 = r10 (offset 0) + [0, 8] includes offset 8 → REJECT too
+        let mut state = VerifierState::initial();
+        state.regs[1] = ptr_stack(0);
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 8));
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_misaligned() {
+        // the scalar's low three bits are unknown → the computed offset
+        // is not provably 8-byte aligned → REJECT with an alignment
+        // message (#45)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 8,
+            umin: 0,
+            umax: 8,
+            s32_min: 0,
+            s32_max: 8,
+            u32_min: 0,
+            u32_max: 8,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b101,
+            },
+        });
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("alignment"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_known_misalignment() {
+        // r2 low bits known 1: the result is provably misaligned, which
+        // is still "not provably 8-byte aligned" for a computed offset
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 1,
+            smax: 1,
+            umin: 1,
+            umax: 1,
+            s32_min: 1,
+            s32_max: 1,
+            u32_min: 1,
+            u32_max: 1,
+            tnum: Tnum::constant(1),
+        });
+        // exact result (r2 is a constant): accepted — access-time checks
+        // cover exact offsets
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], ptr_stack(-31));
+    }
+
+    #[test]
+    fn step_add_imm_ptr_stack_alignment() {
+        // alignment survives immediate arithmetic: r10 += -8 keeps mod 8
+        let state = VerifierState::initial();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+        let RegState::PtrToStack { align_off, .. } = next.regs[10] else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!(align_off, 0);
+        let next = step(0, &next, &BpfInsn::AddImm { dst: 10, imm: -4 }).unwrap();
+        let RegState::PtrToStack { align_off, .. } = next.regs[10] else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!(align_off, 4);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_overflow_safe() {
+        // a scalar whose signed range reaches i64::MIN cannot overflow
+        // the offset arithmetic: it is rejected as out of frame (#47)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_pointer_src_rejected() {
+        // PtrToStack + PtrToStack is still rejected
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 10, src: 1 }).unwrap_err();
+        assert!(err.message.contains("register-offset"), "{}", err.message);
+    }
 
     #[test]
     fn step_add_imm_ptr_stack() {
         // r10 += -8 → PtrToStack(-8): the frame pointer moves down one slot
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: -8 });
+        assert_eq!(next.regs[10], ptr_stack(-8));
     }
 
     #[test]
@@ -635,7 +2736,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: -16 });
+        assert_eq!(next.regs[10], ptr_stack(-16));
     }
 
     #[test]
@@ -644,9 +2745,9 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 5, imm: -16 }).unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToStack { offset: -16 });
+        assert_eq!(next.regs[5], ptr_stack(-16));
         // the frame pointer itself is untouched
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     #[test]
@@ -665,7 +2766,7 @@ mod tests {
         // offset -512 is the last valid slot; one step past it → REJECT
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -512 }).unwrap();
-        assert_eq!(state.regs[10], RegState::PtrToStack { offset: -512 });
+        assert_eq!(state.regs[10], ptr_stack(-512));
         let err = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap_err();
         assert!(err.message.contains("out of the"));
     }
@@ -675,105 +2776,369 @@ mod tests {
         // adding 0 keeps the pointer (no-op)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: 0 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     // ── Trace (v0.2) ─────────────────────────────────────────────────────────
 
     #[test]
     fn refine_gt_issue_example() {
-        // issue example: R1 = [0, 100]; if R1 > 50
+        // issue example: R1 = [0, 100]; if R1 > 50 (signed)
         // true: R1 = [51, 100], false: R1 = [0, 50]
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (50, 50));
-        assert_eq!(true_dst, (51, 100));
-        assert_eq!(true_src, (50, 50));
-        assert_eq!(false_dst, (0, 50));
-        assert_eq!(false_src, (50, 50));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
+        assert_eq!(true_dst.signed(), (51, 100));
+        assert_eq!(true_src.signed(), (50, 50));
+        assert_eq!(false_dst.signed(), (0, 50));
+        assert_eq!(false_src.signed(), (50, 50));
+    }
+
+    #[test]
+    fn refine_gt_unsigned_matches_signed_on_non_negative() {
+        // on non-negative ranges the unsigned and signed views coincide,
+        // and the sync keeps both interpretations identical afterwards
+        let signed = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
+        let unsigned = refine_cmp(
+            CondOp::Ugt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
+        assert_eq!(signed, unsigned);
+        let ((true_dst, _), _) = unsigned;
+        assert_eq!(true_dst.unsigned(), (51, 100));
+        assert_eq!(true_dst.signed(), (51, 100));
+    }
+
+    #[test]
+    fn refine_unsigned_narrows_unsigned_family_only() {
+        // JLE 10 refines umax; the sync propagates the narrowing into the
+        // signed range too (kernel reg_bounds_sync), so both families agree
+        let dst = ScalarBounds::from_signed(0, 100);
+        let ((taken, _), (fall, _)) = refine_cmp(CondOp::Ule, dst, ScalarBounds::constant(10));
+        assert_eq!(taken.unsigned(), (0, 10));
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(fall.unsigned(), (11, 100));
+        assert_eq!(fall.signed(), (11, 100));
+        // and JSLE 10 refines the signed family first, then syncs
+        let ((taken, _), _) = refine_cmp(CondOp::Sle, dst, ScalarBounds::constant(10));
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(taken.unsigned(), (0, 10));
+    }
+
+    #[test]
+    fn refine_signed_negative_constant_keeps_both_interpretations() {
+        // r1 = -1: signed -1..-1, unsigned u64::MAX..u64::MAX; JSGT 0 can
+        // never be taken, so the taken side narrows to the empty range
+        let r1 = ScalarBounds::constant(-1);
+        let ((true_dst, _), _) = refine_cmp(CondOp::Sgt, r1, ScalarBounds::constant(0));
+        assert!(true_dst.smin > true_dst.smax);
+        // JGT 0 (unsigned) is always taken: the fall side is empty
+        let (_, (false_dst, _)) = refine_cmp(CondOp::Ugt, r1, ScalarBounds::constant(0));
+        assert!(false_dst.umin > false_dst.umax);
     }
 
     #[test]
     fn refine_gt_both_ranges() {
         // dst = [0, 100], src = [20, 200]: on the true branch both operands
         // narrow (dst >= src.min + 1, src <= dst.max - 1)
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (20, 200));
-        assert_eq!(true_dst, (21, 100));
-        assert_eq!(true_src, (20, 99));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(20, 200),
+        );
+        assert_eq!(true_dst.signed(), (21, 100));
+        assert_eq!(true_src.signed(), (20, 99));
         // the false branch adds no constraint here (dst <= 200, src >= 0
         // are already implied by the ranges)
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (20, 200));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (20, 200));
     }
 
     #[test]
     fn refine_gt_self() {
         // r1 > r1 with r1 = [0, 100]: both sides of the comparison are
         // refined, so the true branch narrows to the empty range
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_gt((0, 100), (0, 100));
-        assert_eq!(true_dst, (1, 100));
-        assert_eq!(true_src, (0, 99));
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (0, 100));
+        let r = ScalarBounds::from_signed(0, 100);
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(CondOp::Sgt, r, r);
+        assert_eq!(true_dst.signed(), (1, 100));
+        assert_eq!(true_src.signed(), (0, 99));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (0, 100));
     }
 
     #[test]
     fn refine_gt_infeasible_true_branch() {
         // dst = [0, 100] vs src = [100, 100]: dst > 100 is impossible,
         // so the true branch narrows to an empty range (min > max)
-        let ((true_dst, _), _) = refine_gt((0, 100), (100, 100));
-        assert!(true_dst.0 > true_dst.1);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(100),
+        );
+        assert!(true_dst.smin > true_dst.smax);
     }
 
     #[test]
     fn refine_eq_intersection() {
         // dst = [0, 100], src = [40, 60]: equality means both must be in [40, 60]
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_eq((0, 100), (40, 60));
-        assert_eq!(true_dst, (40, 60));
-        assert_eq!(true_src, (40, 60));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(40, 60),
+        );
+        assert_eq!(true_dst.signed(), (40, 60));
+        assert_eq!(true_src.signed(), (40, 60));
         // false branch keeps both ranges (no safe single-interval narrowing)
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (40, 60));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (40, 60));
     }
 
     #[test]
     fn refine_eq_disjoint() {
         // disjoint ranges: equality is impossible → true branch is empty
-        let ((true_dst, true_src), _) = refine_eq((0, 10), (20, 30));
-        assert!(true_dst.0 > true_dst.1);
-        assert!(true_src.0 > true_src.1);
+        let ((true_dst, true_src), _) = refine_eq(
+            ScalarBounds::from_signed(0, 10),
+            ScalarBounds::from_signed(20, 30),
+        );
+        assert!(true_dst.smin > true_dst.smax);
+        assert!(true_src.smin > true_src.smax);
     }
 
     #[test]
     fn refine_eq_constants() {
         // two constants: r1 = 5, r2 = 5 → true branch keeps 5..5
-        let ((true_dst, _), _) = refine_eq((5, 5), (5, 5));
-        assert_eq!(true_dst, (5, 5));
+        let ((true_dst, _), _) = refine_eq(ScalarBounds::constant(5), ScalarBounds::constant(5));
+        assert_eq!(true_dst.signed(), (5, 5));
     }
 
     #[test]
     fn refine_gt_extremes() {
         // wrapping at i64 extremes stays sound (never panics)
-        let ((true_dst, true_src), _) = refine_gt((i64::MIN, i64::MAX), (0, 0));
-        assert_eq!(true_dst, (1, i64::MAX));
+        let ((true_dst, true_src), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::unknown(),
+            ScalarBounds::constant(0),
+        );
+        assert_eq!(true_dst.signed(), (1, i64::MAX));
         // src.max = 0 is already below dst.max - 1, so src stays [0, 0]
-        assert_eq!(true_src, (0, 0));
+        assert_eq!(true_src.signed(), (0, 0));
         // src.min + 1 wraps to i64::MIN; dst is kept soundly (the branch is
         // actually infeasible, but over-approximation is allowed)
-        let ((true_dst, _), _) = refine_gt((0, i64::MAX), (i64::MAX, i64::MAX));
-        assert_eq!(true_dst.0, 0);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, i64::MAX),
+            ScalarBounds::constant(i64::MAX),
+        );
+        assert_eq!(true_dst.smin, 0);
         // dst.max - 1 wraps when dst.max = i64::MIN; dst stays [MIN, MIN] so
         // the true branch narrows to an empty range (dst > src is impossible)
-        let ((true_dst, _), _) = refine_gt((i64::MIN, i64::MIN), (i64::MIN, i64::MIN));
-        assert!(true_dst.0 > true_dst.1);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::constant(i64::MIN),
+            ScalarBounds::constant(i64::MIN),
+        );
+        assert!(true_dst.smin > true_dst.smax);
     }
 
-    // ── add_subprog / register_subprog ───────────────────────────────────────
+    #[test]
+    fn refine_ne_issue_example() {
+        // r1 = 5, r2 = 5: r1 != r2 is impossible → taken branch is empty;
+        // the fall-through keeps the intersection
+        let ((true_dst, true_src), (false_dst, false_src)) =
+            refine_ne(ScalarBounds::constant(5), ScalarBounds::constant(5));
+        assert!(true_dst.smin > true_dst.smax);
+        assert!(true_src.smin > true_src.smax);
+        assert_eq!(false_dst.signed(), (5, 5));
+        assert_eq!(false_src.signed(), (5, 5));
+    }
+
+    #[test]
+    fn refine_ne_excludes_endpoint_constant() {
+        // r1 = [0, 100] != 42: the complement is two intervals, so no
+        // narrowing; r1 = [0, 42] != 42 → taken side excludes 42
+        let ((true_dst, _), _) = refine_ne(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(true_dst.signed(), (0, 100));
+        let ((true_dst, _), _) =
+            refine_ne(ScalarBounds::from_signed(0, 42), ScalarBounds::constant(42));
+        assert_eq!(true_dst.signed(), (0, 41));
+        let ((true_dst, _), _) = refine_ne(
+            ScalarBounds::from_signed(42, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(true_dst.signed(), (43, 100));
+        // with a non-constant operand the inequality never narrows: for
+        // every value of dst there is a differing src value (only a
+        // constant operand can be excluded — #44)
+        let ((true_dst, true_src), _) =
+            refine_ne(ScalarBounds::constant(5), ScalarBounds::from_signed(0, 100));
+        assert_eq!(true_dst.signed(), (5, 5));
+        assert_eq!(true_src.signed(), (0, 100));
+    }
+
+    #[test]
+    fn refine_signed_variants() {
+        // dst = [0, 100], src = [40, 60]: the true branch of each comparison
+        let dst = ScalarBounds::from_signed(0, 100);
+        let src = ScalarBounds::from_signed(40, 60);
+        let ((sgt_true, _), _) = refine_cmp(CondOp::Sgt, dst, src);
+        assert_eq!(sgt_true.signed(), (41, 100));
+        let ((sge_true, _), _) = refine_cmp(CondOp::Sge, dst, src);
+        assert_eq!(sge_true.signed(), (40, 100));
+        let ((slt_true, _), _) = refine_cmp(CondOp::Slt, dst, src);
+        assert_eq!(slt_true.signed(), (0, 59));
+        let ((sle_true, _), _) = refine_cmp(CondOp::Sle, dst, src);
+        assert_eq!(sle_true.signed(), (0, 60));
+        // and the false branches are the exact complements
+        let (_, (sgt_false, _)) = refine_cmp(CondOp::Sgt, dst, src);
+        assert_eq!(sgt_false.signed(), (0, 60));
+        let (_, (sge_false, _)) = refine_cmp(CondOp::Sge, dst, src);
+        assert_eq!(sge_false.signed(), (0, 39));
+        let (_, (slt_false, _)) = refine_cmp(CondOp::Slt, dst, src);
+        assert_eq!(slt_false.signed(), (40, 100));
+        let (_, (sle_false, _)) = refine_cmp(CondOp::Sle, dst, src);
+        assert_eq!(sle_false.signed(), (41, 100));
+    }
+
+    #[test]
+    fn refine_unsigned_variants_u64_view() {
+        // r1 = -1 (u64::MAX): unsigned compares see the u64 view
+        let r1 = ScalarBounds::constant(-1);
+        let ((true_dst, _), _) = refine_cmp(CondOp::Ugt, r1, ScalarBounds::constant(0));
+        // u64::MAX > 0: no narrowing, the range is unchanged
+        assert_eq!(true_dst.unsigned(), (u64::MAX, u64::MAX));
+        // JLE 0 (unsigned): r1 <= 0 is false (MAX > 0) → taken side is empty
+        let ((true_dst, _), _) = refine_cmp(CondOp::Ule, r1, ScalarBounds::constant(0));
+        assert!(true_dst.umin > true_dst.umax);
+        // JSLT 0 (signed): -1 < 0 always → taken side is unchanged
+        let ((true_dst, _), _) = refine_cmp(CondOp::Slt, r1, ScalarBounds::constant(0));
+        assert_eq!(true_dst.signed(), (-1, -1));
+    }
+
+    #[test]
+    fn refine_mirrors_kernel_equations() {
+        // the kernel's reg_set_min_max equations on a fixed example set
+        // (dst vs a constant val), kernel/bpf/verifier.c (#44):
+        //   JGT:   false umax = min(umax, val);      true umin = max(umin, val + 1)
+        //   JSGT:  false smax = min(smax, val);      true smin = max(smin, val + 1)
+        //   JGE:   false umax = min(umax, val - 1);  true umin = max(umin, val)
+        //   JSGE:  false smax = min(smax, val - 1);  true smin = max(smin, val)
+        //   JLT:   false umin = max(umin, val);      true umax = min(umax, val - 1)
+        //   JSLT:  false smin = max(smin, val);      true smax = min(smax, val - 1)
+        //   JLE:   false umin = max(umin, val + 1);  true umax = min(umax, val)
+        //   JSLE:  false smin = max(smin, val + 1);  true smax = min(smax, val)
+        let dst = ScalarBounds::from_signed(0, 100);
+        let val = ScalarBounds::constant(42);
+        let (t, f) = refine_cmp(CondOp::Ugt, dst, val);
+        assert_eq!(t.0.signed(), (43, 100)); // true umin = max(0, 42+1)
+        assert_eq!(f.0.signed(), (0, 42)); // false umax = min(100, 42)
+        let (t, f) = refine_cmp(CondOp::Sgt, dst, val);
+        assert_eq!(t.0.signed(), (43, 100));
+        assert_eq!(f.0.signed(), (0, 42));
+        let (t, f) = refine_cmp(CondOp::Uge, dst, val);
+        assert_eq!(t.0.signed(), (42, 100)); // true umin = max(0, 42)
+        assert_eq!(f.0.signed(), (0, 41)); // false umax = min(100, 42-1)
+        let (t, f) = refine_cmp(CondOp::Sge, dst, val);
+        assert_eq!(t.0.signed(), (42, 100));
+        assert_eq!(f.0.signed(), (0, 41));
+        let (t, f) = refine_cmp(CondOp::Ult, dst, val);
+        assert_eq!(t.0.signed(), (0, 41)); // true umax = min(100, 42-1)
+        assert_eq!(f.0.signed(), (42, 100)); // false umin = max(0, 42)
+        let (t, f) = refine_cmp(CondOp::Slt, dst, val);
+        assert_eq!(t.0.signed(), (0, 41));
+        assert_eq!(f.0.signed(), (42, 100));
+        let (t, f) = refine_cmp(CondOp::Ule, dst, val);
+        assert_eq!(t.0.signed(), (0, 42)); // true umax = min(100, 42)
+        assert_eq!(f.0.signed(), (43, 100)); // false umin = max(0, 42+1)
+        let (t, f) = refine_cmp(CondOp::Sle, dst, val);
+        assert_eq!(t.0.signed(), (0, 42));
+        assert_eq!(f.0.signed(), (43, 100));
+    }
+
+    #[test]
+    fn refine_eq_fall_excludes_constant() {
+        // r1 = [0, 42] == 42: the taken side is the constant, the
+        // fall-through excludes it where a single interval allows it
+        let ((true_dst, _), (false_dst, _)) =
+            refine_eq(ScalarBounds::from_signed(0, 42), ScalarBounds::constant(42));
+        assert_eq!(true_dst.signed(), (42, 42));
+        assert_eq!(false_dst.signed(), (0, 41));
+        // the complement of a mid-range constant is not representable
+        let ((_, _), (false_dst, _)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(false_dst.signed(), (0, 100));
+        // a non-constant operand is never excluded
+        let ((_, _), (false_dst, false_src)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(40, 60),
+        );
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (40, 60));
+    }
+
+    #[test]
+    fn is_branch_taken_unsigned_pruning() {
+        // infeasible-branch pruning works for unsigned comparisons (#44):
+        // r1 = -1 (u64::MAX) vs 0
+        let r1 = ScalarBounds::constant(-1);
+        let zero = ScalarBounds::constant(0);
+        // JGT: MAX > 0 always → the fall-through is pruned
+        assert!(matches!(
+            is_branch_taken(CondOp::Ugt, r1, zero),
+            BranchVerdict::AlwaysTaken
+        ));
+        // JLE: MAX <= 0 never → the taken branch is pruned
+        assert!(matches!(
+            is_branch_taken(CondOp::Ule, r1, zero),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        // JGE on a negative range: [-10, -1] as u64 is [MAX-9, MAX] ≥ 0
+        let neg = ScalarBounds::from_signed(-10, -1);
+        assert!(matches!(
+            is_branch_taken(CondOp::Uge, neg, zero),
+            BranchVerdict::AlwaysTaken
+        ));
+        // and the signed family prunes the mirror image
+        assert!(matches!(
+            is_branch_taken(CondOp::Slt, neg, zero),
+            BranchVerdict::AlwaysTaken
+        ));
+    }
+
+    #[test]
+    fn refine_sync_keeps_interpretations_consistent() {
+        // after a signed-only refinement the unsigned range is synced:
+        // JSLE 10 on [0, 100] narrows smax to 10 and umax to 10 too
+        let ((taken, _), _) = refine_cmp(
+            CondOp::Sle,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(10),
+        );
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(taken.unsigned(), (0, 10));
+        // a refinement that pushes smin >= 0 syncs umax down to smax
+        let r = ScalarBounds::from_signed(-5, 100);
+        let ((taken, _), _) = refine_cmp(CondOp::Sge, r, ScalarBounds::constant(0));
+        assert_eq!(taken.signed(), (0, 100));
+        assert_eq!(taken.unsigned(), (0, 100));
+    }
 
     #[test]
     fn successors_jgt_refines_issue_example() {
         // issue #16 example wired through the driver: R1 = [0, 100]; if R1 > 50
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
 
         let nexts = successors(
             0,
@@ -790,11 +3155,17 @@ mod tests {
         // taken: pc = 0 + 1 + 1 = 2, R1 = [51, 100]
         let (taken_pc, taken) = &nexts[0];
         assert_eq!(*taken_pc, 2);
-        assert_eq!(taken.regs[1], RegState::Scalar { min: 51, max: 100 });
+        assert_eq!(
+            taken.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(51, 100))
+        );
         // fall: pc = 1, R1 = [0, 50]
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
-        assert_eq!(fall.regs[1], RegState::Scalar { min: 0, max: 50 });
+        assert_eq!(
+            fall.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 50))
+        );
     }
 
     #[test]
@@ -871,42 +3242,208 @@ mod tests {
     fn is_branch_taken_gt() {
         // always true: dst.min > src.max
         assert!(matches!(
-            is_branch_taken(CondOp::Gt, (30, 40), (10, 20)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(30, 40),
+                ScalarBounds::from_signed(10, 20)
+            ),
             BranchVerdict::AlwaysTaken
         ));
         // always false: dst.max <= src.min (boundary included)
         assert!(matches!(
-            is_branch_taken(CondOp::Gt, (10, 20), (20, 30)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(10, 20),
+                ScalarBounds::from_signed(20, 30)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         // overlapping ranges → unknown
         assert!(matches!(
-            is_branch_taken(CondOp::Gt, (0, 100), (50, 50)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::constant(50)
+            ),
             BranchVerdict::Unknown
         ));
+        // the unsigned family behaves identically on non-negative ranges
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Ugt,
+                ScalarBounds::from_signed(30, 40),
+                ScalarBounds::from_signed(10, 20)
+            ),
+            BranchVerdict::AlwaysTaken
+        ));
+    }
+
+    #[test]
+    fn is_branch_taken_signed_vs_unsigned_negative() {
+        // r1 = -1: signed says -1 > 0 is false (never taken),
+        // unsigned says u64::MAX > 0 is true (always taken)
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Ugt,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
+            BranchVerdict::AlwaysTaken
+        ));
+        // a straddling signed range keeps a full unsigned view: JGT 0 is
+        // still always taken there
+        let straddle = ScalarBounds::from_signed(-10, 10);
+        assert!(matches!(
+            is_branch_taken(CondOp::Ugt, straddle, ScalarBounds::constant(0)),
+            BranchVerdict::Unknown
+        ));
+        assert!(matches!(
+            is_branch_taken(CondOp::Slt, straddle, ScalarBounds::constant(0)),
+            BranchVerdict::Unknown
+        ));
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Sle,
+                ScalarBounds::from_signed(-10, -1),
+                ScalarBounds::constant(0)
+            ),
+            BranchVerdict::AlwaysTaken
+        ));
+    }
+
+    #[test]
+    fn is_branch_taken_ne() {
+        // both the same constant → never taken
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::constant(5),
+                ScalarBounds::constant(5)
+            ),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        // disjoint ranges → always taken
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::from_signed(0, 10),
+                ScalarBounds::from_signed(20, 30)
+            ),
+            BranchVerdict::AlwaysTaken
+        ));
+        // overlapping ranges → unknown
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::from_signed(40, 60)
+            ),
+            BranchVerdict::Unknown
+        ));
+    }
+
+    #[test]
+    fn is_branch_taken_all_variants() {
+        // dst = [30, 40] vs src = [10, 20]: every "greater" form is taken
+        for op in [CondOp::Sgt, CondOp::Ugt, CondOp::Sge, CondOp::Uge] {
+            assert!(
+                matches!(
+                    is_branch_taken(
+                        op,
+                        ScalarBounds::from_signed(30, 40),
+                        ScalarBounds::from_signed(10, 20)
+                    ),
+                    BranchVerdict::AlwaysTaken
+                ),
+                "{:?}",
+                op
+            );
+        }
+        for op in [CondOp::Slt, CondOp::Ult, CondOp::Sle, CondOp::Ule] {
+            assert!(
+                matches!(
+                    is_branch_taken(
+                        op,
+                        ScalarBounds::from_signed(30, 40),
+                        ScalarBounds::from_signed(10, 20)
+                    ),
+                    BranchVerdict::AlwaysNotTaken
+                ),
+                "{:?}",
+                op
+            );
+        }
     }
 
     #[test]
     fn is_branch_taken_eq() {
         // both the same constant → always taken
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (5, 5), (5, 5)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::constant(5),
+                ScalarBounds::constant(5)
+            ),
             BranchVerdict::AlwaysTaken
         ));
-        // disjoint ranges → never taken
+        // disjoint ranges (in either family) → never taken
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (0, 10), (20, 30)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(0, 10),
+                ScalarBounds::from_signed(20, 30)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         // overlapping ranges → unknown
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (0, 100), (40, 60)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::from_signed(40, 60)
+            ),
             BranchVerdict::Unknown
         ));
         // a non-constant range is never 'always taken'
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (5, 7), (5, 5)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(5, 7),
+                ScalarBounds::constant(5)
+            ),
             BranchVerdict::Unknown
+        ));
+    }
+
+    #[test]
+    fn is_branch_taken_eq_disjoint_unsigned_family() {
+        // signed ranges overlap but the unsigned views are disjoint
+        // (e.g. -1 vs 0): equality can never hold → pruned
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        // and vice versa: a state refined only in the signed family may
+        // still be decided by the unsigned family
+        let mut dst = ScalarBounds::from_signed(0, 100);
+        dst.umin = 50; // unsigned [50, 100]
+        let mut src = ScalarBounds::from_signed(0, 100);
+        src.umax = 49; // unsigned [0, 49]
+        assert!(matches!(
+            is_branch_taken(CondOp::Eq, dst, src),
+            BranchVerdict::AlwaysNotTaken
         ));
     }
 
@@ -914,8 +3451,8 @@ mod tests {
     fn successors_jgt_always_taken() {
         // dst = [30, 40] > src = [10, 20] is always true → only taken
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 30, max: 40 };
-        state.regs[2] = RegState::Scalar { min: 10, max: 20 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(30, 40));
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {
@@ -934,8 +3471,8 @@ mod tests {
     fn successors_jgt_never_taken() {
         // dst = [10, 20] > src = [30, 40] is always false → only fall-through
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 10, max: 20 };
-        state.regs[2] = RegState::Scalar { min: 30, max: 40 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(30, 40));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {
@@ -954,8 +3491,8 @@ mod tests {
     fn successors_jeq_always_taken() {
         // r1 == r2 with both constant 5 → only the taken successor
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 5, max: 5 };
-        state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(5));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(5));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -975,7 +3512,7 @@ mod tests {
         // issue example: r0 = PtrToMapValueOrNull; if r0 == 0 (via r1 = 0)
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
 
         let nexts = successors(
             0,
@@ -992,7 +3529,7 @@ mod tests {
         // taken (r0 == 0): the pointer becomes the constant 0 (kernel style)
         let (taken_pc, taken) = &nexts[0];
         assert_eq!(*taken_pc, 2);
-        assert_eq!(taken.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(taken.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
         // fall (r0 != 0): refined to a valid map value pointer
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
@@ -1004,7 +3541,7 @@ mod tests {
         // the constant 0 may also be the dst register: if r1 == r0 with r1 = 0
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -1016,7 +3553,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nexts.len(), 2);
-        assert_eq!(nexts[0].1.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(
+            nexts[0].1.regs[0],
+            RegState::Scalar(ScalarBounds::constant(0))
+        );
         assert_eq!(nexts[1].1.regs[0], RegState::PtrToMapValue);
     }
 
@@ -1026,7 +3566,7 @@ mod tests {
         // different-types rejection
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 8, max: 8 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(8));
         let err = successors(
             0,
             &BpfInsn::Jeq {
@@ -1045,7 +3585,7 @@ mod tests {
         // a non-null map value pointer compared to 0 keeps both branches
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValue;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -1118,7 +3658,7 @@ mod tests {
         // registers are clobbered (#29)
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
+        state.regs[2] = ptr_stack(-8);
         let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
         assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
         assert_eq!(next.regs[1], RegState::Uninit);
@@ -1130,13 +3670,7 @@ mod tests {
         // no arguments → R0 becomes an unknown scalar (full range)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::Call { imm: -7 }).unwrap();
-        assert_eq!(
-            next.regs[0],
-            RegState::Scalar {
-                min: i64::MIN,
-                max: i64::MAX
-            }
-        );
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::unknown()));
     }
 
     #[test]
@@ -1145,11 +3679,11 @@ mod tests {
         // returns 0 on success
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
-        state.regs[3] = RegState::PtrToStack { offset: -16 };
-        state.regs[4] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[2] = ptr_stack(-8);
+        state.regs[3] = ptr_stack(-16);
+        state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
         let next = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
     }
 
     #[test]
@@ -1157,7 +3691,7 @@ mod tests {
         // R3 (the value pointer) is uninitialized → #14 error
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
+        state.regs[2] = ptr_stack(-8);
         let err = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
@@ -1192,14 +3726,14 @@ mod tests {
         // the eBPF calling convention: R1..R5 are scratch, R6..R9 callee-saved
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
-        state.regs[3] = RegState::Scalar { min: 1, max: 1 };
-        state.regs[4] = RegState::Scalar { min: 2, max: 2 };
-        state.regs[5] = RegState::Scalar { min: 3, max: 3 };
-        state.regs[6] = RegState::Scalar { min: 10, max: 10 };
-        state.regs[7] = RegState::Scalar { min: 11, max: 11 };
-        state.regs[8] = RegState::Scalar { min: 12, max: 12 };
-        state.regs[9] = RegState::Scalar { min: 13, max: 13 };
+        state.regs[2] = ptr_stack(-8);
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(1));
+        state.regs[4] = RegState::Scalar(ScalarBounds::constant(2));
+        state.regs[5] = RegState::Scalar(ScalarBounds::constant(3));
+        state.regs[6] = RegState::Scalar(ScalarBounds::constant(10));
+        state.regs[7] = RegState::Scalar(ScalarBounds::constant(11));
+        state.regs[8] = RegState::Scalar(ScalarBounds::constant(12));
+        state.regs[9] = RegState::Scalar(ScalarBounds::constant(13));
 
         let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
         // R0 = return type, R1..R5 invalidated
@@ -1211,11 +3745,11 @@ mod tests {
         for (reg, val) in [(6, 10), (7, 11), (8, 12), (9, 13)] {
             assert_eq!(
                 next.regs[reg],
-                RegState::Scalar { min: val, max: val },
+                RegState::Scalar(ScalarBounds::constant(val)),
                 "r{}",
                 reg
             );
         }
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 }
