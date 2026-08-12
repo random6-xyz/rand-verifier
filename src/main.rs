@@ -503,6 +503,112 @@ fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
     ((inter, inter), (dst, src))
 }
 
+// ── Tracked number abstraction (tnum) (v0.3 Mini) ────────────────────────────
+
+/// A tracked number: `value` holds the known bits and `mask` the unknown
+/// ones (a 1 in `mask` means the bit may be either 0 or 1).
+///
+/// This is the simplified counterpart of the kernel's `struct tnum`
+/// (tnum_var_off); it is not wired into RegState yet — that happens in
+/// Meso, alongside the min/max ranges the kernel keeps next to it.
+#[allow(dead_code)] // wired into RegState in Meso
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tnum {
+    value: u64,
+    mask: u64,
+}
+
+#[allow(dead_code)] // wired into RegState in Meso
+impl Tnum {
+    /// A fully known constant.
+    fn constant(value: u64) -> Self {
+        Self { value, mask: 0 }
+    }
+
+    /// A fully unknown value (every bit may be anything).
+    fn unknown() -> Self {
+        Self {
+            value: 0,
+            mask: u64::MAX,
+        }
+    }
+
+    /// Whether every bit is known.
+    fn is_constant(&self) -> bool {
+        self.mask == 0
+    }
+
+    /// Whether no bit is known.
+    fn is_unknown(&self) -> bool {
+        self.mask == u64::MAX
+    }
+
+    /// The bits that are known to be 1.
+    fn known_ones(&self) -> u64 {
+        self.value & !self.mask
+    }
+
+    /// Addition with carry, following the kernel's tnum_add(): the
+    /// possible carry chain is folded into the mask.
+    fn add(self, other: Tnum) -> Self {
+        // kernel: sm = a.mask + b.mask; sv = a.value + b.value;
+        // sigma = sm + sv; chi = sigma ^ sv; mu = chi | a.mask | b.mask
+        let sm = self.mask.wrapping_add(other.mask);
+        let sv = self.value.wrapping_add(other.value);
+        let sigma = sm.wrapping_add(sv);
+        let chi = sigma ^ sv;
+        let mu = chi | self.mask | other.mask;
+        Self {
+            value: sv & !mu,
+            mask: mu,
+        }
+    }
+
+    /// Bitwise AND: a bit is known 1 only if both operands are known 1
+    /// there; it is unknown if either operand could be 0 there.
+    fn and(self, other: Tnum) -> Self {
+        let alpha = self.value | self.mask; // possible 1s of self
+        let beta = other.value | other.mask; // possible 1s of other
+        let value = self.value & other.value;
+        let mask = (alpha & beta) ^ value;
+        Self { value, mask }
+    }
+
+    /// Bitwise OR: a bit is known 1 if either operand is known 1 there,
+    /// and known 0 if both operands are known 0.
+    fn or(self, other: Tnum) -> Self {
+        let known_one = self.known_ones() | other.known_ones();
+        let known_zero = (!self.value & !self.mask) & (!other.value & !other.mask);
+        Self {
+            value: known_one,
+            mask: !(known_one | known_zero),
+        }
+    }
+
+    /// The values common to both abstractions (kernel's tnum_intersect).
+    fn intersect(self, other: Tnum) -> Self {
+        let v = self.value | other.value;
+        let mu = self.mask & other.mask;
+        Self {
+            value: v & !mu,
+            mask: mu,
+        }
+    }
+
+    /// Does `self` contain every value of `other` (a partial order)?
+    /// A bit known in `self` must be known with the same value in
+    /// `other`; unknown bits of `self` may be refined in `other`.
+    fn subsumes(self, other: Tnum) -> bool {
+        (other.mask & !self.mask) == 0 && (other.value & !self.mask) == (self.value & !self.mask)
+    }
+}
+
+impl std::fmt::Display for Tnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TNUM({:#x},{:#x})", self.value, self.mask)
+    }
+}
+
 // ── Execution trace (v0.2 Micro) ─────────────────────────────────────────────
 
 /// Render a single instruction in a readable eBPF-like syntax.

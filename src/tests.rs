@@ -157,6 +157,119 @@ fn reg_state_display() {
     );
 }
 
+// ── Tnum (v0.3) ─────────────────────────────────────────────────────────
+
+#[test]
+fn tnum_constants() {
+    assert_eq!(Tnum::constant(5), Tnum { value: 5, mask: 0 });
+    assert_eq!(Tnum::unknown().mask, u64::MAX);
+    assert!(Tnum::constant(5).is_constant());
+    assert!(!Tnum::unknown().is_constant());
+    assert!(Tnum::unknown().is_unknown());
+    assert!(!Tnum::constant(5).is_unknown());
+    assert_eq!(Tnum::constant(0b1010).known_ones(), 0b1010);
+    assert_eq!(Tnum::unknown().known_ones(), 0);
+    // value bits under the mask are not known ones
+    assert_eq!(
+        Tnum {
+            value: 0b001,
+            mask: 0b010
+        }
+        .known_ones(),
+        0b001
+    );
+}
+
+#[test]
+fn tnum_add() {
+    // constants add exactly
+    assert_eq!(Tnum::constant(1).add(Tnum::constant(2)), Tnum::constant(3));
+    assert_eq!(
+        Tnum::constant(5).add(Tnum::constant(-3i64 as u64)),
+        Tnum::constant(2)
+    );
+    // unknown + anything = unknown
+    assert_eq!(Tnum::unknown().add(Tnum::constant(0)), Tnum::unknown());
+    // bit0 known 1, bit1 unknown (value 1 or 3) + const 2 → bit0 is
+    // always 1, bits 1..2 unknown (carry from the unknown bit)
+    let a = Tnum {
+        value: 0b001,
+        mask: 0b010,
+    };
+    assert_eq!(
+        a.add(Tnum::constant(0b010)),
+        Tnum {
+            value: 0b001,
+            mask: 0b110
+        }
+    );
+}
+
+#[test]
+fn tnum_and_or() {
+    // a = {101, 111} (bit1 unknown)
+    let a = Tnum {
+        value: 0b101,
+        mask: 0b010,
+    };
+    let b = Tnum::constant(0b001);
+    // AND: only bit0 can be 1 in both → const 001
+    assert_eq!(a.and(b), Tnum::constant(0b001));
+    // OR: bit0 known 1, bit1 unknown, bit2 known 1 → {101, 111}
+    assert_eq!(
+        a.or(b),
+        Tnum {
+            value: 0b101,
+            mask: 0b010
+        }
+    );
+}
+
+#[test]
+fn tnum_intersect() {
+    // {1, 3} ∩ {1} = {1}
+    let a = Tnum {
+        value: 0b001,
+        mask: 0b010,
+    };
+    assert_eq!(a.intersect(Tnum::constant(0b001)), Tnum::constant(0b001));
+    // {1, 3} ∩ {0, 1} = {1}
+    let b = Tnum {
+        value: 0b000,
+        mask: 0b001,
+    };
+    assert_eq!(a.intersect(b), Tnum::constant(0b001));
+    // intersecting with unknown keeps the value
+    assert_eq!(a.intersect(Tnum::unknown()), a);
+}
+
+#[test]
+fn tnum_subsumes() {
+    // a wider abstraction contains narrower ones
+    let wide = Tnum {
+        value: 0b100,
+        mask: 0b011,
+    }; // {100, 101, 110, 111}
+    assert!(wide.subsumes(Tnum::constant(0b101)));
+    assert!(wide.subsumes(Tnum {
+        value: 0b110,
+        mask: 0b001,
+    }));
+    assert!(!Tnum::constant(0b101).subsumes(wide));
+    // constants subsume only themselves
+    assert!(Tnum::constant(7).subsumes(Tnum::constant(7)));
+    assert!(!Tnum::constant(7).subsumes(Tnum::constant(6)));
+    // unknown subsumes everything
+    assert!(Tnum::unknown().subsumes(Tnum::constant(0)));
+    assert!(Tnum::unknown().subsumes(Tnum::unknown()));
+}
+
+#[test]
+fn tnum_display() {
+    assert_eq!(Tnum::constant(5).to_string(), "TNUM(0x5,0x0)");
+    assert_eq!(Tnum::unknown().to_string(), "TNUM(0x0,0xffffffffffffffff)");
+}
+
 // ── VerifierState (v0.2) ─────────────────────────────────────────────────
 
 #[test]
