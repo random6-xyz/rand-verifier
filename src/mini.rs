@@ -26,10 +26,13 @@ pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
     match (old, new) {
         (RegState::Uninit, RegState::Uninit) => true,
         (RegState::Scalar(old), RegState::Scalar(new)) => {
+            // both interpretations must be contained, and the tnum must
+            // be a superset of the new one (#42)
             old.smin <= new.smin
                 && old.smax >= new.smax
                 && old.umin <= new.umin
                 && old.umax >= new.umax
+                && old.tnum.subsumes(new.tnum)
         }
         (
             RegState::PtrToStack { offset: old_offset },
@@ -164,6 +167,7 @@ mod tests {
     use crate::exec::*;
     use crate::insn::*;
     use crate::state::*;
+    use crate::tnum::Tnum;
 
     #[test]
     fn verify_mini_straight_line() {
@@ -458,6 +462,7 @@ mod tests {
             s32_max: i32::MAX,
             u32_min: 0,
             u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
         };
         let mut old = VerifierState::initial();
         old.regs[1] = RegState::Scalar(bounds(0, 100, 0, 100));
@@ -471,6 +476,32 @@ mod tests {
         // and vice versa
         new.regs[1] = RegState::Scalar(bounds(-50, 20, 0, 100));
         assert!(!subsumes(&old, &new));
+    }
+
+    #[test]
+    fn subsumes_tnum() {
+        // a state with a narrower tnum is subsumed by one with a wider
+        // tnum when the ranges also contain it (#42)
+        let tnum_bounds = |value: u64, mask: u64| ScalarBounds {
+            smin: 0,
+            smax: 3,
+            umin: 0,
+            umax: 3,
+            s32_min: 0,
+            s32_max: 3,
+            u32_min: 0,
+            u32_max: 3,
+            tnum: Tnum { value, mask },
+        };
+        let mut wide = VerifierState::initial();
+        wide.regs[1] = RegState::Scalar(tnum_bounds(0, 0b011));
+        let mut narrow = VerifierState::initial();
+        narrow.regs[1] = RegState::Scalar(tnum_bounds(0b001, 0));
+        assert!(subsumes(&wide, &narrow));
+        // the narrower tnum never subsumes the wider one
+        assert!(!subsumes(&narrow, &wide));
+        // equal tnums subsume each other
+        assert!(subsumes(&wide, &wide));
     }
 
     #[test]

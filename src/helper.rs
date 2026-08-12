@@ -2,6 +2,7 @@
 
 use crate::error::VerificationFailure;
 use crate::state::{RegState, ScalarBounds, VerifierState, read_reg};
+use crate::tnum::Tnum;
 
 /// Expected type of one helper argument (R1..R5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 s32_max: 0,
                 u32_min: 0,
                 u32_max: 0,
+                tnum: Tnum { value: 0, mask: 0 },
             }),
         }),
         // BPF_FUNC_get_prandom_u32: no arguments, unknown scalar
@@ -62,6 +64,10 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 s32_max: i32::MAX,
                 u32_min: 0,
                 u32_max: u32::MAX,
+                tnum: Tnum {
+                    value: 0,
+                    mask: 0xFFFF_FFFF_FFFF_FFFF,
+                },
             }),
         }),
         _ => None,

@@ -69,6 +69,7 @@ result into the 64-bit register; `w` notation is used for the destination.
 | alu32                    | `r2 = 2147483647; r2 += 2147483647; r2 += 3; w2 += 0; r0 = r2; exit` | ALU32 truncation + zero-extension |
 | alu32_roundtrip          | `r2 = -1; w2 += 0; w2 += 1; r0 = r2; exit`                       | ALU32 overflow wraps to 0        |
 | alu32_zero_extend        | `r2 = -2147483648; w2 += 0; r2 += 1; r0 = r2; exit`               | ALU32 zero-extension of sign bit |
+| tnum_precise_branch       | `call -7; r0 &= 1; r1 = 0; jeq r0, r1, +1; exit; exit`          | tnum-precise equality refinement  |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |

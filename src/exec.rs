@@ -7,6 +7,7 @@ use crate::state::{
     RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg, read_reg, read_scalar,
     stack_slot_index,
 };
+use crate::tnum::Tnum;
 
 /// ALU operations of the custom opcode space (Meso #39).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +328,7 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 s32_max: i32::MAX,
                 u32_min: 0,
                 u32_max: u32::MAX,
+                tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax),
             }
             .synced()
         }
@@ -345,8 +347,36 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 s32_max: i32::MAX,
                 u32_min: 0,
                 u32_max: u32::MAX,
+                tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax).subreg(),
             }
             .synced()
+        }
+    }
+}
+
+/// The tnum result of an ALU operation (kernel tnum_*).
+///
+/// For shifts the amount must be a constant — with a variable amount
+/// every bit of the result may be anything (sound over-approximation).
+/// The 32-bit path truncates the result with `subreg`.
+fn alu_tnum(op: AluOp, d: Tnum, s: Tnum, amount_min: i64, amount_max: i64) -> Tnum {
+    match op {
+        AluOp::Add => d.add(s),
+        AluOp::Sub => d.sub(s),
+        AluOp::And => d.and(s),
+        AluOp::Or => d.or(s),
+        AluOp::Xor => d.xor(s),
+        AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => {
+            if amount_min != amount_max {
+                Tnum::unknown()
+            } else {
+                match op {
+                    AluOp::Lsh => d.lshift(amount_min as u32),
+                    AluOp::Rsh => d.rshift(amount_min as u32),
+                    AluOp::Arsh => d.arshift(amount_min as u32),
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 }
@@ -774,6 +804,9 @@ pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         s32_max: i32::MAX,
         u32_min: 0,
         u32_max: u32::MAX,
+        // equality narrows the tnum to the common values (kernel
+        // tnum_intersect in regs_refine_cond_op)
+        tnum: dst.tnum.intersect(src.tnum),
     }
     .synced();
     ((inter, inter), (dst, src))
@@ -812,6 +845,9 @@ fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
         s32_max: i32::MAX,
         u32_min: 0,
         u32_max: u32::MAX,
+        // inequality cannot narrow the tnum: the complement of a tnum
+        // is not representable — keep the sound over-approximation
+        tnum: a.tnum,
     }
 }
 
@@ -830,6 +866,7 @@ pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         s32_max: i32::MAX,
         u32_min: 0,
         u32_max: u32::MAX,
+        tnum: dst.tnum.intersect(src.tnum),
     }
     .synced();
     (
@@ -1689,19 +1726,218 @@ mod tests {
     }
 
     #[test]
+    fn step_alu_tnum_bitwise_issue_example() {
+        // issue example: r1 = 0b1xx (values {1, 3}); r1 &= 1 yields a
+        // constant 1 in the tnum
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 1,
+            smax: 3,
+            umin: 1,
+            umax: 3,
+            s32_min: 1,
+            s32_max: 3,
+            u32_min: 1,
+            u32_max: 3,
+            tnum: Tnum {
+                value: 0b001,
+                mask: 0b010,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 1 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.tnum.is_constant());
+        assert_eq!(b.tnum.value, 1);
+    }
+
+    #[test]
+    fn step_alu_tnum_or_keeps_known_bits() {
+        // r1 = {0, 1} (bit0 unknown); r1 |= 0b100 keeps bit2 known
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::OrImm { dst: 1, imm: 0b100 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // values {100, 101}: bit2 known one, bit0 unknown
+        assert_eq!(
+            b.tnum,
+            Tnum {
+                value: 0b100,
+                mask: 0b001
+            }
+        );
+    }
+
+    #[test]
+    fn step_alu32_truncates_tnum() {
+        // 0x1_0000_0001 truncates to 1 in the tnum as well
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0x1_0000_0001,
+            smax: 0x1_0000_0001,
+            umin: 0x1_0000_0001,
+            umax: 0x1_0000_0001,
+            s32_min: 1,
+            s32_max: 1,
+            u32_min: 1,
+            u32_max: 1,
+            tnum: Tnum::constant(0x1_0000_0001),
+        });
+        let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn cond_branch_eq_narrows_tnum() {
+        // r1 = {0, 1} (tnum) == 1: the taken side intersects the tnum
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jeq {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        let (_, taken) = &nexts[0];
+        let RegState::Scalar(b) = taken.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn cond_branch_jne_keeps_tnum() {
+        // r1 = {0, 1} != 1: the taken side keeps the sound over-approximation
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
+        let nexts = successors(
+            0,
+            &BpfInsn::Jne {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        let (_, taken) = &nexts[0];
+        let RegState::Scalar(b) = taken.regs[1] else {
+            panic!("expected scalar");
+        };
+        // the exclusion narrows the range to [0, 0] and the sync pins the
+        // tnum down to the constant 0 — exact, not just over-approximated
+        assert_eq!(b.tnum, Tnum::constant(0));
+        // the fall-through (equality) intersects
+        let (_, fall) = &nexts[1];
+        let RegState::Scalar(b) = fall.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.tnum, Tnum::constant(1));
+    }
+
+    #[test]
+    fn spill_fill_preserves_tnum() {
+        // the stack slot stores the full RegState, tnum included (#42)
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1,
+            umin: 0,
+            umax: 1,
+            s32_min: 0,
+            s32_max: 1,
+            u32_min: 0,
+            u32_max: 1,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b001,
+            },
+        });
+        let state = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+        let next = step(0, &state, &BpfInsn::LdStack { dst: 3, offset: -8 }).unwrap();
+        assert_eq!(next.regs[3], state.regs[2]);
+        let RegState::Scalar(b) = next.regs[3] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(
+            b.tnum,
+            Tnum {
+                value: 0,
+                mask: 0b001
+            }
+        );
+    }
+
+    #[test]
     fn step_alu32_range_wrap() {
         // w1: [0xFFFFFFF0, 0xFFFFFFFF] += 0x10 wraps to [0, 0xF]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar(ScalarBounds {
-            smin: 0xFFFF_FFF0,
-            smax: 0xFFFF_FFFF,
-            umin: 0xFFFF_FFF0,
-            umax: 0xFFFF_FFFF,
-            s32_min: -0x10,
-            s32_max: -1,
-            u32_min: 0xFFFF_FFF0,
-            u32_max: 0xFFFF_FFFF,
-        });
+        state.regs[1] = RegState::Scalar(
+            ScalarBounds {
+                smin: 0xFFFF_FFF0,
+                smax: 0xFFFF_FFFF,
+                umin: 0xFFFF_FFF0,
+                umax: 0xFFFF_FFFF,
+                s32_min: -0x10,
+                s32_max: -1,
+                u32_min: 0xFFFF_FFF0,
+                u32_max: 0xFFFF_FFFF,
+                tnum: Tnum::unknown(),
+            }
+            .synced(),
+        );
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0x10 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
             panic!("expected scalar");
@@ -1709,16 +1945,20 @@ mod tests {
         assert_eq!(b.signed(), (0, 0xF));
         assert_eq!(b.unsigned(), (0, 0xF));
         // a range crossing the 32-bit boundary widens to the full range
-        state.regs[1] = RegState::Scalar(ScalarBounds {
-            smin: 0xFFFF_FFF0,
-            smax: 0x1_0000_0010,
-            umin: 0xFFFF_FFF0,
-            umax: 0x1_0000_0010,
-            s32_min: i32::MIN,
-            s32_max: i32::MAX,
-            u32_min: 0,
-            u32_max: u32::MAX,
-        });
+        state.regs[1] = RegState::Scalar(
+            ScalarBounds {
+                smin: 0xFFFF_FFF0,
+                smax: 0x1_0000_0010,
+                umin: 0xFFFF_FFF0,
+                umax: 0x1_0000_0010,
+                s32_min: i32::MIN,
+                s32_max: i32::MAX,
+                u32_min: 0,
+                u32_max: u32::MAX,
+                tnum: Tnum::unknown(),
+            }
+            .synced(),
+        );
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
             panic!("expected scalar");

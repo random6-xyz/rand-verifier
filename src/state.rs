@@ -1,6 +1,7 @@
 // ── Abstract register and stack state (v0.2 Micro) ──────────────────────────
 
 use crate::error::VerificationFailure;
+use crate::tnum::Tnum;
 
 /// Number of eBPF registers: R0..R10.
 pub(crate) const NUM_REGS: usize = 11;
@@ -26,6 +27,10 @@ pub(crate) struct ScalarBounds {
     /// The 32-bit view of the unsigned range, derived the same way.
     pub(crate) u32_min: u32,
     pub(crate) u32_max: u32,
+    /// The tracked number (kernel var_off, #42): bit-level precision on
+    /// top of the ranges. Kept consistent with the ranges by the sync
+    /// (the tnum is intersected with the range in `synced`).
+    pub(crate) tnum: Tnum,
 }
 
 impl ScalarBounds {
@@ -40,6 +45,7 @@ impl ScalarBounds {
             s32_max: value as i32,
             u32_min: value as u64 as u32,
             u32_max: value as u64 as u32,
+            tnum: Tnum::constant(value as u64),
         }
     }
 
@@ -61,6 +67,7 @@ impl ScalarBounds {
                 s32_max: i32::MAX,
                 u32_min: 0,
                 u32_max: u32::MAX,
+                tnum: Tnum::unknown(),
             }
         } else {
             // both interpretations are the same bit range
@@ -73,14 +80,16 @@ impl ScalarBounds {
                 s32_max: i32::MAX,
                 u32_min: 0,
                 u32_max: u32::MAX,
+                tnum: Tnum::unknown(),
             }
         };
         bounds.synced()
     }
 
-    /// Whether every bit of the value is known in both interpretations.
+    /// Whether every bit of the value is known in both interpretations
+    /// and the tnum agrees (consistent states satisfy this together).
     pub(crate) fn is_constant(&self) -> bool {
-        self.smin == self.smax && self.umin == self.umax
+        self.smin == self.smax && self.umin == self.umax && self.tnum.is_constant()
     }
 
     /// The signed interval.
@@ -105,6 +114,7 @@ impl ScalarBounds {
             s32_max: i32::MAX,
             u32_min: 0,
             u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
         }
     }
 
@@ -161,6 +171,9 @@ impl ScalarBounds {
             self.s32_min = i32::MIN;
             self.s32_max = i32::MAX;
         }
+        // intersect the tnum with the range (kernel __reg_bound_offset):
+        // a narrowed range pins down bits the tnum still had unknown
+        self.tnum = self.tnum.intersect(Tnum::from_range(self.umin, self.umax));
         self
     }
 }
@@ -200,8 +213,8 @@ impl std::fmt::Display for RegState {
             RegState::Uninit => write!(f, "UNINIT"),
             RegState::Scalar(s) => write!(
                 f,
-                "SCALAR(s:{}..{},u:{:#x}..{:#x})",
-                s.smin, s.smax, s.umin, s.umax
+                "SCALAR(s:{}..{},u:{:#x}..{:#x},t:{:#x}/{:#x})",
+                s.smin, s.smax, s.umin, s.umax, s.tnum.value, s.tnum.mask
             ),
             RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
@@ -435,11 +448,11 @@ mod tests {
         assert_eq!(RegState::Uninit.to_string(), "UNINIT");
         assert_eq!(
             RegState::Scalar(ScalarBounds::from_signed(0, 100)).to_string(),
-            "SCALAR(s:0..100,u:0x0..0x64)"
+            "SCALAR(s:0..100,u:0x0..0x64,t:0x0/0x7f)"
         );
         assert_eq!(
             RegState::Scalar(ScalarBounds::constant(-1)).to_string(),
-            "SCALAR(s:-1..-1,u:0xffffffffffffffff..0xffffffffffffffff)"
+            "SCALAR(s:-1..-1,u:0xffffffffffffffff..0xffffffffffffffff,t:0xffffffffffffffff/0x0)"
         );
         assert_eq!(
             RegState::PtrToStack { offset: -8 }.to_string(),
@@ -531,7 +544,9 @@ mod tests {
             s32_max: i32::MAX,
             u32_min: 0,
             u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
         }
+        .synced()
         .synced()
         .synced();
         assert_eq!(narrowed.signed(), (i64::MIN, -5));
@@ -546,7 +561,9 @@ mod tests {
             s32_max: i32::MAX,
             u32_min: 0,
             u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
         }
+        .synced()
         .synced()
         .synced();
         assert_eq!(narrowed.signed(), (0, 100));
