@@ -5,9 +5,10 @@ use std::fs;
 use anyhow::Result;
 
 use crate::cfg::{add_subprog, check_cfg};
+use crate::concrete::{ConcreteReport, check_coverage, render_coverage_report, run_concrete};
 use crate::error::Verdict;
 use crate::insn::{BpfInsn, parse_insn};
-use crate::mini::verify_mini;
+use crate::mini::{VerifierLimits, verify_mini_with_states};
 
 /// A loaded BPF program: raw bytecode plus decoded instructions and
 /// subprogram entry points.
@@ -26,6 +27,8 @@ pub(crate) struct BpfProg {
 #[derive(Default)]
 pub struct BpfVerifierEnv {
     pub(crate) prog: BpfProg, // BPF program data
+    /// The concrete-side report of the last `verify()` call (v0.5).
+    pub(crate) concrete_report: Option<ConcreteReport>,
 }
 
 impl BpfVerifierEnv {
@@ -64,24 +67,111 @@ impl BpfVerifierEnv {
 
     /// Run the full verification pipeline: structural checks (nano),
     /// then path-sensitive exploration (mini — the most advanced pass,
-    /// which includes the micro abstract execution). A verification
-    /// failure is not an error — it is returned as Ok(Verdict::Unsafe).
+    /// which includes the micro abstract execution). On accepted
+    /// programs the concrete interpreter then runs and its reachable
+    /// states are checked against the abstract states (Phase 2, #53);
+    /// on rejected programs the concrete run is kept as an
+    /// informational cross-check. A verification failure is not an
+    /// error — it is returned as Ok(Verdict::Unsafe). The verdict is
+    /// unchanged by the concrete side: an unsoundness is a model bug
+    /// and is reported via [`BpfVerifierEnv::concrete_report_text`].
     pub fn verify(&mut self) -> Result<Verdict> {
+        self.concrete_report = None;
+        // structural checks (nano)
         let subprogs = match add_subprog(&self.prog.insns) {
             Ok(subprogs) => subprogs,
-            Err(failure) => return Ok(Verdict::Unsafe(failure)),
+            Err(failure) => return self.reject_with_cross_check(failure, &[]),
         };
         self.prog.subprogs = subprogs;
-
         let loop_heads = match check_cfg(&self.prog.insns, &self.prog.subprogs) {
             Ok(loop_heads) => loop_heads,
-            Err(failure) => return Ok(Verdict::Unsafe(failure)),
+            Err(failure) => return self.reject_with_cross_check(failure, &[]),
         };
-
-        match verify_mini(&self.prog.insns, &loop_heads) {
-            Ok(_) => Ok(Verdict::Safe),
-            Err(failure) => Ok(Verdict::Unsafe(failure)),
+        // path exploration (mini), collecting the per-pc abstract states
+        match verify_mini_with_states(&self.prog.insns, &loop_heads, &VerifierLimits::default()) {
+            Err(failure) => self.reject_with_cross_check(failure, &loop_heads),
+            Ok((_, abstract_states)) => {
+                // ACCEPT: concrete run + coverage check — the Phase 2
+                // soundness question (every concrete visited state must
+                // be covered by an abstract state at the same pc)
+                let mut report = ConcreteReport::default();
+                match run_concrete(&self.prog.insns, &loop_heads) {
+                    Err(failure) => report.unexpected_failure = Some(failure),
+                    Ok(run) => {
+                        report.inconclusive = run.inconclusive;
+                        report.violations = check_coverage(&abstract_states, &run);
+                    }
+                }
+                self.concrete_report = Some(report);
+                Ok(Verdict::Safe)
+            }
         }
+    }
+
+    /// Run the concrete interpreter on a rejected program for an
+    /// informational cross-check: concrete also fails (expected),
+    /// concrete executes the program the abstract rejected (precision
+    /// candidate), or the concrete run is inconclusive (non-termination
+    /// candidate). Loop heads are unknown when the structural pass
+    /// failed; the state/step budgets still bound the run.
+    fn reject_with_cross_check(
+        &mut self,
+        failure: crate::error::VerificationFailure,
+        loop_heads: &[u32],
+    ) -> Result<Verdict> {
+        let note = match run_concrete(&self.prog.insns, loop_heads) {
+            Err(concrete_failure) => Some(format!(
+                "concrete cross-check: also fails {}",
+                concrete_failure
+            )),
+            Ok(run) if run.inconclusive => Some(
+                "concrete cross-check: inconclusive (non-terminating loop candidate)".to_string(),
+            ),
+            Ok(_) => Some(
+                "concrete cross-check: the program executes concretely — precision candidate"
+                    .to_string(),
+            ),
+        };
+        self.concrete_report = Some(ConcreteReport {
+            violations: Vec::new(),
+            inconclusive: false,
+            unexpected_failure: None,
+            reject_note: note,
+        });
+        Ok(Verdict::Unsafe(failure))
+    }
+
+    /// The concrete-side report of the last verification: rendered text
+    /// when something needs attention, `None` when the concrete run
+    /// agreed with the verdict.
+    pub fn concrete_report_text(&self) -> Option<String> {
+        let report = self.concrete_report.as_ref()?;
+        let mut out = String::new();
+        if !report.violations.is_empty() {
+            out.push_str(&format!(
+                "concrete coverage: {} violation(s) — the abstract state does not cover the concrete run\n",
+                report.violations.len()
+            ));
+            out.push_str(&render_coverage_report(
+                &report.violations,
+                &self.prog.insns,
+            ));
+        }
+        if report.inconclusive {
+            out.push_str(
+                "concrete run inconclusive: exploration budget exceeded (non-terminating loop candidate)\n",
+            );
+        }
+        if let Some(failure) = &report.unexpected_failure {
+            out.push_str(&format!(
+                "unexpected concrete failure (the abstract verifier accepted the program): {}\n",
+                failure
+            ));
+        }
+        if let Some(note) = &report.reject_note {
+            out.push_str(&format!("{}\n", note));
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 
@@ -174,6 +264,104 @@ mod tests {
             }
         }
         assert!(count > 0, "no reject programs found in {:?}", dir);
+    }
+
+    // ── Concrete integration (v0.5, #53) ───────────────────────────────────
+
+    /// Write a raw program to a temp file, verify it, and return the
+    /// verdict plus the env (for the concrete report).
+    fn verify_temp_program(insns: &[[u8; 8]], tag: &str) -> (Verdict, BpfVerifierEnv) {
+        let path =
+            std::env::temp_dir().join(format!("rand_verifier_{}_{}.bpf", tag, std::process::id()));
+        std::fs::write(&path, prog_bytes(insns)).unwrap();
+        let mut env = BpfVerifierEnv::new();
+        env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+        let verdict = env.verify().unwrap();
+        std::fs::remove_file(&path).ok();
+        (verdict, env)
+    }
+
+    #[test]
+    fn verify_accept_runs_concrete_clean() {
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 42),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "accept_clean");
+        assert!(matches!(verdict, Verdict::Safe));
+        let report = env.concrete_report.as_ref().unwrap();
+        assert!(report.violations.is_empty());
+        assert!(!report.inconclusive);
+        assert!(report.unexpected_failure.is_none());
+        assert!(report.reject_note.is_none());
+        // nothing noteworthy → no report text
+        assert!(env.concrete_report_text().is_none());
+    }
+
+    #[test]
+    fn verify_accept_prandom_program_clean() {
+        // r0 = get_prandom_u32(-7); exit — helper seeds must all be
+        // covered by the abstract unknown scalar range
+        let insns = [
+            insn_bytes(opcode::CALL, 0, 0, 0, -7),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "accept_prandom");
+        assert!(matches!(verdict, Verdict::Safe));
+        let report = env.concrete_report.as_ref().unwrap();
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert!(!report.inconclusive);
+        assert!(report.unexpected_failure.is_none());
+    }
+
+    #[test]
+    fn verify_reject_uninit_cross_check() {
+        // r0 = 1; r0 += r2 (uninitialized); exit
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 1),
+            insn_bytes(opcode::ADD_REG, 0, 2, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "reject_uninit");
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let report = env.concrete_report.as_ref().unwrap();
+        let note = report.reject_note.as_deref().expect("reject note");
+        assert!(note.contains("also fails"), "note: {}", note);
+        assert!(env.concrete_report_text().is_some());
+    }
+
+    #[test]
+    fn verify_reject_unreachable_precision_candidate() {
+        // r0 = 1; jmp +1; r0 = 0; exit — insn 2 is unreachable (nano
+        // reject), but the concrete interpreter executes the reachable
+        // path fine → precision candidate
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 1),
+            insn_bytes(opcode::JMP, 0, 0, 1, 0),
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "reject_unreachable");
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let report = env.concrete_report.as_ref().unwrap();
+        let note = report.reject_note.as_deref().expect("reject note");
+        assert!(note.contains("executes concretely"), "note: {}", note);
+    }
+
+    #[test]
+    fn verify_reject_nonterminating_loop_inconclusive_note() {
+        // r0 = 0; r0 += 1; jmp -2 — a never-converging loop: the
+        // abstract rejects it, the concrete run is inconclusive
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::ADD_IMM, 0, 0, 0, 1),
+            insn_bytes(opcode::JMP, 0, 0, -2, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "reject_loop");
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let report = env.concrete_report.as_ref().unwrap();
+        let note = report.reject_note.as_deref().expect("reject note");
+        assert!(note.contains("inconclusive"), "note: {}", note);
     }
 
     #[test]

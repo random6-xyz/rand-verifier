@@ -62,7 +62,6 @@ impl ConcreteState {
     /// `initial_reg_state()`: R1 = context pointer, R10 = frame pointer,
     /// everything else (registers and stack) uninitialized. Argument
     /// seeds arrive with helper-call modeling (#51), not at entry.
-    #[allow(dead_code)] // constructed by the interpreter (#50); used by tests
     pub(crate) fn initial() -> Self {
         let mut regs = [None; NUM_REGS];
         regs[1] = Some(ConcreteValue::CtxPtr(CTX_BASE));
@@ -110,6 +109,66 @@ pub(crate) enum ConcreteFailure {
     /// A jump target outside the program (defensive: the structural
     /// pass rejects invalid targets before this driver runs).
     InternalError { pc: u32 },
+}
+
+impl std::fmt::Display for ConcreteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UninitializedRead { pc, reg } => {
+                write!(f, "at insn {}: register r{} is uninitialized", pc, reg)
+            }
+            Self::InvalidRegister { pc, reg } => {
+                write!(f, "at insn {}: invalid register r{}", pc, reg)
+            }
+            Self::StackOutOfFrame { pc, offset } => write!(
+                f,
+                "at insn {}: stack access at r10{:+} is out of the frame",
+                pc, offset
+            ),
+            Self::MisalignedStackAccess { pc, offset } => write!(
+                f,
+                "at insn {}: stack access at r10{:+} is not 8-byte aligned",
+                pc, offset
+            ),
+            Self::UninitializedStackRead { pc, offset } => write!(
+                f,
+                "at insn {}: stack slot at r10{:+} is uninitialized (write before read)",
+                pc, offset
+            ),
+            Self::PointerArithmetic { pc, reg } => {
+                write!(f, "at insn {}: arithmetic on pointer r{}", pc, reg)
+            }
+            Self::StackPointerOutOfFrame { pc, reg } => {
+                write!(f, "at insn {}: stack pointer r{} left the frame", pc, reg)
+            }
+            Self::InvalidShiftAmount { pc, amount } => {
+                write!(f, "at insn {}: invalid shift amount {}", pc, amount)
+            }
+            Self::UnknownHelper { pc, imm } => write!(f, "at insn {}: unknown helper {}", pc, imm),
+            Self::HelperArgMismatch { pc, arg } => {
+                write!(
+                    f,
+                    "at insn {}: helper argument r{} has the wrong type",
+                    pc, arg
+                )
+            }
+            Self::InvalidComparison { pc, dst, src } => {
+                write!(
+                    f,
+                    "at insn {}: invalid comparison of r{} and r{}",
+                    pc, dst, src
+                )
+            }
+            Self::UnsupportedHelperReturn { pc, imm } => {
+                write!(
+                    f,
+                    "at insn {}: helper {} return type has no concrete model",
+                    pc, imm
+                )
+            }
+            Self::InternalError { pc } => write!(f, "at insn {}: internal error", pc),
+        }
+    }
 }
 
 /// Does the tnum admit the value? The known bits (`!mask`) must match;
@@ -174,7 +233,6 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
 /// Slot-level granularity mirrors the abstract stack (`StackState`):
 /// an uninitialized slot pairs with `None`, a spilled register with
 /// `Some(value)` plus `abstract_covers` on the spilled state.
-#[allow(dead_code)] // used by the coverage checker (#52); used by tests
 pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteState) -> bool {
     abstract_state
         .regs
@@ -583,7 +641,6 @@ pub(crate) struct ConcreteRun {
 
 /// Explore a program with the default limits. `loop_heads` are the
 /// targets of back edges from the structural pass (like `verify_mini`).
-#[allow(dead_code)] // wired into the pipeline (#53); used by tests
 pub(crate) fn run_concrete(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -598,7 +655,6 @@ pub(crate) fn run_concrete(
 /// equality (the abstract side uses subsumption); a deterministic loop
 /// converges by reaching its exit, and a loop that never converges hits
 /// the loop-head budget → inconclusive.
-#[allow(dead_code)] // wired into the pipeline (#53); used by tests
 pub(crate) fn run_concrete_with_limits(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -853,6 +909,28 @@ fn helper_return_seeds(
     }
 }
 
+/// The concrete-side report of the last verification (v0.5, #53): what
+/// the concrete interpreter found next to the verdict. The verdict
+/// itself is unchanged — an unsoundness is a verifier/model bug, not a
+/// program failure, so it is reported instead of flipping ACCEPT/REJECT.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConcreteReport {
+    /// Coverage violations on accepted programs (#52): `NotCovered` is
+    /// unsoundness, `AbstractMissedPc` a precision candidate.
+    pub(crate) violations: Vec<CoverageViolation>,
+    /// The concrete run hit an exploration budget (non-termination
+    /// candidate). Only reachable on rejected programs — accepted
+    /// programs terminate within the concrete budget (mirrors the
+    /// abstract loop budget).
+    pub(crate) inconclusive: bool,
+    /// The concrete interpreter failed although the abstract verifier
+    /// accepted the program — a model discrepancy.
+    pub(crate) unexpected_failure: Option<ConcreteFailure>,
+    /// Rejected programs: informational cross-check of the concrete
+    /// run ("also fails" / "precision candidate" / "inconclusive").
+    pub(crate) reject_note: Option<String>,
+}
+
 // ── Abstract↔concrete coverage checker (#52) ────────────────────────────────
 
 /// The classification of a coverage violation.
@@ -887,7 +965,6 @@ pub(crate) struct CoverageViolation {
 /// is checked through the same path. On an inconclusive run the
 /// violations found in the explored prefix are still real; the pipeline
 /// (#53) treats the inconclusive flag itself as a warning.
-#[allow(dead_code)] // wired into the pipeline (#53); used by tests
 pub(crate) fn check_coverage(
     abstract_states: &HashMap<u32, Vec<VerifierState>>,
     run: &ConcreteRun,
@@ -950,7 +1027,6 @@ fn render_concrete_state(state: &ConcreteState) -> String {
 
 /// Render a coverage report in the trace style: pc, disassembled
 /// instruction, concrete values, and the candidate abstract states.
-#[allow(dead_code)] // wired into the pipeline (#53); used by tests
 pub(crate) fn render_coverage_report(
     violations: &[CoverageViolation],
     program: &[BpfInsn],

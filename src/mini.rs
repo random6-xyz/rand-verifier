@@ -108,6 +108,7 @@ impl Default for VerifierLimits {
 ///   `max_steps` remain the outer bounds
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
+#[allow(dead_code)] // convenience entry kept for tests; the pipeline uses verify_mini_with_states (#53)
 pub(crate) fn verify_mini(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -133,7 +134,6 @@ pub(crate) fn verify_mini_with_limits(
 /// `verify_mini_with_limits` that also returns the per-pc abstract
 /// states the exploration analyzed — the input of the abstract↔concrete
 /// coverage checker (#52).
-#[allow(dead_code)] // wired into the pipeline (#53); used by tests
 pub(crate) fn verify_mini_with_states(
     program: &[BpfInsn],
     loop_heads: &[u32],
