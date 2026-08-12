@@ -74,6 +74,7 @@ result into the 64-bit register; `w` notation is used for the destination.
 | unsigned_then_signed_refine | `call -7; r1 = 100; jle r0, r1, +1; exit; r2 = -1; jsgt r0, r2, +1; exit; exit` | unsigned refine then signed prune    |
 | jeq_fall_exclusion          | `call -7; r3 = 42; jle r0, r3, +1; exit; r4 = 42; jeq r0, r4, +1; exit; exit` | equality fall-through exclusion     |
 | computed_offset_access      | `r6 = r10; r6 += -512; call -7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset in-frame + aligned   |
+| bounded_loop                | `r0 = 0; r2 = 100; r1 = 0; r1 += 1; jlt r1, r2, -2; exit`            | bounded counter loop (100 iterations) |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
@@ -82,7 +83,7 @@ result into the 64-bit register; `w` notation is used for the destination.
 
 | program                       | bytecode                                            | rule exercised                      |
 |-------------------------------|-----------------------------------------------------|-------------------------------------|
-| backward_jump                 | `jmp -1; exit`                                      | backward jump (loop)                |
+| loop_unreachable_exit          | `jmp -1; exit`                                      | self-loop with an unreachable exit  |
 | invalid_jump                  | `jmp +100; exit`                                    | jump target out of range            |
 | no_exit                       | `r0 = 1`                                            | missing exit                        |
 | unreachable                   | `jmp +1; r0 = 1; exit`                              | unreachable instruction             |
@@ -107,3 +108,4 @@ result into the 64-bit register; `w` notation is used for the destination.
 | jsgt_must_be_signed            | `r1 = -1; r2 = 0; jsgt r1, r2, +1; exit; r0 = 1; exit`          | signed compare must prune the taken path |
 | computed_offset_misaligned     | `r6 = r10; r6 += -512; call -7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment not provable    |
 | computed_offset_out_of_frame   | `r6 = r10; r6 += -32; call -7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset can leave the frame       |
+| non_converging_loop            | `r0 = 0; r1 = 0; r1 += 1; jeq r1, r1, -2; exit`                    | non-converging loop (loop budget)         |
