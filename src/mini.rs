@@ -35,9 +35,17 @@ pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
                 && old.tnum.subsumes(new.tnum)
         }
         (
-            RegState::PtrToStack { offset: old_offset },
-            RegState::PtrToStack { offset: new_offset },
-        ) => old_offset == new_offset,
+            RegState::PtrToStack {
+                min_offset: old_min,
+                max_offset: old_max,
+                align_off: old_align,
+            },
+            RegState::PtrToStack {
+                min_offset: new_min,
+                max_offset: new_max,
+                align_off: new_align,
+            },
+        ) => old_min == new_min && old_max == new_max && old_align == new_align,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
         (RegState::PtrToMap, RegState::PtrToMap) => true,
         (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
@@ -167,6 +175,7 @@ mod tests {
     use crate::exec::*;
     use crate::insn::*;
     use crate::state::*;
+    use crate::testutil::*;
     use crate::tnum::Tnum;
 
     #[test]
@@ -545,7 +554,7 @@ mod tests {
 
         // pointer offsets must match exactly
         let mut shifted = VerifierState::initial();
-        shifted.regs[10] = RegState::PtrToStack { offset: -8 };
+        shifted.regs[10] = ptr_stack(-8);
         assert!(!subsumes(&old, &shifted));
         assert!(subsumes(&old, &old));
     }

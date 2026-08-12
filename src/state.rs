@@ -6,6 +6,9 @@ use crate::tnum::Tnum;
 /// Number of eBPF registers: R0..R10.
 pub(crate) const NUM_REGS: usize = 11;
 
+/// Marker for an unknown pointer alignment (`align_off`).
+pub(crate) const ALIGN_UNKNOWN: u8 = 0xFF;
+
 /// The range bounds of a scalar register: the signed and the unsigned
 /// interpretation tracked side by side (cf. the kernel's `smin`/`smax`
 /// and `umin`/`umax` in `struct bpf_reg_state`, Meso #40).
@@ -205,8 +208,15 @@ impl ScalarBounds {
 pub(crate) enum RegState {
     Uninit,
     Scalar(ScalarBounds),
+    /// A pointer into the stack frame, offset relative to R10. The
+    /// offset may be a range (computed pointer arithmetic, #45); the
+    /// alignment tracks the known offset modulo 8.
     PtrToStack {
-        offset: i32,
+        min_offset: i32,
+        max_offset: i32,
+        /// Known offset modulo 8 (0..=7); [`ALIGN_UNKNOWN`] when the low
+        /// three bits of the offset are not determined.
+        align_off: u8,
     },
     PtrToCtx,
     /// A fixed map pointer (kernel's CONST_PTR_TO_MAP). Never
@@ -226,7 +236,17 @@ impl std::fmt::Display for RegState {
                 "SCALAR(s:{}..{},u:{:#x}..{:#x},t:{:#x}/{:#x})",
                 s.smin, s.smax, s.umin, s.umax, s.tnum.value, s.tnum.mask
             ),
-            RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
+            RegState::PtrToStack {
+                min_offset,
+                max_offset,
+                ..
+            } => {
+                if min_offset == max_offset {
+                    write!(f, "PTR_STACK({})", min_offset)
+                } else {
+                    write!(f, "PTR_STACK({}..{})", min_offset, max_offset)
+                }
+            }
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
             RegState::PtrToMap => write!(f, "PTR_MAP"),
             RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
@@ -241,7 +261,11 @@ impl std::fmt::Display for RegState {
 pub(crate) fn initial_reg_state() -> [RegState; NUM_REGS] {
     let mut regs = [RegState::Uninit; NUM_REGS];
     regs[1] = RegState::PtrToCtx;
-    regs[10] = RegState::PtrToStack { offset: 0 };
+    regs[10] = RegState::PtrToStack {
+        min_offset: 0,
+        max_offset: 0,
+        align_off: 0,
+    };
     regs
 }
 
@@ -433,6 +457,7 @@ mod tests {
     use super::*;
     use crate::exec::step;
     use crate::insn::BpfInsn;
+    use crate::testutil::*;
 
     #[test]
     fn reg_state_initial_state() {
@@ -451,7 +476,7 @@ mod tests {
         }
 
         // R10 = PtrToStack(0)
-        assert_eq!(regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(regs[10], ptr_stack(0));
     }
 
     #[test]
@@ -473,10 +498,7 @@ mod tests {
             RegState::Scalar(ScalarBounds::constant(-1)).to_string(),
             "SCALAR(s:-1..-1,u:0xffffffffffffffff..0xffffffffffffffff,t:0xffffffffffffffff/0x0)"
         );
-        assert_eq!(
-            RegState::PtrToStack { offset: -8 }.to_string(),
-            "PTR_STACK(-8)"
-        );
+        assert_eq!(ptr_stack(-8).to_string(), "PTR_STACK(-8)");
         assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
         assert_eq!(RegState::PtrToMap.to_string(), "PTR_MAP");
         assert_eq!(RegState::PtrToMapValue.to_string(), "PTR_MAP_VALUE");
@@ -515,7 +537,7 @@ mod tests {
         }
 
         // R10 = PtrToStack(0)
-        assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(state.regs[10], ptr_stack(0));
     }
 
     // ── ScalarBounds (Meso #40) ──────────────────────────────────────────────
@@ -803,10 +825,7 @@ mod tests {
         let state = VerifierState::initial();
         // R1 (PtrToCtx) and R10 (PtrToStack) are readable at entry
         assert_eq!(read_reg(0, &state, 1).unwrap(), RegState::PtrToCtx);
-        assert_eq!(
-            read_reg(0, &state, 10).unwrap(),
-            RegState::PtrToStack { offset: 0 }
-        );
+        assert_eq!(read_reg(0, &state, 10).unwrap(), ptr_stack(0));
     }
 
     #[test]

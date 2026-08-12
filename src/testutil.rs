@@ -2,6 +2,15 @@
 
 use crate::insn::{BpfInsn, parse_insn};
 
+/// A stack pointer at an exact offset (test shorthand).
+pub(crate) fn ptr_stack(offset: i32) -> crate::state::RegState {
+    crate::state::RegState::PtrToStack {
+        min_offset: offset,
+        max_offset: offset,
+        align_off: offset.rem_euclid(8) as u8,
+    }
+}
+
 /// Build a raw 8-byte instruction:
 /// [op, (src << 4 | dst), offset_le, imm_le]
 pub(crate) fn insn_bytes(op: u8, dst: u8, src: u8, offset: i16, imm: i32) -> [u8; 8] {

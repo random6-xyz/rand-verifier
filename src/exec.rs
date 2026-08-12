@@ -4,8 +4,8 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg, read_reg, read_scalar,
-    stack_slot_index,
+    ALIGN_UNKNOWN, RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg,
+    read_reg, read_scalar, stack_slot_index,
 };
 use crate::tnum::Tnum;
 
@@ -202,10 +202,14 @@ fn alu_imm(
             next.regs[dst as usize] = RegState::Scalar(next_bounds);
             Ok(next)
         }
-        // PtrToStack + imm => PtrToStack at the shifted offset;
-        // the pointer must stay within the frame (cf. #19). Only ADD is
+        // PtrToStack + imm => PtrToStack at the shifted offset; the
+        // pointer must stay within the frame (cf. #19). Only ADD is
         // allowed on stack pointers — like the kernel's check_alu_op.
-        RegState::PtrToStack { offset } => {
+        RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(VerificationFailure::new(
                     pc,
@@ -215,18 +219,23 @@ fn alu_imm(
                     ),
                 ));
             }
-            let new_offset = offset.wrapping_add(imm);
-            if !(-(STACK_SIZE as i32)..=0).contains(&new_offset) {
+            let new_min = min_offset.wrapping_add(imm);
+            let new_max = max_offset.wrapping_add(imm);
+            if new_min < -(STACK_SIZE as i32) || new_max > 0 {
                 return Err(VerificationFailure::new(
                     pc,
                     format!(
-                        "stack pointer r{} offset {} is out of the {} byte frame",
-                        dst, new_offset, STACK_SIZE
+                        "stack pointer r{} offsets {}..{} are out of the {} byte frame",
+                        dst, new_min, new_max, STACK_SIZE
                     ),
                 ));
             }
             let mut next = *state;
-            next.regs[dst as usize] = RegState::PtrToStack { offset: new_offset };
+            next.regs[dst as usize] = RegState::PtrToStack {
+                min_offset: new_min,
+                max_offset: new_max,
+                align_off: (align_off as i32 + imm.rem_euclid(8)).rem_euclid(8) as u8,
+            };
             Ok(next)
         }
         RegState::PtrToCtx => Err(VerificationFailure::new(
@@ -270,6 +279,27 @@ fn alu_reg(
 ) -> Result<VerifierState, VerificationFailure> {
     check_reg(pc, dst)?;
     let dst_state = read_reg(pc, state, dst)?;
+    // computed stack pointer arithmetic: PtrToStack + ScalarRange is
+    // accepted when the result provably stays in the frame and the
+    // alignment of the computed offset is provable (#45)
+    if let RegState::PtrToStack {
+        min_offset,
+        max_offset,
+        align_off,
+    } = dst_state
+    {
+        if op != AluOp::Add || width != AluWidth::W64 {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "arithmetic on stack pointer r{} is not allowed (only ADD supports stack pointer arithmetic)",
+                    dst
+                ),
+            ));
+        }
+        let s = read_scalar(pc, state, src)?;
+        return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, s, state);
+    }
     let d = match dst_state {
         RegState::Scalar(bounds) => bounds,
         _ => {
@@ -290,6 +320,60 @@ fn alu_reg(
     let next_bounds = apply_alu(op, width, d, s);
     let mut next = *state;
     next.regs[dst as usize] = RegState::Scalar(next_bounds);
+    Ok(next)
+}
+
+/// `PtrToStack + ScalarRange` (#45): the resulting offsets must provably
+/// stay within the frame, and a computed (non-exact) offset must be
+/// provably 8-byte aligned (the scalar's tnum determines the low three
+/// bits of the added amount).
+fn add_scalar_to_stack_ptr(
+    pc: u32,
+    dst: u8,
+    min_offset: i32,
+    max_offset: i32,
+    align_off: u8,
+    s: ScalarBounds,
+    state: &VerifierState,
+) -> Result<VerifierState, VerificationFailure> {
+    // the offset range shifts by the scalar's signed range; the sums
+    // cannot overflow i64 (offsets are within [-512, 0])
+    let new_min = min_offset as i64 + s.smin;
+    let new_max = max_offset as i64 + s.smax;
+    if new_min < -(STACK_SIZE as i64) || new_max > 0 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack pointer r{} may leave the {} byte frame (offsets {}..{})",
+                dst, STACK_SIZE, new_min, new_max
+            ),
+        ));
+    }
+    // alignment: the low three bits of the scalar's tnum, when known
+    let new_align = if s.tnum.mask & 7 == 0 {
+        (align_off as i32 + (s.tnum.value & 7) as i32).rem_euclid(8) as u8
+    } else {
+        ALIGN_UNKNOWN
+    };
+    // a computed (non-exact) offset must be provably 8-byte aligned —
+    // this is the model's access-time requirement: every stack access
+    // is an 8-byte slot access, so every possible concrete offset must
+    // be aligned
+    if new_min != new_max && new_align == ALIGN_UNKNOWN {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack pointer r{} alignment is not provable (computed offsets must be 8-byte aligned)",
+                dst
+            ),
+        ));
+    }
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::PtrToStack {
+        min_offset: new_min as i32,
+        max_offset: new_max as i32,
+        align_off: new_align,
+    };
     Ok(next)
 }
 
@@ -1326,7 +1410,7 @@ mod tests {
         assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(10)));
         // other registers untouched
         assert_eq!(next.regs[1], RegState::PtrToCtx);
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     #[test]
@@ -1359,7 +1443,7 @@ mod tests {
         let next = step(0, &state, &BpfInsn::MovReg { dst: 4, src: 1 }).unwrap();
         assert_eq!(next.regs[4], RegState::PtrToCtx);
         let next = step(0, &state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[5], ptr_stack(0));
     }
 
     #[test]
@@ -2450,11 +2534,174 @@ mod tests {
     // ── Pointer arithmetic (v0.2) ────────────────────────────────────────────
 
     #[test]
+    fn step_add_reg_stack_ptr_computed_aligned() {
+        // r1 = r10; r1 += -32; r1 += r2 with r2 = {0, 8} (tnum low three
+        // bits known zero): every resulting offset is in-frame and
+        // 8-byte aligned → ACCEPT (#45)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 8,
+            umin: 0,
+            umax: 8,
+            s32_min: 0,
+            s32_max: 8,
+            u32_min: 0,
+            u32_max: 8,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b1000,
+            },
+        });
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(
+            next.regs[1],
+            RegState::PtrToStack {
+                min_offset: -32,
+                max_offset: -24,
+                align_off: 0,
+            }
+        );
+        // the frame pointer itself is untouched
+        assert_eq!(next.regs[10], ptr_stack(0));
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_exact_result() {
+        // r2 = 8 (constant): the result is exact; alignment is not even
+        // needed for the acceptance
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], ptr_stack(-24));
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_out_of_frame() {
+        // the range can exceed the frame → REJECT with a bounds message
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 1000,
+            umin: 0,
+            umax: 1000,
+            s32_min: 0,
+            s32_max: 1000,
+            u32_min: 0,
+            u32_max: 1000,
+            tnum: Tnum::unknown(),
+        });
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
+        // r1 = r10 (offset 0) + [0, 8] includes offset 8 → REJECT too
+        let mut state = VerifierState::initial();
+        state.regs[1] = ptr_stack(0);
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 8));
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_misaligned() {
+        // the scalar's low three bits are unknown → the computed offset
+        // is not provably 8-byte aligned → REJECT with an alignment
+        // message (#45)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 0,
+            smax: 8,
+            umin: 0,
+            umax: 8,
+            s32_min: 0,
+            s32_max: 8,
+            u32_min: 0,
+            u32_max: 8,
+            tnum: Tnum {
+                value: 0,
+                mask: 0b101,
+            },
+        });
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("alignment"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_known_misalignment() {
+        // r2 low bits known 1: the result is provably misaligned, which
+        // is still "not provably 8-byte aligned" for a computed offset
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds {
+            smin: 1,
+            smax: 1,
+            umin: 1,
+            umax: 1,
+            s32_min: 1,
+            s32_max: 1,
+            u32_min: 1,
+            u32_max: 1,
+            tnum: Tnum::constant(1),
+        });
+        // exact result (r2 is a constant): accepted — access-time checks
+        // cover exact offsets
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], ptr_stack(-31));
+    }
+
+    #[test]
+    fn step_add_imm_ptr_stack_alignment() {
+        // alignment survives immediate arithmetic: r10 += -8 keeps mod 8
+        let state = VerifierState::initial();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
+        let RegState::PtrToStack { align_off, .. } = next.regs[10] else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!(align_off, 0);
+        let next = step(0, &next, &BpfInsn::AddImm { dst: 10, imm: -4 }).unwrap();
+        let RegState::PtrToStack { align_off, .. } = next.regs[10] else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!(align_off, 4);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_pointer_src_rejected() {
+        // PtrToStack + PtrToStack is still rejected
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 10, src: 1 }).unwrap_err();
+        assert!(err.message.contains("register-offset"), "{}", err.message);
+    }
+
+    #[test]
     fn step_add_imm_ptr_stack() {
         // r10 += -8 → PtrToStack(-8): the frame pointer moves down one slot
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: -8 });
+        assert_eq!(next.regs[10], ptr_stack(-8));
     }
 
     #[test]
@@ -2463,7 +2710,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -8 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: -16 });
+        assert_eq!(next.regs[10], ptr_stack(-16));
     }
 
     #[test]
@@ -2472,9 +2719,9 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 5, imm: -16 }).unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToStack { offset: -16 });
+        assert_eq!(next.regs[5], ptr_stack(-16));
         // the frame pointer itself is untouched
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     #[test]
@@ -2493,7 +2740,7 @@ mod tests {
         // offset -512 is the last valid slot; one step past it → REJECT
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -512 }).unwrap();
-        assert_eq!(state.regs[10], RegState::PtrToStack { offset: -512 });
+        assert_eq!(state.regs[10], ptr_stack(-512));
         let err = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap_err();
         assert!(err.message.contains("out of the"));
     }
@@ -2503,7 +2750,7 @@ mod tests {
         // adding 0 keeps the pointer (no-op)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: 0 }).unwrap();
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     // ── Trace (v0.2) ─────────────────────────────────────────────────────────
@@ -3385,7 +3632,7 @@ mod tests {
         // registers are clobbered (#29)
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
+        state.regs[2] = ptr_stack(-8);
         let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
         assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
         assert_eq!(next.regs[1], RegState::Uninit);
@@ -3406,8 +3653,8 @@ mod tests {
         // returns 0 on success
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
-        state.regs[3] = RegState::PtrToStack { offset: -16 };
+        state.regs[2] = ptr_stack(-8);
+        state.regs[3] = ptr_stack(-16);
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
         let next = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap();
         assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
@@ -3418,7 +3665,7 @@ mod tests {
         // R3 (the value pointer) is uninitialized → #14 error
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
+        state.regs[2] = ptr_stack(-8);
         let err = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
@@ -3453,7 +3700,7 @@ mod tests {
         // the eBPF calling convention: R1..R5 are scratch, R6..R9 callee-saved
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        state.regs[2] = RegState::PtrToStack { offset: -8 };
+        state.regs[2] = ptr_stack(-8);
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(1));
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(2));
         state.regs[5] = RegState::Scalar(ScalarBounds::constant(3));
@@ -3477,6 +3724,6 @@ mod tests {
                 reg
             );
         }
-        assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 }
