@@ -1606,7 +1606,7 @@ fn successors_uninit_operand_rejected() {
 
 #[test]
 fn verify_mini_unknown_helper() {
-    let program = vec![BpfInsn::Call { imm: 99 }, BpfInsn::Exit];
+    let program = vec![BpfInsn::Call { imm: -99 }, BpfInsn::Exit];
     let err = verify_mini(&program).unwrap_err();
     assert!(err.message.contains("unknown helper"));
 }
@@ -2099,7 +2099,7 @@ fn step_call_map_lookup_ok() {
     let mut state = VerifierState::initial();
     state.regs[1] = RegState::PtrToMap;
     state.regs[2] = RegState::PtrToStack { offset: -8 };
-    let next = step(&state, &BpfInsn::Call { imm: 1 }).unwrap();
+    let next = step(&state, &BpfInsn::Call { imm: -1 }).unwrap();
     assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
     assert_eq!(next.regs[1], RegState::Uninit);
     assert_eq!(next.regs[2], RegState::Uninit);
@@ -2109,7 +2109,7 @@ fn step_call_map_lookup_ok() {
 fn step_call_prandom() {
     // no arguments → R0 becomes an unknown scalar (full range)
     let state = VerifierState::initial();
-    let next = step(&state, &BpfInsn::Call { imm: 7 }).unwrap();
+    let next = step(&state, &BpfInsn::Call { imm: -7 }).unwrap();
     assert_eq!(
         next.regs[0],
         RegState::Scalar {
@@ -2128,7 +2128,7 @@ fn step_call_map_update_ok() {
     state.regs[2] = RegState::PtrToStack { offset: -8 };
     state.regs[3] = RegState::PtrToStack { offset: -16 };
     state.regs[4] = RegState::Scalar { min: 0, max: 0 };
-    let next = step(&state, &BpfInsn::Call { imm: 2 }).unwrap();
+    let next = step(&state, &BpfInsn::Call { imm: -2 }).unwrap();
     assert_eq!(next.regs[0], RegState::Scalar { min: 0, max: 0 });
 }
 
@@ -2138,7 +2138,7 @@ fn step_call_map_update_missing_value() {
     let mut state = VerifierState::initial();
     state.regs[1] = RegState::PtrToMap;
     state.regs[2] = RegState::PtrToStack { offset: -8 };
-    let err = step(&state, &BpfInsn::Call { imm: 2 }).unwrap_err();
+    let err = step(&state, &BpfInsn::Call { imm: -2 }).unwrap_err();
     assert!(err.message.contains("uninitialized"));
 }
 
@@ -2146,7 +2146,7 @@ fn step_call_map_update_missing_value() {
 fn step_call_arg_mismatch() {
     // R1 is the context pointer, not a map pointer → rejected
     let state = VerifierState::initial();
-    let err = step(&state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+    let err = step(&state, &BpfInsn::Call { imm: -1 }).unwrap_err();
     assert!(err.message.contains("expected PtrToMap"));
     assert!(err.message.contains("r1 has type PTR_CTX"));
 }
@@ -2154,8 +2154,8 @@ fn step_call_arg_mismatch() {
 #[test]
 fn step_call_unknown_helper() {
     let state = VerifierState::initial();
-    let err = step(&state, &BpfInsn::Call { imm: 99 }).unwrap_err();
-    assert!(err.message.contains("unknown helper 99"));
+    let err = step(&state, &BpfInsn::Call { imm: -99 }).unwrap_err();
+    assert!(err.message.contains("unknown helper -99"));
 }
 
 #[test]
@@ -2163,7 +2163,7 @@ fn step_call_uninit_arg() {
     // R2 (the key pointer) is uninitialized → #14 error
     let mut state = VerifierState::initial();
     state.regs[1] = RegState::PtrToMap;
-    let err = step(&state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+    let err = step(&state, &BpfInsn::Call { imm: -1 }).unwrap_err();
     assert!(err.message.contains("uninitialized"));
 }
 
@@ -2177,7 +2177,7 @@ fn verify_mini_prandom_branch() {
     // 3: exit           (R0 = [MIN, MAX])
     // 4: exit           (R0 = [0, 0])
     let program = vec![
-        BpfInsn::Call { imm: 7 },
+        BpfInsn::Call { imm: -7 },
         BpfInsn::MovImm { dst: 1, imm: 0 },
         BpfInsn::Jeq {
             dst: 0,
@@ -2261,7 +2261,7 @@ fn step_call_clobbers_r1_to_r5_preserves_r6_to_r9() {
     state.regs[8] = RegState::Scalar { min: 12, max: 12 };
     state.regs[9] = RegState::Scalar { min: 13, max: 13 };
 
-    let next = step(&state, &BpfInsn::Call { imm: 1 }).unwrap();
+    let next = step(&state, &BpfInsn::Call { imm: -1 }).unwrap();
     // R0 = return type, R1..R5 invalidated
     assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
     for reg in 1..=5 {
@@ -2286,7 +2286,7 @@ fn verify_mini_helper_clobber_detected() {
     // 1: r0 = r1  → R1 is uninitialized → REJECT
     // 2: exit
     let program = vec![
-        BpfInsn::Call { imm: 7 },
+        BpfInsn::Call { imm: -7 },
         BpfInsn::MovReg { dst: 0, src: 1 },
         BpfInsn::Exit,
     ];
@@ -2303,7 +2303,7 @@ fn verify_mini_helper_preserves_callee_saved() {
     // 3: exit
     let program = vec![
         BpfInsn::MovImm { dst: 6, imm: 5 },
-        BpfInsn::Call { imm: 7 },
+        BpfInsn::Call { imm: -7 },
         BpfInsn::MovReg { dst: 0, src: 6 },
         BpfInsn::Exit,
     ];
@@ -2320,4 +2320,69 @@ fn subsumes_ptr_to_map() {
     assert!(subsumes(&map, &map));
     assert!(!subsumes(&map, &ctx));
     assert!(!subsumes(&ctx, &map));
+}
+
+// ── mini test corpus (file fixtures) ────────────────────────────────────
+
+/// Run the full pipeline on a mini corpus program: structural checks
+/// (nano) first, then path-sensitive exploration (mini) with the
+/// default limits.
+fn verify_mini_corpus_program(path: &std::path::Path) -> Verdict {
+    let mut env = BpfVerifierEnv::new();
+    env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+
+    // structural pass (nano): the CFG must be valid
+    if let Verdict::Unsafe(failure) = env.verify().unwrap() {
+        return Verdict::Unsafe(failure);
+    }
+
+    // path-sensitive pass (mini): worklist exploration (#23..#32)
+    match verify_mini(&env.prog.insns) {
+        Ok(_) => Verdict::Safe,
+        Err(failure) => Verdict::Unsafe(failure),
+    }
+}
+
+/// Every program under tests/programs/mini/accept/ must pass verification.
+#[test]
+fn corpus_mini_accept_all() {
+    let dir = std::path::Path::new("tests/programs/mini/accept");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        let verdict = verify_mini_corpus_program(&path);
+        assert!(
+            matches!(verdict, Verdict::Safe),
+            "accept program {:?} was rejected",
+            path
+        );
+        count += 1;
+    }
+    assert!(count > 0, "no accept programs found in {:?}", dir);
+}
+
+/// Every program under tests/programs/mini/reject/ must fail verification.
+#[test]
+fn corpus_mini_reject_all() {
+    let dir = std::path::Path::new("tests/programs/mini/reject");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        // skip docs and directories; corpus files have no extension
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+        match verify_mini_corpus_program(&path) {
+            Verdict::Safe => panic!("reject program {:?} was accepted", path),
+            Verdict::Unsafe(failure) => {
+                println!("rejected as expected: {:?} → {}", path, failure);
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 0, "no reject programs found in {:?}", dir);
 }

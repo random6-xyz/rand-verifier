@@ -444,7 +444,9 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
         // clobbered by the call (kernel's check_helper_call resets them
         // to NOT_INIT), R6..R9 are preserved, and R0 gets the return type
         BpfInsn::Call { imm } => {
-            let helper = helper_prototype(*imm).ok_or_else(|| {
+            // helper ids are encoded as negative immediates (kernel
+            // convention); positive immediates are BPF-to-BPF calls
+            let helper = helper_prototype(-*imm).ok_or_else(|| {
                 VerificationFailure::new(NO_PC, format!("unknown helper {}", imm))
             })?;
             check_helper_args(helper, state)?;
@@ -696,7 +698,9 @@ struct HelperPrototype {
     return_type: RegState,
 }
 
-/// The helper table: id → prototype (#28).
+/// The helper table: id → prototype (#28). Calls encode the helper id
+/// as a negative immediate, like the kernel (positive immediates are
+/// BPF-to-BPF calls, handled by the nano pass).
 fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
     match id {
         // BPF_FUNC_map_lookup_elem: map_lookup(map, key)
@@ -1173,7 +1177,11 @@ fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
     let mut subprogs = vec![0u32];
 
     for (idx, insn) in insns.iter().enumerate() {
-        if let BpfInsn::Call { imm } = insn {
+        // helper calls use negative immediates (kernel convention) and
+        // are not subprograms
+        if let BpfInsn::Call { imm } = insn
+            && *imm >= 0
+        {
             register_subprog(idx as u32, *imm, insn_cnt, &mut subprogs)?;
         }
     }
@@ -1249,8 +1257,12 @@ fn visit_insn(
             }
             vec![target, idx + 1]
         }
-        // subprogram call — callee entry + return address
+        // subprogram call (imm >= 0) — callee entry + return address;
+        // helper calls (imm < 0, kernel convention) fall straight through
         BpfInsn::Call { imm } => {
+            if *imm < 0 {
+                return Ok(vec![idx + 1]);
+            }
             let target = *imm as u32;
             if target >= insn_cnt {
                 return Err(VerificationFailure::new(
