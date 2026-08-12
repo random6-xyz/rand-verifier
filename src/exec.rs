@@ -552,8 +552,9 @@ fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
 }
 
 /// Exact 64-bit ALU on constant bits (wrapping is exact bit arithmetic).
-/// Shift amounts are validated by the caller.
-fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
+/// Shift amounts are validated by the caller. Shared with the concrete
+/// interpreter (#50) so both sides use the same bit-level operation.
+pub(crate) fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
     match op {
         AluOp::Add => a.wrapping_add(b),
         AluOp::Sub => a.wrapping_sub(b),
@@ -567,7 +568,8 @@ fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
 }
 
 /// Exact 32-bit ALU on constant bits: truncate, compute, zero-extend.
-fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
+/// Shared with the concrete interpreter (#50).
+pub(crate) fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
     let a = a as u32;
     let b = b as u32;
     let r = match op {
