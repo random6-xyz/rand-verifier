@@ -209,14 +209,17 @@ fn stack_slot_constants() {
 #[test]
 fn stack_slot_display() {
     assert_eq!(StackSlot::Uninit.to_string(), "UNINIT");
-    assert_eq!(StackSlot::Scalar.to_string(), "SCALAR");
+    assert_eq!(
+        StackSlot::Spilled(RegState::PtrToCtx).to_string(),
+        "SPILLED(PTR_CTX)"
+    );
 }
 
 #[test]
 fn stack_state_equality() {
     let a = StackState::new();
     let mut b = StackState::new();
-    b.slots[0] = StackSlot::Scalar;
+    b.slots[0] = StackSlot::Spilled(RegState::Scalar { min: 1, max: 1 });
     assert_ne!(a, b);
 }
 
@@ -227,7 +230,11 @@ fn st_stack_writes_scalar_slot() {
     let state = VerifierState::initial();
     let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
     let next = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
-    assert_eq!(next.stack.slots[0], StackSlot::Scalar);
+    // the full scalar range is spilled, not just an initialized marker
+    assert_eq!(
+        next.stack.slots[0],
+        StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+    );
     // the source register is unchanged
     assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
 }
@@ -245,7 +252,10 @@ fn st_stack_offsets_map_to_slots() {
         },
     )
     .unwrap();
-    assert_eq!(next.stack.slots[63], StackSlot::Scalar);
+    assert_eq!(
+        next.stack.slots[63],
+        StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+    );
     assert_eq!(next.stack.slots[0], StackSlot::Uninit);
 }
 
@@ -258,11 +268,31 @@ fn st_stack_rejects_uninit_src() {
 }
 
 #[test]
-fn st_stack_rejects_pointer_spill() {
-    // storing a pointer is not representable yet → #30
+fn st_stack_spills_pointer() {
+    // pointers are now spilled with their full state (#30)
     let state = VerifierState::initial();
-    let err = step(&state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap_err();
-    assert!(err.message.contains("#30"));
+    let next = step(&state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap();
+    assert_eq!(next.stack.slots[0], StackSlot::Spilled(RegState::PtrToCtx));
+}
+
+#[test]
+fn ld_stack_restores_pointer() {
+    // spill r1 (PtrToCtx), then restore it into r5
+    let state = VerifierState::initial();
+    let state = step(&state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::LdStack { dst: 5, offset: -8 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToCtx);
+}
+
+#[test]
+fn st_ld_stack_nullable_pointer_roundtrip() {
+    // an OrNull pointer survives spill/fill — the NULL check is still
+    // required after the fill
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValueOrNull;
+    let state = step(&state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap();
+    let next = step(&state, &BpfInsn::LdStack { dst: 5, offset: -8 }).unwrap();
+    assert_eq!(next.regs[5], RegState::PtrToMapValueOrNull);
 }
 
 #[test]
@@ -271,14 +301,8 @@ fn ld_stack_after_store() {
     let state = step(&state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
     let state = step(&state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
     let next = step(&state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap();
-    // the slot carries no range, so the loaded scalar is unknown (full range)
-    assert_eq!(
-        next.regs[0],
-        RegState::Scalar {
-            min: i64::MIN,
-            max: i64::MAX
-        }
-    );
+    // the spilled range is restored exactly (#30)
+    assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
 }
 
 #[test]
@@ -347,7 +371,10 @@ fn stack_bounds_frame_edges() {
     for offset in [-8, -512] {
         let next = step(&state, &BpfInsn::StStack { src: 2, offset }).unwrap();
         let idx = stack_slot_index(offset as i32).unwrap();
-        assert_eq!(next.stack.slots[idx], StackSlot::Scalar);
+        assert_eq!(
+            next.stack.slots[idx],
+            StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+        );
     }
     // one byte beyond each edge is rejected
     for offset in [-7, -513] {
@@ -741,11 +768,8 @@ fn run_trace_full_sequence() {
     ];
     let trace = run_trace(&program).unwrap();
     assert!(trace.contains("1: [r10-8] = r2\n"));
-    assert!(
-        trace.contains(
-            "2: r0 = [r10-8]\n  R0 = SCALAR(-9223372036854775808..9223372036854775807)\n"
-        )
-    );
+    // the spilled scalar range survives the round-trip (#30)
+    assert!(trace.contains("2: r0 = [r10-8]\n  R0 = SCALAR(10..10)\n"));
     assert!(trace.contains("3: r10 += -8\n  R10 = PTR_STACK(-8)\n"));
 }
 
@@ -1766,7 +1790,7 @@ fn subsumes_reg_mismatch() {
 #[test]
 fn subsumes_stack_mismatch() {
     let mut old = VerifierState::initial();
-    old.stack.slots[0] = StackSlot::Scalar;
+    old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar { min: 1, max: 1 });
     let new = VerifierState::initial();
     // stack states differ → not subsumed even though the registers match
     assert!(!subsumes(&old, &new));

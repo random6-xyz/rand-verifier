@@ -140,19 +140,21 @@ const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 
 /// Abstract state of a single stack slot.
 ///
-/// Slot-level granularity (not byte-level) keeps the model approachable;
-/// scalar ranges and spilled pointer states are not tracked here yet (#30).
+/// Slot-level granularity (not byte-level) keeps the model approachable.
+/// A slot holds the full spilled register state, so pointers and scalar
+/// ranges survive a store/load round-trip (#30) — like the kernel's
+/// STACK_SPILL slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StackSlot {
     Uninit,
-    Scalar,
+    Spilled(RegState),
 }
 
 impl std::fmt::Display for StackSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StackSlot::Uninit => write!(f, "UNINIT"),
-            StackSlot::Scalar => write!(f, "SCALAR"),
+            StackSlot::Spilled(state) => write!(f, "SPILLED({})", state),
         }
     }
 }
@@ -397,35 +399,22 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             };
             Ok(next)
         }
-        // r10[offset] = rY → store the source's abstract state to a stack
-        // slot; only scalars are representable yet (pointer spill is #30)
+        // r10[offset] = rY → spill the source's full abstract state,
+        // including pointers and scalar ranges (#30)
         BpfInsn::StStack { src, offset } => {
             let slot = stack_slot_index(*offset as i32)?;
             let src_state = read_reg(state, *src)?;
-            match src_state {
-                RegState::Scalar { .. } => {}
-                RegState::PtrToStack { .. }
-                | RegState::PtrToCtx
-                | RegState::PtrToMap
-                | RegState::PtrToMapValue
-                | RegState::PtrToMapValueOrNull => {
-                    return Err(VerificationFailure::new(
-                        NO_PC,
-                        format!("spilling pointer r{} is not supported yet (see #30)", src),
-                    ));
-                }
-                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
-            }
             let mut next = *state;
-            next.stack.slots[slot] = StackSlot::Scalar;
+            next.stack.slots[slot] = StackSlot::Spilled(src_state);
             Ok(next)
         }
         // rX = r10[offset] → load a stack slot; a slot must have been
-        // written before it is read (write-before-read, #18)
+        // written before it is read (write-before-read, #18). The full
+        // spilled register state is restored, pointers included (#30).
         BpfInsn::LdStack { dst, offset } => {
             check_reg(*dst)?;
             let slot = stack_slot_index(*offset as i32)?;
-            match state.stack.slots[slot] {
+            let spilled = match state.stack.slots[slot] {
                 StackSlot::Uninit => {
                     return Err(VerificationFailure::new(
                         NO_PC,
@@ -435,14 +424,10 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                         ),
                     ));
                 }
-                StackSlot::Scalar => {}
-            }
-            // the slot carries no range yet, so a loaded scalar is unknown
-            let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: i64::MIN,
-                max: i64::MAX,
+                StackSlot::Spilled(spilled) => spilled,
             };
+            let mut next = *state;
+            next.regs[*dst as usize] = spilled;
             Ok(next)
         }
         // control flow is expanded by the worklist driver (#23), which
