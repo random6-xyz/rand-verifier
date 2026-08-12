@@ -2127,4 +2127,28 @@ mod tests {
         assert!(report.contains("Scalar(42)")); // concrete value
         assert!(report.contains("SCALAR(s:41..41")); // abstract candidate
     }
+
+    #[test]
+    fn render_report_distinguishes_kinds() {
+        // an unsoundness and a precision case must render differently
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+
+        let unsound_states = abstract_states_for_constant_program(41);
+        let unsound = check_coverage(&unsound_states, &run);
+        assert_eq!(unsound.len(), 1);
+        let report = render_coverage_report(&unsound, &program);
+        assert!(report.contains("NOT COVERED"));
+        assert!(!report.contains("ABSTRACT MISSED PC"));
+
+        // precision case: the abstract never visited pc 1
+        let mut missing: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+        missing.insert(0, vec![VerifierState::initial()]);
+        let precision = check_coverage(&missing, &run);
+        assert_eq!(precision.len(), 1);
+        assert_eq!(precision[0].kind, CoverageKind::AbstractMissedPc);
+        let report = render_coverage_report(&precision, &program);
+        assert!(report.contains("ABSTRACT MISSED PC"));
+        assert!(!report.contains("NOT COVERED"));
+    }
 }

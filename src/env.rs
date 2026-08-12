@@ -266,6 +266,92 @@ mod tests {
         assert!(count > 0, "no reject programs found in {:?}", dir);
     }
 
+    /// Every accept program must also be concretely clean: the abstract
+    /// states must cover every concrete reachable state (v0.5, #54).
+    /// `corpus_accept_all` only checks the verdict — this test fixes the
+    /// Phase 2 soundness claim for the whole accept corpus.
+
+    #[test]
+    fn corpus_accept_concrete_clean() {
+        let dir = std::path::Path::new("tests/programs/accept");
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            // skip docs and directories; corpus files have no extension
+            if !path.is_file() || path.extension().is_some() {
+                continue;
+            }
+            let mut env = BpfVerifierEnv::new();
+            env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+            let verdict = env.verify().unwrap();
+            assert!(
+                matches!(verdict, Verdict::Safe),
+                "accept program {:?} was rejected",
+                path
+            );
+            let report = env.concrete_report.as_ref().expect("concrete report");
+            assert!(
+                report.violations.is_empty(),
+                "accept program {:?} has coverage violations: {:?}",
+                path,
+                report.violations
+            );
+            assert!(
+                !report.inconclusive,
+                "accept program {:?} has an inconclusive concrete run",
+                path
+            );
+            assert!(
+                report.unexpected_failure.is_none(),
+                "accept program {:?} has an unexpected concrete failure",
+                path
+            );
+            count += 1;
+        }
+        assert!(count > 0, "no accept programs found in {:?}", dir);
+    }
+
+    /// Every reject program must produce a concrete cross-check note
+    /// (the informational counterpart of the accept-side coverage check).
+
+    #[test]
+    fn corpus_reject_concrete_cross_check() {
+        let dir = std::path::Path::new("tests/programs/reject");
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            // skip docs and directories; corpus files have no extension
+            if !path.is_file() || path.extension().is_some() {
+                continue;
+            }
+            let mut env = BpfVerifierEnv::new();
+            env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+            let verdict = env.verify().unwrap();
+            assert!(
+                matches!(verdict, Verdict::Unsafe(_)),
+                "reject program {:?} was accepted",
+                path
+            );
+            let report = env.concrete_report.as_ref().expect("concrete report");
+            let note = report
+                .reject_note
+                .as_deref()
+                .expect("reject cross-check note");
+            assert!(
+                !note.is_empty(),
+                "reject program {:?} has an empty note",
+                path
+            );
+            assert!(
+                report.unexpected_failure.is_none(),
+                "reject program {:?} reported an unexpected concrete failure",
+                path
+            );
+            count += 1;
+        }
+        assert!(count > 0, "no reject programs found in {:?}", dir);
+    }
+
     // ── Concrete integration (v0.5, #53) ───────────────────────────────────
 
     /// Write a raw program to a temp file, verify it, and return the

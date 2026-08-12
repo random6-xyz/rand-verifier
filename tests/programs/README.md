@@ -6,8 +6,11 @@ Each program is a small binary file exercising one specific verification rule.
 Encoding: 8 bytes per instruction — `[op, (src << 4 | dst), off_le16, imm_le32]`.
 
 All programs are verified with the full pipeline (nano structural checks +
-mini path exploration) — the most advanced pass. Helper calls use negative
-immediates (kernel convention); positive immediates are BPF-to-BPF calls.
+mini path exploration — the most advanced pass). Since v0.5 the pipeline
+additionally runs every program through the concrete interpreter and checks
+that the abstract states cover the concrete reachable states (issues #49–#54).
+Helper calls use negative immediates (kernel convention); positive immediates
+are BPF-to-BPF calls.
 
 ## Opcode map (custom encoding, Meso #39)
 
@@ -46,7 +49,32 @@ kernel's BPF_ALU vs BPF_ALU64 class split), e.g. `0x43`/`0x44` = `wX += imm` /
 A 32-bit operation truncates its operands to 32 bits and zero-extends the
 result into the 64-bit register; `w` notation is used for the destination.
 
-## accept/ — must pass verification
+## Concrete execution (v0.5)
+
+The same programs are also executed with real values and the results are
+checked against the abstract verifier state (Phase 2). Execution model:
+
+- fixed virtual addresses: `R10 = STACK_BASE` (`0x1000`), `R1 = CTX_BASE`
+  (`0x2000`); the 512-byte frame spans `0x0E00..0x1000`
+- entry state mirrors the abstract one: only R1 and R10 are initialized,
+  all other registers and the stack are uninitialized
+- branches are **deterministic**: a conditional branch takes exactly one
+  successor per concrete state (like a real CPU); path forking happens only
+  at helper calls
+- helper calls mirror the abstract side: arguments are validated against the
+  prototype, R1..R5 are clobbered, and `R0` is set to each return seed —
+  constant returns get the constant, unknown scalars (e.g. `get_prandom_u32`)
+  get `[0, 1, u64::MAX]`, pointer returns are unsupported (unreachable for
+  this corpus)
+- exploration budgets mirror the mini pass; a loop that never converges
+  marks the run **inconclusive** (a warning, not a REJECT)
+- accepted programs must have **zero coverage violations** (the abstract
+  state must contain every concrete reachable state — enforced by the
+  corpus); rejected programs get an informational concrete cross-check note
+  ("also fails" / "executes concretely — precision candidate" /
+  "inconclusive")
+
+## accept/ — must pass verification (and concrete coverage)
 
 | program                  | bytecode                                                      | rule exercised                  |
 |--------------------------|---------------------------------------------------------------|---------------------------------|
@@ -79,7 +107,7 @@ result into the 64-bit register; `w` notation is used for the destination.
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
 
-## reject/ — must fail verification
+## reject/ — must fail verification (concrete cross-check)
 
 | program                       | bytecode                                            | rule exercised                      |
 |-------------------------------|-----------------------------------------------------|-------------------------------------|
