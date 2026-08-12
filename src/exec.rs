@@ -323,6 +323,17 @@ fn alu_reg(
     Ok(next)
 }
 
+/// The out-of-frame error for computed pointer arithmetic.
+fn out_of_frame_error(pc: u32, dst: u8) -> VerificationFailure {
+    VerificationFailure::new(
+        pc,
+        format!(
+            "stack pointer r{} may leave the {} byte frame (computed offsets)",
+            dst, STACK_SIZE
+        ),
+    )
+}
+
 /// `PtrToStack + ScalarRange` (#45): the resulting offsets must provably
 /// stay within the frame, and a computed (non-exact) offset must be
 /// provably 8-byte aligned (the scalar's tnum determines the low three
@@ -336,18 +347,18 @@ fn add_scalar_to_stack_ptr(
     s: ScalarBounds,
     state: &VerifierState,
 ) -> Result<VerifierState, VerificationFailure> {
-    // the offset range shifts by the scalar's signed range; the sums
-    // cannot overflow i64 (offsets are within [-512, 0])
-    let new_min = min_offset as i64 + s.smin;
-    let new_max = max_offset as i64 + s.smax;
+    // the offset range shifts by the scalar's signed range; a sum that
+    // overflows i64 means some resulting offset is far out of the frame
+    let new_min = match (min_offset as i64).checked_add(s.smin) {
+        Some(v) => v,
+        None => return Err(out_of_frame_error(pc, dst)),
+    };
+    let new_max = match (max_offset as i64).checked_add(s.smax) {
+        Some(v) => v,
+        None => return Err(out_of_frame_error(pc, dst)),
+    };
     if new_min < -(STACK_SIZE as i64) || new_max > 0 {
-        return Err(VerificationFailure::new(
-            pc,
-            format!(
-                "stack pointer r{} may leave the {} byte frame (offsets {}..{})",
-                dst, STACK_SIZE, new_min, new_max
-            ),
-        ));
+        return Err(out_of_frame_error(pc, dst));
     }
     // alignment: the low three bits of the scalar's tnum, when known
     let new_align = if s.tnum.mask & 7 == 0 {
@@ -2686,6 +2697,21 @@ mod tests {
             panic!("expected stack pointer");
         };
         assert_eq!(align_off, 4);
+    }
+
+    #[test]
+    fn step_add_reg_stack_ptr_overflow_safe() {
+        // a scalar whose signed range reaches i64::MIN cannot overflow
+        // the offset arithmetic: it is rejected as out of frame (#47)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("may leave the"), "{}", err.message);
     }
 
     #[test]
