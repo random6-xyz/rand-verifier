@@ -182,6 +182,20 @@ pub(crate) fn check_cfg(
     subprogs: &[u32],
 ) -> Result<Vec<u32>, VerificationFailure> {
     let insn_cnt = insns.len();
+
+    // every subprogram must end with EXIT (cf. the kernel's "last insn
+    // is not exit"): this is what guarantees that accepted programs
+    // actually reach an exit, even when the CFG contains loops
+    for (i, &start) in subprogs.iter().enumerate() {
+        let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt as u32);
+        if !matches!(insns[(end - 1) as usize], BpfInsn::Exit) {
+            return Err(VerificationFailure::new(
+                end - 1,
+                format!("subprogram [{}..{}) does not end with exit", start, end),
+            ));
+        }
+    }
+
     let mut state = vec![VisitState::NotVisited; insn_cnt];
     let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
     let mut loop_heads = Vec::new();
@@ -468,11 +482,43 @@ mod tests {
 
     #[test]
     fn check_cfg_multi_insn_loop_allowed() {
-        // 0: jmp +0 → 1    (target = 0 + 1 + 0 = 1)
-        // 1: jmp -2 → 0    (target = 1 + 1 - 2 = 0) — 2-instruction loop
-        let insns = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Jmp { offset: -2 }];
+        // 0: jmp +0 → 1            (target = 0 + 1 + 0 = 1)
+        // 1: jeq r1, r1, -2 → 0    (target = 1 + 1 - 2 = 0) — back edge
+        // 2: exit                  (reachable via the fall-through)
+        let insns = vec![
+            BpfInsn::Jmp { offset: 0 },
+            BpfInsn::Jeq {
+                dst: 1,
+                src: 1,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
         let loop_heads = check_cfg(&insns, &[0]).unwrap();
         assert_eq!(loop_heads, vec![0]);
+    }
+
+    #[test]
+    fn check_cfg_subprogram_must_end_with_exit() {
+        // a loop that never reaches exit: the last instruction of the
+        // (only) subprogram is a jump, not EXIT → rejected (cf. the
+        // kernel's "last insn is not exit")
+        let insns = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Jmp { offset: -2 }];
+        let err = check_cfg(&insns, &[0]).unwrap_err();
+        assert!(
+            err.message.contains("does not end with exit"),
+            "{}",
+            err.message
+        );
+        // every subprogram of a call chain must end with EXIT too
+        let insns = vec![
+            BpfInsn::Call { imm: 2 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 0, imm: 1 }, // subprog [2..4) without exit
+            BpfInsn::MovImm { dst: 0, imm: 2 },
+        ];
+        let err = check_cfg(&insns, &[0, 2]).unwrap_err();
+        assert!(err.message.contains("does not end with exit"));
     }
 
     #[test]

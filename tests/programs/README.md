@@ -110,4 +110,5 @@ result into the 64-bit register; `w` notation is used for the destination.
 | computed_offset_out_of_frame   | `r6 = r10; r6 += -32; call -7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset can leave the frame       |
 | non_converging_loop            | `r0 = 0; r1 = 0; r1 += 1; jeq r1, r1, -2; exit`                    | non-converging loop (loop budget)         |
 | alu32_uninit                   | `w2 += 5; exit`                                     | ALU32 read of an uninitialized register   |
+| loop_no_exit                   | `jmp -1`                                           | loop whose subprogram does not end with exit |
 | overflowed_range_out_of_frame   | `r6 = r10; r6 += -32; call -7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | overflowed range cannot be in-frame       |

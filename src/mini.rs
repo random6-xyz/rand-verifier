@@ -96,11 +96,16 @@ impl Default for VerifierLimits {
 ///   monotone, so the subsumed state cannot reach a new outcome — the
 ///   first defense against state explosion (#25/#26)
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
-///   R0 !read_ok check at exit)
+///   R0 !read_ok check at exit); the structural pass guarantees that
+///   every accepted program has a reachable exit (unreachable
+///   instructions and subprograms whose last instruction is not exit
+///   are rejected)
 /// - branches ruled out by the static verdict (#24) are never explored
-/// - termination is guaranteed because the nano pass (#6) rejects loops,
-///   so the CFG is acyclic; the exploration is additionally bounded by
-///   `limits` (#32)
+/// - termination is guaranteed by the exploration bounds (#32, #46):
+///   loops converge when a new state at the loop head is subsumed by an
+///   already-analyzed one; a non-converging loop head hits the
+///   `max_loop_iterations` budget and is rejected; `max_states` and
+///   `max_steps` remain the outer bounds
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
 pub(crate) fn verify_mini(
