@@ -9,6 +9,43 @@ All programs are verified with the full pipeline (nano structural checks +
 mini path exploration) — the most advanced pass. Helper calls use negative
 immediates (kernel convention); positive immediates are BPF-to-BPF calls.
 
+## Opcode map (custom encoding, Meso #39)
+
+| op | mnemonic | meaning |
+|----|----------|---------|
+| `0x01` | `rX = imm` | MOV immediate |
+| `0x02` | `rX = rY` | MOV register |
+| `0x03` | `rX += imm` | ADD immediate |
+| `0x04` | `rX += rY` | ADD register |
+| `0x05` | `rX = [r10+off]` | load stack slot |
+| `0x06` | `[r10+off] = rX` | store stack slot |
+| `0x07` | `if rX == rY goto +off` | jump equal |
+| `0x08` | `if rX > rY goto +off` | jump greater (unsigned) |
+| `0x09` | `goto +off` | unconditional jump |
+| `0x0A` | `call imm` | helper call (imm < 0) / BPF-to-BPF call (imm >= 0) |
+| `0x0B` | `exit` | exit |
+| `0x0C`/`0x0D` | `rX -= imm` / `rX -= rY` | SUB |
+| `0x0E`/`0x0F` | `rX &= imm` / `rX &= rY` | AND |
+| `0x10`/`0x11` | `rX |= imm` / `rX |= rY` | OR |
+| `0x12`/`0x13` | `rX ^= imm` / `rX ^= rY` | XOR |
+| `0x14`/`0x15` | `rX <<= imm` / `rX <<= rY` | shift left |
+| `0x16`/`0x17` | `rX >>= imm` / `rX >>= rY` | shift right (logical) |
+| `0x18`/`0x19` | `rX s>>= imm` / `rX s>>= rY` | shift right (arithmetic) |
+| `0x1A` | `if rX != rY goto +off` | jump not equal |
+| `0x1B` | `if rX >= rY goto +off` | jump greater-or-equal (unsigned) |
+| `0x1C` | `if rX < rY goto +off` | jump less (unsigned) |
+| `0x1D` | `if rX <= rY goto +off` | jump less-or-equal (unsigned) |
+| `0x1E` | `if rX s> rY goto +off` | jump greater (signed) |
+| `0x1F` | `if rX s>= rY goto +off` | jump greater-or-equal (signed) |
+| `0x20` | `if rX s< rY goto +off` | jump less (signed) |
+| `0x21` | `if rX s<= rY goto +off` | jump less-or-equal (signed) |
+
+ALU32 forms are the ALU64 opcode with the `0x40` flag bit set (like the
+kernel's BPF_ALU vs BPF_ALU64 class split), e.g. `0x43`/`0x44` = `wX += imm` /
+`wX += rY`, `0x4C`/`0x4D` = `wX -= imm` / `wX -= rY`, … `0x59` = `wX s>>= rY`.
+A 32-bit operation truncates its operands to 32 bits and zero-extends the
+result into the 64-bit register; `w` notation is used for the destination.
+
 ## accept/ — must pass verification
 
 | program                  | bytecode                                                      | rule exercised                  |
@@ -26,6 +63,13 @@ immediates (kernel convention); positive immediates are BPF-to-BPF calls.
 | pointer_arithmetic       | `r5 = r10; r5 += -16; r0 = 0; exit`                           | stack pointer arithmetic        |
 | helper_return_used       | `call -7; exit`                                               | helper return value (unknown)   |
 | range_checked_access     | `call -7; r1 = 0; jeq r0, r1, +1; r0 = 1; exit`               | branch range refinement         |
+| alu_sub                  | `r2 = 10; r2 -= 3; r0 = r2; exit`                             | SUB propagation                 |
+| alu_and_or_xor           | `r2 = 12; r2 &= 10; r2 |= 3; r2 ^= 12; r0 = r2; exit`         | AND/OR/XOR propagation          |
+| alu_shift                | `r2 = 1; r2 <<= 4; r2 >>= 2; r2 s>>= 1; r0 = r2; exit`        | shift propagation               |
+| alu32                    | `r2 = 2147483647; r2 += 2147483647; r2 += 3; w2 += 0; r0 = r2; exit` | ALU32 truncation + zero-extension |
+| jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
+| unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
+| signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
 
 ## reject/ — must fail verification
 
@@ -50,3 +94,5 @@ immediates (kernel convention); positive immediates are BPF-to-BPF calls.
 | invalid_helper_argument       | `call -1; exit`                                     | helper argument type mismatch       |
 | invalid_pointer_arithmetic    | `r1 += 8; exit`                                     | context pointer arithmetic          |
 | complexity_limit              | 11 stacked diamonds (2^11 states)                   | exploration complexity limit        |
+| sub_on_pointer                | `r10 -= 8; exit`                                    | SUB on a stack pointer              |
+| invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |

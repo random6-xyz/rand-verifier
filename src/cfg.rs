@@ -112,7 +112,16 @@ pub(crate) fn visit_insn(
             vec![target]
         }
         // conditional branches — branch target + fall-through
-        BpfInsn::Jeq { offset, .. } | BpfInsn::Jgt { offset, .. } => {
+        BpfInsn::Jeq { offset, .. }
+        | BpfInsn::Jne { offset, .. }
+        | BpfInsn::Jgt { offset, .. }
+        | BpfInsn::Jge { offset, .. }
+        | BpfInsn::Jlt { offset, .. }
+        | BpfInsn::Jle { offset, .. }
+        | BpfInsn::Jsgt { offset, .. }
+        | BpfInsn::Jsge { offset, .. }
+        | BpfInsn::Jslt { offset, .. }
+        | BpfInsn::Jsle { offset, .. } => {
             // BPF branch target is PC-relative to the next insn: idx + 1 + offset
             let target = (idx as i32 + 1 + *offset as i32) as u32;
             if target < start || target >= end {

@@ -48,10 +48,7 @@ pub(crate) fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailu
     for (pc, insn) in program.iter().enumerate() {
         // exit ends the trace (no state change); control flow is not
         // part of the straight-line subset
-        if matches!(
-            insn,
-            BpfInsn::Exit | BpfInsn::Jmp { .. } | BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. }
-        ) {
+        if insn.is_control_flow() {
             if matches!(insn, BpfInsn::Exit) {
                 out.push_str(&trace_step(pc as u32, insn, &state, &state));
                 out.push('\n');
