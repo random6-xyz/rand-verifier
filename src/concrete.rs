@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::exec::{AluOp, AluWidth, CondOp, alu_const32, alu_const64, branch_target};
 use crate::helper::{ArgType, HelperPrototype, helper_prototype};
-use crate::insn::BpfInsn;
+use crate::insn::{BpfInsn, disassemble};
 use crate::state::{
     ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOT_SIZE, STACK_SLOTS, ScalarBounds,
     StackSlot, VerifierState,
@@ -851,6 +851,143 @@ fn helper_return_seeds(
         // this is a model gap, not a fake value
         _ => Err(ConcreteFailure::UnsupportedHelperReturn { pc, imm }),
     }
+}
+
+// ── Abstract↔concrete coverage checker (#52) ────────────────────────────────
+
+/// The classification of a coverage violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoverageKind {
+    /// The concrete execution reached a pc the abstract exploration
+    /// never visited: the abstract missed a reachable path — a
+    /// precision candidate (warning, not a soundness failure).
+    AbstractMissedPc,
+    /// The abstract visited the pc, but no abstract state there covers
+    /// the concrete state: the abstract under-approximates the actual
+    /// execution — unsoundness.
+    NotCovered,
+}
+
+/// One abstract↔concrete mismatch found by [`check_coverage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoverageViolation {
+    pub(crate) pc: u32,
+    pub(crate) kind: CoverageKind,
+    /// The concrete state the abstract side fails to cover.
+    pub(crate) concrete: ConcreteState,
+    /// The abstract states analyzed at this pc (empty for
+    /// `AbstractMissedPc`).
+    pub(crate) abstract_states: Vec<VerifierState>,
+}
+
+/// Check that every concrete visited state is covered by at least one
+/// abstract state at the same pc — the Phase 2 soundness question.
+///
+/// Exit states are part of `run.visited` (#51), so the R0-at-exit rule
+/// is checked through the same path. On an inconclusive run the
+/// violations found in the explored prefix are still real; the pipeline
+/// (#53) treats the inconclusive flag itself as a warning.
+#[allow(dead_code)] // wired into the pipeline (#53); used by tests
+pub(crate) fn check_coverage(
+    abstract_states: &HashMap<u32, Vec<VerifierState>>,
+    run: &ConcreteRun,
+) -> Vec<CoverageViolation> {
+    let mut violations = Vec::new();
+    for (pc, concrete) in &run.visited {
+        match abstract_states.get(pc) {
+            None => violations.push(CoverageViolation {
+                pc: *pc,
+                kind: CoverageKind::AbstractMissedPc,
+                concrete: *concrete,
+                abstract_states: Vec::new(),
+            }),
+            Some(candidates) => {
+                if !candidates
+                    .iter()
+                    .any(|abstract_state| state_covers(abstract_state, concrete))
+                {
+                    violations.push(CoverageViolation {
+                        pc: *pc,
+                        kind: CoverageKind::NotCovered,
+                        concrete: *concrete,
+                        abstract_states: candidates.clone(),
+                    });
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// Render one concrete value in the trace style.
+fn render_concrete_value(value: &ConcreteValue) -> String {
+    match value {
+        ConcreteValue::Scalar(v) => format!("Scalar({})", v),
+        ConcreteValue::StackPtr(v) => format!("StackPtr({:#x})", v),
+        ConcreteValue::CtxPtr(v) => format!("CtxPtr({:#x})", v),
+    }
+}
+
+/// Render the initialized registers and stack slots of a concrete state.
+fn render_concrete_state(state: &ConcreteState) -> String {
+    let mut out = String::new();
+    for (i, reg) in state.regs.iter().enumerate() {
+        if let Some(value) = reg {
+            out.push_str(&format!("    R{} = {}\n", i, render_concrete_value(value)));
+        }
+    }
+    for (i, slot) in state.stack.iter().enumerate() {
+        if let Some(value) = slot {
+            out.push_str(&format!(
+                "    [r10-{}] = {}\n",
+                (i + 1) * 8,
+                render_concrete_value(value)
+            ));
+        }
+    }
+    out
+}
+
+/// Render a coverage report in the trace style: pc, disassembled
+/// instruction, concrete values, and the candidate abstract states.
+#[allow(dead_code)] // wired into the pipeline (#53); used by tests
+pub(crate) fn render_coverage_report(
+    violations: &[CoverageViolation],
+    program: &[BpfInsn],
+) -> String {
+    let mut out = String::new();
+    for violation in violations {
+        let insn = program
+            .get(violation.pc as usize)
+            .map(disassemble)
+            .unwrap_or_else(|| "<out of range>".to_string());
+        let kind = match violation.kind {
+            CoverageKind::AbstractMissedPc => {
+                "ABSTRACT MISSED PC (precision candidate — the abstract never explored this pc)"
+            }
+            CoverageKind::NotCovered => {
+                "NOT COVERED (unsound — no abstract state at this pc contains the concrete state)"
+            }
+        };
+        out.push_str(&format!(
+            "coverage violation at insn {} [{}]\n  {}: {}\n",
+            violation.pc, kind, violation.pc, insn
+        ));
+        out.push_str("  concrete:\n");
+        out.push_str(&render_concrete_state(&violation.concrete));
+        if !violation.abstract_states.is_empty() {
+            out.push_str("  abstract candidates:\n");
+            for abstract_state in &violation.abstract_states {
+                for (i, reg) in abstract_state.regs.iter().enumerate() {
+                    if *reg != RegState::Uninit {
+                        out.push_str(&format!("    R{} = {}\n", i, reg));
+                    }
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -1814,5 +1951,104 @@ mod tests {
         let program = vec![BpfInsn::Jmp { offset: 100 }, BpfInsn::Exit];
         let err = run_concrete(&program, &[]).unwrap_err();
         assert_eq!(err, ConcreteFailure::InternalError { pc: 101 });
+    }
+
+    // ── abstract↔concrete coverage checker (#52) ─────────────────────────
+
+    /// The abstract states for `[r0 = 42, exit]`: initial at pc 0, a
+    /// state with `r0 = 42` at pc 1.
+    fn abstract_states_for_constant_program(r0_at_exit: i64) -> HashMap<u32, Vec<VerifierState>> {
+        let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+        abstract_states.insert(0, vec![VerifierState::initial()]);
+        let mut at_exit = VerifierState::initial();
+        at_exit.regs[0] = RegState::Scalar(ScalarBounds::constant(r0_at_exit));
+        abstract_states.insert(1, vec![at_exit]);
+        abstract_states
+    }
+
+    #[test]
+    fn check_coverage_clean_run() {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        let abstract_states = abstract_states_for_constant_program(42);
+        assert_eq!(check_coverage(&abstract_states, &run), vec![]);
+    }
+
+    #[test]
+    fn check_coverage_detects_unsound() {
+        // the abstract state at pc 1 covers only 41, not the concrete 42
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        let abstract_states = abstract_states_for_constant_program(41);
+        let violations = check_coverage(&abstract_states, &run);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].pc, 1);
+        assert_eq!(violations[0].kind, CoverageKind::NotCovered);
+        assert_eq!(violations[0].abstract_states.len(), 1);
+    }
+
+    #[test]
+    fn check_coverage_detects_missing_pc() {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        // pc 1 (exit) is missing from the abstract side
+        let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+        abstract_states.insert(0, vec![VerifierState::initial()]);
+        let violations = check_coverage(&abstract_states, &run);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].pc, 1);
+        assert_eq!(violations[0].kind, CoverageKind::AbstractMissedPc);
+        assert!(violations[0].abstract_states.is_empty());
+    }
+
+    #[test]
+    fn check_coverage_initial_mismatch() {
+        // abstract pc 0 has R0 initialized, concrete initial R0 is None
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        let mut abstract_states = abstract_states_for_constant_program(42);
+        let mut wrong_initial = VerifierState::initial();
+        wrong_initial.regs[0] = RegState::Scalar(ScalarBounds::constant(0));
+        abstract_states.insert(0, vec![wrong_initial]);
+        let violations = check_coverage(&abstract_states, &run);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].pc, 0);
+        assert_eq!(violations[0].kind, CoverageKind::NotCovered);
+    }
+
+    #[test]
+    fn check_coverage_end_to_end_accept() {
+        // a branched program with a helper call: the abstract pass and
+        // the concrete run must agree (no violations)
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Call { imm: -7 }, // r0 = prandom (unknown scalar)
+            BpfInsn::MovImm { dst: 1, imm: 10 },
+            BpfInsn::Jgt {
+                dst: 0,
+                src: 1,
+                offset: 0,
+            },
+            BpfInsn::Exit,
+        ];
+        let (_, abstract_states) =
+            crate::mini::verify_mini_with_states(&program, &[], &Default::default()).unwrap();
+        let run = run_concrete(&program, &[]).unwrap();
+        assert!(!run.inconclusive);
+        assert_eq!(check_coverage(&abstract_states, &run), vec![]);
+    }
+
+    #[test]
+    fn render_report_readable() {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let run = run_concrete(&program, &[]).unwrap();
+        let abstract_states = abstract_states_for_constant_program(41);
+        let violations = check_coverage(&abstract_states, &run);
+        let report = render_coverage_report(&violations, &program);
+        assert!(report.contains("coverage violation at insn 1"));
+        assert!(report.contains("NOT COVERED"));
+        assert!(report.contains("1: exit")); // disassembled instruction
+        assert!(report.contains("Scalar(42)")); // concrete value
+        assert!(report.contains("SCALAR(s:41..41")); // abstract candidate
     }
 }

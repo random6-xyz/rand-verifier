@@ -127,6 +127,28 @@ pub(crate) fn verify_mini_with_limits(
     loop_heads: &[u32],
     limits: &VerifierLimits,
 ) -> Result<usize, VerificationFailure> {
+    Ok(verify_mini_core(program, loop_heads, limits)?.0)
+}
+
+/// `verify_mini_with_limits` that also returns the per-pc abstract
+/// states the exploration analyzed — the input of the abstract↔concrete
+/// coverage checker (#52).
+#[allow(dead_code)] // wired into the pipeline (#53); used by tests
+pub(crate) fn verify_mini_with_states(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+    limits: &VerifierLimits,
+) -> Result<(usize, HashMap<u32, Vec<VerifierState>>), VerificationFailure> {
+    verify_mini_core(program, loop_heads, limits)
+}
+
+/// The shared exploration core: runs the worklist and collects the
+/// analyzed states per pc. Both public entry points are thin wrappers.
+fn verify_mini_core(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+    limits: &VerifierLimits,
+) -> Result<(usize, HashMap<u32, Vec<VerifierState>>), VerificationFailure> {
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
@@ -209,7 +231,7 @@ pub(crate) fn verify_mini_with_limits(
             });
         }
     }
-    Ok(explored)
+    Ok((explored, visited))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
