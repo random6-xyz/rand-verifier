@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 
@@ -81,7 +81,7 @@ const NUM_REGS: usize = 11;
 /// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     Uninit,
     Scalar { min: i64, max: i64 },
@@ -126,7 +126,7 @@ const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 ///
 /// Slot-level granularity (not byte-level) keeps the model approachable;
 /// scalar ranges and spilled pointer states are not tracked here yet (#30).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StackSlot {
     Uninit,
     Scalar,
@@ -142,7 +142,7 @@ impl std::fmt::Display for StackSlot {
 }
 
 /// Abstract stack state: one slot per 8-byte cell of the 512-byte frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StackState {
     slots: [StackSlot; STACK_SLOTS],
 }
@@ -197,7 +197,7 @@ fn stack_slot_index(offset: i32) -> Result<usize, VerificationFailure> {
 /// Unified verifier state carried through instruction simulation.
 ///
 /// Holds the abstract state of all 11 registers plus the stack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerifierState {
     regs: [RegState; NUM_REGS],
     stack: StackState,
@@ -720,21 +720,58 @@ fn cond_branch(
     Ok(out)
 }
 
+/// Does `old` subsume `new`, i.e. is `new` strictly more specific?
+///
+/// A subsumed state needs no analysis: step() and successors() are
+/// monotone, so every outcome reachable from `new` is also reachable
+/// from `old`, and `old` has already been analyzed (#26).
+fn subsumes(old: &VerifierState, new: &VerifierState) -> bool {
+    old.regs
+        .iter()
+        .zip(&new.regs)
+        .all(|(old, new)| reg_subsumes(*old, *new))
+        && old.stack == new.stack
+}
+
+/// Per-register part of `subsumes`: the old range must contain the new one.
+fn reg_subsumes(old: RegState, new: RegState) -> bool {
+    match (old, new) {
+        (RegState::Uninit, RegState::Uninit) => true,
+        (
+            RegState::Scalar {
+                min: old_min,
+                max: old_max,
+            },
+            RegState::Scalar {
+                min: new_min,
+                max: new_max,
+            },
+        ) => old_min <= new_min && old_max >= new_max,
+        (
+            RegState::PtrToStack { offset: old_offset },
+            RegState::PtrToStack { offset: new_offset },
+        ) => old_offset == new_offset,
+        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        // different types are never comparable
+        _ => false,
+    }
+}
+
 /// Path-sensitive verification: explore every execution path with a
 /// worklist until it is empty.
 ///
 /// - states are processed LIFO (depth-first), like the kernel's
 ///   push_stack/pop_stack verifier stack
-/// - a (pc, state) pair is analyzed at most once (cf. the kernel's
-///   is_state_visited): step() is pure, so revisiting the same pair
-///   would only repeat the same outcome — the first defense against
-///   state explosion (#25)
+/// - a state is analyzed at most once per pc: a new state is skipped
+///   when an already-analyzed state subsumes it (cf. the kernel's
+///   is_state_visited / states_equal); step() and successors() are
+///   monotone, so the subsumed state cannot reach a new outcome — the
+///   first defense against state explosion (#25/#26)
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
 ///   R0 !read_ok check at exit)
 /// - branches ruled out by the static verdict (#24) are never explored
 /// - termination is guaranteed because the nano pass (#6) rejects loops,
-///   so the CFG is acyclic; state subsumption (#26) and complexity
-///   limits (#32) come later
+///   so the CFG is acyclic; complexity limits (#32) come later
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
 #[allow(dead_code)] // consumed by the mini corpus runner (#33)
@@ -743,16 +780,18 @@ fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
         pc: 0,
         state: VerifierState::initial(),
     }];
-    // distinct (pc, state) pairs already analyzed, grouped by pc:
-    // duplicates only matter at the same instruction
-    let mut visited: HashMap<u32, HashSet<VerifierState>> = HashMap::new();
+    // states already analyzed at each pc: a new state is skipped when an
+    // analyzed one subsumes it, like the kernel's per-pc state list
+    let mut visited: HashMap<u32, Vec<VerifierState>> = HashMap::new();
     let mut explored = 0usize;
 
     while let Some(item) = worklist.pop() {
-        // skip pairs that were already analyzed
-        if !visited.entry(item.pc).or_default().insert(item.state) {
+        // skip states subsumed by an already-analyzed state at this pc
+        let seen = visited.entry(item.pc).or_default();
+        if seen.iter().any(|old| subsumes(old, &item.state)) {
             continue;
         }
+        seen.push(item.state);
         explored += 1;
 
         let insn = program.get(item.pc as usize).ok_or_else(|| {

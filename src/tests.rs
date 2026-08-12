@@ -1708,3 +1708,85 @@ fn verify_mini_dedup_distinct_join_states_not_merged() {
     // (4, r0=1) and (4, r0=2) are distinct → both counted
     assert_eq!(verify_mini(&program).unwrap(), 6);
 }
+
+// ── Subsumption (v0.3) ──────────────────────────────────────────────────
+
+#[test]
+fn subsumes_issue_example() {
+    // issue example: old R1 = [0, 100] subsumes new R1 = [10, 20]
+    let mut old = VerifierState::initial();
+    old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    let mut new = VerifierState::initial();
+    new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+    assert!(subsumes(&old, &new));
+}
+
+#[test]
+fn subsumes_scalar_ranges() {
+    let old = VerifierState::initial();
+    let mut old = old;
+    old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    let mut new = VerifierState::initial();
+    new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+
+    // subsumption is reflexive: a state subsumes itself
+    assert!(subsumes(&old, &old));
+    assert!(subsumes(&new, &new));
+    // a wider new range is not subsumed
+    new.regs[1] = RegState::Scalar { min: -50, max: 200 };
+    assert!(!subsumes(&old, &new));
+    // equal ranges subsume each other
+    new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    assert!(subsumes(&old, &new));
+    assert!(subsumes(&new, &old));
+}
+
+#[test]
+fn subsumes_reg_mismatch() {
+    // different types are never comparable
+    let old = VerifierState::initial();
+    let mut new = VerifierState::initial();
+    new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    assert!(!subsumes(&old, &new)); // Uninit vs Scalar
+    assert!(!subsumes(&new, &old));
+
+    // pointer offsets must match exactly
+    let mut shifted = VerifierState::initial();
+    shifted.regs[10] = RegState::PtrToStack { offset: -8 };
+    assert!(!subsumes(&old, &shifted));
+    assert!(subsumes(&old, &old));
+}
+
+#[test]
+fn subsumes_stack_mismatch() {
+    let mut old = VerifierState::initial();
+    old.stack.slots[0] = StackSlot::Scalar;
+    let new = VerifierState::initial();
+    // stack states differ → not subsumed even though the registers match
+    assert!(!subsumes(&old, &new));
+    assert!(!subsumes(&new, &old));
+}
+
+#[test]
+fn verify_mini_refined_state_subsumed_by_original() {
+    // the refined branches of [0, 100] > 50 (R1 = [51, 100] / [0, 50])
+    // are both subsumed by the original R1 = [0, 100]
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+    state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 1,
+            src: 2,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+    let (_, taken) = &nexts[0];
+    let (_, fall) = &nexts[1];
+    assert!(subsumes(&state, taken));
+    assert!(subsumes(&state, fall));
+}
