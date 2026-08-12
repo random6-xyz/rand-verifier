@@ -81,12 +81,23 @@ const NUM_REGS: usize = 11;
 /// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
+/// - `PtrToMapValue` — pointer to a map value (non-null)
+/// - `PtrToMapValueOrNull` — nullable map value pointer; must pass a
+///   NULL check before use (#27)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     Uninit,
-    Scalar { min: i64, max: i64 },
-    PtrToStack { offset: i32 },
+    Scalar {
+        min: i64,
+        max: i64,
+    },
+    PtrToStack {
+        offset: i32,
+    },
     PtrToCtx,
+    PtrToMapValue,
+    #[allow(dead_code)] // produced by map lookups (#29)
+    PtrToMapValueOrNull,
 }
 
 impl std::fmt::Display for RegState {
@@ -96,6 +107,8 @@ impl std::fmt::Display for RegState {
             RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
             RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
+            RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
+            RegState::PtrToMapValueOrNull => write!(f, "PTR_MAP_VALUE_OR_NULL"),
         }
     }
 }
@@ -262,7 +275,10 @@ fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFail
 fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), VerificationFailure> {
     match read_reg(state, reg)? {
         RegState::Scalar { min, max } => Ok((min, max)),
-        RegState::PtrToStack { .. } | RegState::PtrToCtx => Err(VerificationFailure::new(
+        RegState::PtrToStack { .. }
+        | RegState::PtrToCtx
+        | RegState::PtrToMapValue
+        | RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
             NO_PC,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
@@ -343,6 +359,20 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                     NO_PC,
                     format!("arithmetic on context pointer r{} is not allowed", dst),
                 )),
+                RegState::PtrToMapValue => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!(
+                        "arithmetic on map value pointer r{} is not supported yet",
+                        dst
+                    ),
+                )),
+                RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!(
+                        "arithmetic on nullable pointer r{} is not allowed (check for NULL first)",
+                        dst
+                    ),
+                )),
                 RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
             }
         }
@@ -366,7 +396,10 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             let src_state = read_reg(state, *src)?;
             match src_state {
                 RegState::Scalar { .. } => {}
-                RegState::PtrToStack { .. } | RegState::PtrToCtx => {
+                RegState::PtrToStack { .. }
+                | RegState::PtrToCtx
+                | RegState::PtrToMapValue
+                | RegState::PtrToMapValueOrNull => {
                     return Err(VerificationFailure::new(
                         NO_PC,
                         format!("spilling pointer r{} is not supported yet (see #30)", src),
@@ -628,10 +661,12 @@ fn successors(
 /// Scalar operands are refined on both sides via #16 (like the kernel's
 /// check_cond_jmp_op / regs_refine_cond_op); a branch that the static
 /// verdict (#24) rules out is not explored at all, mirroring the
-/// kernel's is_branch_taken(). Pointers of the same type may be
-/// compared for equality without refinement (the NULL-check foundation
-/// for #27); `>` on pointers and mixed-type comparisons are rejected,
-/// mirroring the kernel.
+/// kernel's is_branch_taken(). A nullable pointer compared to the
+/// constant 0 is a NULL check (#27): the taken branch turns it into the
+/// scalar 0 (kernel style) and the fall-through refines it to a valid
+/// map value pointer (mark_ptr_not_null_reg). Pointers of the same type
+/// may be compared for equality without refinement; `>` on pointers and
+/// mixed-type comparisons are rejected, mirroring the kernel.
 fn cond_branch(
     pc: u32,
     dst: u8,
@@ -689,10 +724,36 @@ fn cond_branch(
             }
             out
         }
+        // NULL check: a nullable pointer compared to the constant 0
+        (RegState::PtrToMapValueOrNull, RegState::Scalar { min: 0, max: 0 })
+        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValueOrNull) => {
+            let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
+                dst
+            } else {
+                src
+            };
+            // taken (== 0): the pointer becomes the constant 0 (kernel
+            // style — NULL is a scalar zero, not a pointer type)
+            let mut taken = *state;
+            taken.regs[ptr_reg as usize] = RegState::Scalar { min: 0, max: 0 };
+            // fall (!= 0): refined to a valid map value pointer
+            let mut not_null = *state;
+            not_null.regs[ptr_reg as usize] = RegState::PtrToMapValue;
+            vec![(taken_pc, taken), (fall_pc, not_null)]
+        }
+        // a non-null map value pointer compared to 0: both branches are
+        // kept without refinement (simplified — the kernel marks the
+        // taken branch infeasible)
+        (RegState::PtrToMapValue, RegState::Scalar { min: 0, max: 0 })
+        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValue) => {
+            vec![(taken_pc, *state), (fall_pc, *state)]
+        }
         // pointers of the same type: equality is allowed without
         // refinement; `>` on pointers is not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
-        | (RegState::PtrToCtx, RegState::PtrToCtx) => match op {
+        | (RegState::PtrToCtx, RegState::PtrToCtx)
+        | (RegState::PtrToMapValue, RegState::PtrToMapValue)
+        | (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => match op {
             CondOp::Eq => vec![(taken_pc, *state), (fall_pc, *state)],
             CondOp::Gt => {
                 return Err(VerificationFailure::new(
@@ -752,6 +813,10 @@ fn reg_subsumes(old: RegState, new: RegState) -> bool {
             RegState::PtrToStack { offset: new_offset },
         ) => old_offset == new_offset,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
+        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => true,
+        // a nullable pointer is a superset of the non-null one
+        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValue) => true,
         // different types are never comparable
         _ => false,
     }

@@ -149,6 +149,11 @@ fn reg_state_display() {
         "PTR_STACK(-8)"
     );
     assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
+    assert_eq!(RegState::PtrToMapValue.to_string(), "PTR_MAP_VALUE");
+    assert_eq!(
+        RegState::PtrToMapValueOrNull.to_string(),
+        "PTR_MAP_VALUE_OR_NULL"
+    );
 }
 
 // ── VerifierState (v0.2) ─────────────────────────────────────────────────
@@ -1789,4 +1794,159 @@ fn verify_mini_refined_state_subsumed_by_original() {
     let (_, fall) = &nexts[1];
     assert!(subsumes(&state, taken));
     assert!(subsumes(&state, fall));
+}
+
+// ── Nullable pointers (v0.3) ─────────────────────────────────────────────
+
+#[test]
+fn successors_null_check_issue_example() {
+    // issue example: r0 = PtrToMapValueOrNull; if r0 == 0 (via r1 = 0)
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValueOrNull;
+    state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+
+    // taken (r0 == 0): the pointer becomes the constant 0 (kernel style)
+    let (taken_pc, taken) = &nexts[0];
+    assert_eq!(*taken_pc, 2);
+    assert_eq!(taken.regs[0], RegState::Scalar { min: 0, max: 0 });
+    // fall (r0 != 0): refined to a valid map value pointer
+    let (fall_pc, fall) = &nexts[1];
+    assert_eq!(*fall_pc, 1);
+    assert_eq!(fall.regs[0], RegState::PtrToMapValue);
+}
+
+#[test]
+fn successors_null_check_reversed_operands() {
+    // the constant 0 may also be the dst register: if r1 == r0 with r1 = 0
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValueOrNull;
+    state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 1,
+            src: 0,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+    assert_eq!(nexts[0].1.regs[0], RegState::Scalar { min: 0, max: 0 });
+    assert_eq!(nexts[1].1.regs[0], RegState::PtrToMapValue);
+}
+
+#[test]
+fn successors_null_check_nonzero_scalar_rejected() {
+    // only the constant 0 enables a NULL check; other scalars keep the
+    // different-types rejection
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValueOrNull;
+    state.regs[1] = RegState::Scalar { min: 8, max: 8 };
+    let err = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("different types"));
+}
+
+#[test]
+fn successors_map_value_vs_zero_both_branches() {
+    // a non-null map value pointer compared to 0 keeps both branches
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValue;
+    state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+    assert_eq!(nexts[0].1, state);
+    assert_eq!(nexts[1].1, state);
+}
+
+#[test]
+fn successors_same_type_map_pointers() {
+    // equality is allowed without refinement, > is not
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValue;
+    let nexts = successors(
+        0,
+        &BpfInsn::Jeq {
+            dst: 0,
+            src: 0,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap();
+    assert_eq!(nexts.len(), 2);
+    assert_eq!(nexts[0].1, state);
+
+    let err = successors(
+        0,
+        &BpfInsn::Jgt {
+            dst: 0,
+            src: 0,
+            offset: 1,
+        },
+        &state,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("comparing pointers"));
+}
+
+#[test]
+fn subsumes_nullable_pointer() {
+    // OrNull = {valid} ∪ {NULL} subsumes the non-null pointer
+    let mut or_null = VerifierState::initial();
+    or_null.regs[0] = RegState::PtrToMapValueOrNull;
+    let mut valid = VerifierState::initial();
+    valid.regs[0] = RegState::PtrToMapValue;
+    assert!(subsumes(&or_null, &valid));
+    assert!(!subsumes(&valid, &or_null));
+    // same types subsume themselves
+    assert!(subsumes(&or_null, &or_null));
+    assert!(subsumes(&valid, &valid));
+}
+
+#[test]
+fn step_add_imm_nullable_ptr_rejected() {
+    // arithmetic on a nullable pointer is rejected until the NULL check
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValueOrNull;
+    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
+    assert!(err.message.contains("NULL"));
+}
+
+#[test]
+fn step_add_imm_map_value_ptr_rejected() {
+    let mut state = VerifierState::initial();
+    state.regs[0] = RegState::PtrToMapValue;
+    let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
+    assert!(err.message.contains("map value pointer"));
 }
