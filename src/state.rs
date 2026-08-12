@@ -165,8 +165,18 @@ impl ScalarBounds {
             self.u32_max = u32::MAX;
         }
         if (self.smin as u64) >> 32 == (self.smax as u64) >> 32 {
-            self.s32_min = self.smin as i32;
-            self.s32_max = self.smax as i32;
+            let lo = self.smin as i32;
+            let hi = self.smax as i32;
+            // the truncation can still cross the 32-bit sign bit within
+            // the window (e.g. [0, 0xffffffff]): then the i32 view is two
+            // intervals and widens to the full range
+            if lo <= hi {
+                self.s32_min = lo;
+                self.s32_max = hi;
+            } else {
+                self.s32_min = i32::MIN;
+                self.s32_max = i32::MAX;
+            }
         } else {
             self.s32_min = i32::MIN;
             self.s32_max = i32::MAX;
@@ -341,6 +351,15 @@ impl VerifierState {
 }
 
 // ── Register access helpers ──────────────────────────────────────────────────
+
+/// Extract the scalar bounds of a register; panics for non-scalars.
+#[cfg(test)]
+pub(crate) fn as_scalar(state: RegState) -> ScalarBounds {
+    match state {
+        RegState::Scalar(b) => b,
+        _ => panic!("expected a scalar register"),
+    }
+}
 
 /// Validate a register number used as a write destination.
 pub(crate) fn check_reg(pc: u32, reg: u8) -> Result<(), VerificationFailure> {

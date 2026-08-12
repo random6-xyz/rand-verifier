@@ -517,8 +517,23 @@ fn alu64_signed(op: AluOp, d: (i64, i64), s: (i64, i64)) -> (i64, i64) {
         return (bits as i64, bits as i64);
     }
     match op {
-        AluOp::Add => (dmin.wrapping_add(smin), dmax.wrapping_add(smax)),
-        AluOp::Sub => (dmin.wrapping_sub(smax), dmax.wrapping_sub(smin)),
+        // overflow falls back to the full range (kernel
+        // signed_add_overflows / signed_sub_overflows, #43): a wrapped
+        // interval would not contain the true results
+        AluOp::Add => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_add(smin), dmax.checked_add(smax)) {
+                (lo, hi)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Sub => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_sub(smax), dmax.checked_sub(smin)) {
+                (lo, hi)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
         // AND of non-negative ranges stays in [0, min(max1, max2)];
         // with a possible negative operand the sign bits make the result
         // unbounded (e.g. -1 & x)
@@ -556,8 +571,22 @@ fn alu64_unsigned(op: AluOp, d: (u64, u64), s: (u64, u64)) -> (u64, u64) {
     let (dmin, dmax) = d;
     let (smin, smax) = s;
     match op {
-        AluOp::Add => (dmin.wrapping_add(smin), dmax.wrapping_add(smax)),
-        AluOp::Sub => (dmin.wrapping_sub(smax), dmax.wrapping_sub(smin)),
+        // overflow falls back to the full range (kernel
+        // unsigned_add_overflows / unsigned_sub_overflows, #43)
+        AluOp::Add => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_add(smin), dmax.checked_add(smax)) {
+                (lo, hi)
+            } else {
+                (0, u64::MAX)
+            }
+        }
+        AluOp::Sub => {
+            if let (Some(lo), Some(hi)) = (dmin.checked_sub(smax), dmax.checked_sub(smin)) {
+                (lo, hi)
+            } else {
+                (0, u64::MAX)
+            }
+        }
         // u64 values are never negative: AND clears bits, OR sets them,
         // XOR is unbounded below the mask
         AluOp::And => (0, dmax.min(smax)),
@@ -591,8 +620,18 @@ fn shift64_by_const(op: AluOp, dmin: i64, dmax: i64, k: u32) -> (i64, i64) {
             if dmin < 0 {
                 return (i64::MIN, i64::MAX);
             }
+            if k == 0 {
+                return (dmin, dmax);
+            }
+            // x << k mod 2^64 is monotone within one block of size
+            // 2^(64-k); a range spanning a block boundary can wrap
+            // multiple times and must widen to the full range (#43)
+            if (dmin as u64) >> (64 - k) != (dmax as u64) >> (64 - k) {
+                return (i64::MIN, i64::MAX);
+            }
             let lo = (dmin as u64) << k;
             let hi = (dmax as u64) << k;
+            // a result crossing the sign bit has no i64 interval view
             if lo >= 1 << 63 || hi < 1 << 63 {
                 (lo as i64, hi as i64)
             } else {
@@ -1465,21 +1504,195 @@ mod tests {
     }
 
     #[test]
-    fn step_alu_sync_after_mixed_ops() {
-        // a signed-range operand keeps both families consistent: prandom
-        // then JSLE 100 refines smax and the sync narrows umax too
+    fn step_alu_overflow_falls_back_to_full_range() {
+        // [MIN, MAX] - 100 overflows the signed range: the result is the
+        // full range, never a wrapped min > max state (#43)
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 100 }).unwrap();
         let next = step(0, &next, &BpfInsn::SubReg { dst: 1, src: 2 }).unwrap();
-        // [MIN, MAX] - 100 → [MIN, MAX] with wrapped edges synced back
         let RegState::Scalar(b) = next.regs[1] else {
             panic!("expected scalar");
         };
+        assert_eq!(b.signed(), (i64::MIN, i64::MAX));
+        assert_eq!(b.unsigned(), (0, u64::MAX));
+    }
+
+    #[test]
+    fn step_add_overflow_issue_example() {
+        // issue example: [MAX-5, MAX] + 10 must never produce an empty
+        // (min > max) range. The signed family overflows and falls back
+        // to the full range, but the unsigned family did not overflow —
+        // the sync then recovers the exact wrapped interval (kernel
+        // __reg64_deduce_bounds, "negative" unsigned view).
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(i64::MAX - 5, i64::MAX));
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.smin <= b.smax);
+        // (MAX-5..MAX) + 10 mod 2^64 = (MIN+4..MIN+9) — exact
+        assert_eq!(b.signed(), (i64::MIN + 4, i64::MIN + 9));
+        assert_eq!(b.unsigned(), (i64::MAX as u64 + 5, i64::MAX as u64 + 10));
+    }
+
+    #[test]
+    fn step_add_overflow_unsigned_only() {
+        // [MAX-5, MAX] + 10 as u64 overflows; the signed view of the same
+        // state is negative and does not overflow
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: -10,
+            smax: -1,
+            umin: u64::MAX - 9,
+            umax: u64::MAX,
+            s32_min: -10,
+            s32_max: -1,
+            u32_min: u32::MAX - 9,
+            u32_max: u32::MAX,
+            tnum: Tnum::unknown(),
+        });
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // signed: [-10, -1] + 10 = [0, 9]
+        assert_eq!(b.signed(), (0, 9));
+        // unsigned: MAX-9..MAX + 10 wraps; the full-range fallback is
+        // intersected with the signed view by the sync → [0, 9] exact
+        assert_eq!(b.unsigned(), (0, 9));
+    }
+
+    #[test]
+    fn step_sub_overflow_falls_back() {
+        // [MIN, MIN + 5] - 10 overflows the signed family: never an empty
+        // range; the unsigned view (which did not overflow) recovers the
+        // exact wrapped interval through the sync
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(i64::MIN, i64::MIN + 5));
+        let next = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 10 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert!(b.smin <= b.smax && b.umin <= b.umax);
+        // MIN - 10 mod 2^64 = 2^63 - 10, which is positive in the signed
+        // view — the sync recovers the exact interval from the unsigned
+        // family (which did not overflow)
         assert_eq!(
             b.signed(),
-            (i64::MIN.wrapping_sub(100), i64::MAX.wrapping_sub(100))
+            (((1u64 << 63) - 10) as i64, ((1u64 << 63) - 5) as i64)
         );
+        assert_eq!(b.unsigned(), ((1u64 << 63) - 10, (1u64 << 63) - 5));
+    }
+
+    #[test]
+    fn step_add_non_overflowing_unchanged() {
+        // no behavior change for non-overflowing arithmetic
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(30)));
+        // build the i64::MAX constant: 0x80000000 << 32 - 1
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::MovImm {
+                dst: 1,
+                imm: -0x8000_0000,
+            },
+        )
+        .unwrap();
+        let state = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 32 }).unwrap();
+        let state = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 1 }).unwrap();
+        let RegState::Scalar(b) = state.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (i64::MAX, i64::MAX));
+        // a constant that wraps stays exact (wrapping is the eBPF ALU
+        // semantics: i64::MAX + 1 == i64::MIN)
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 1 }).unwrap();
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::constant(i64::MIN))
+        );
+    }
+
+    #[test]
+    fn alu_matrix_keeps_range_invariant() {
+        // the min <= max invariant holds across an ALU test matrix (#43):
+        // no operation may produce an empty (wrapped) range
+        let cases: [(AluOp, AluWidth, i64, i64, i64, i64); 12] = [
+            // (op, width, dmin, dmax, smin, smax)
+            (AluOp::Add, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Add, AluWidth::W64, i64::MAX - 5, i64::MAX, 10, 10),
+            (AluOp::Sub, AluWidth::W64, i64::MIN, i64::MIN + 5, 10, 10),
+            (AluOp::Sub, AluWidth::W64, i64::MIN, i64::MAX, -1, -1),
+            (AluOp::And, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Or, AluWidth::W64, i64::MIN, i64::MAX, 8, 8),
+            (AluOp::Xor, AluWidth::W64, -100, 100, -50, 50),
+            (AluOp::Lsh, AluWidth::W64, 1, i64::MAX, 1, 1),
+            (AluOp::Lsh, AluWidth::W64, 1 << 61, i64::MAX, 2, 2),
+            (AluOp::Rsh, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Arsh, AluWidth::W64, i64::MIN, i64::MAX, 1, 1),
+            (AluOp::Add, AluWidth::W32, i64::MIN, i64::MAX, 1, 1),
+        ];
+        for (op, width, dmin, dmax, smin, smax) in cases {
+            let mut state = VerifierState::initial();
+            state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(dmin, dmax));
+            state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(smin, smax));
+            let result = apply_alu(
+                op,
+                width,
+                as_scalar(state.regs[1]),
+                as_scalar(state.regs[2]),
+            );
+            assert!(
+                result.smin <= result.smax && result.umin <= result.umax,
+                "{:?} {:?} on [{}, {}] x [{}, {}] → {:?}",
+                op,
+                width,
+                dmin,
+                dmax,
+                smin,
+                smax,
+                result
+            );
+            assert!(
+                result.s32_min <= result.s32_max && result.u32_min <= result.u32_max,
+                "32-bit invariant {:?} {:?} on [{}, {}] x [{}, {}] → {:?}",
+                op,
+                width,
+                dmin,
+                dmax,
+                smin,
+                smax,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn step_alu_shift_block_boundary_sound() {
+        // a range spanning a 2^(64-k) block boundary wraps multiple
+        // times: the range must widen instead of claiming [MIN, -4]
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(1i64 << 61, i64::MAX));
+        let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        // the true results include 0, so a narrow wrapped interval would
+        // be unsound — the full range is the only sound answer
+        assert_eq!(b.signed(), (i64::MIN, i64::MAX));
+        // within one block the shift stays exact
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(1 << 60, (1 << 60) + 3));
+        let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (1 << 62, (1 << 62) + 12));
     }
 
     #[test]
