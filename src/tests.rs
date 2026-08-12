@@ -149,6 +149,7 @@ fn reg_state_display() {
         "PTR_STACK(-8)"
     );
     assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
+    assert_eq!(RegState::PtrToMap.to_string(), "PTR_MAP");
     assert_eq!(RegState::PtrToMapValue.to_string(), "PTR_MAP_VALUE");
     assert_eq!(
         RegState::PtrToMapValueOrNull.to_string(),
@@ -1467,10 +1468,10 @@ fn successors_uninit_operand_rejected() {
 }
 
 #[test]
-fn verify_mini_call_stub() {
-    let program = vec![BpfInsn::Call { imm: 1 }, BpfInsn::Exit];
+fn verify_mini_unknown_helper() {
+    let program = vec![BpfInsn::Call { imm: 99 }, BpfInsn::Exit];
     let err = verify_mini(&program).unwrap_err();
-    assert!(err.message.contains("#28"));
+    assert!(err.message.contains("unknown helper"));
 }
 
 #[test]
@@ -1949,4 +1950,115 @@ fn step_add_imm_map_value_ptr_rejected() {
     state.regs[0] = RegState::PtrToMapValue;
     let err = step(&state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
     assert!(err.message.contains("map value pointer"));
+}
+
+// ── Helpers (v0.3) ──────────────────────────────────────────────────────
+
+#[test]
+fn step_call_map_lookup_ok() {
+    // R1 = map pointer, R2 = key pointer → after the call R0 is the
+    // nullable map value pointer (#27's producer)
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::PtrToMap;
+    state.regs[2] = RegState::PtrToStack { offset: -8 };
+    let next = step(&state, &BpfInsn::Call { imm: 1 }).unwrap();
+    assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
+}
+
+#[test]
+fn step_call_prandom() {
+    // no arguments → R0 becomes an unknown scalar (full range)
+    let state = VerifierState::initial();
+    let next = step(&state, &BpfInsn::Call { imm: 7 }).unwrap();
+    assert_eq!(
+        next.regs[0],
+        RegState::Scalar {
+            min: i64::MIN,
+            max: i64::MAX
+        }
+    );
+}
+
+#[test]
+fn step_call_map_update_ok() {
+    // map_update(map, key, value, flags): all four args validated,
+    // returns 0 on success
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::PtrToMap;
+    state.regs[2] = RegState::PtrToStack { offset: -8 };
+    state.regs[3] = RegState::PtrToStack { offset: -16 };
+    state.regs[4] = RegState::Scalar { min: 0, max: 0 };
+    let next = step(&state, &BpfInsn::Call { imm: 2 }).unwrap();
+    assert_eq!(next.regs[0], RegState::Scalar { min: 0, max: 0 });
+}
+
+#[test]
+fn step_call_map_update_missing_value() {
+    // R3 (the value pointer) is uninitialized → #14 error
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::PtrToMap;
+    state.regs[2] = RegState::PtrToStack { offset: -8 };
+    let err = step(&state, &BpfInsn::Call { imm: 2 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn step_call_arg_mismatch() {
+    // R1 is the context pointer, not a map pointer → rejected
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+    assert!(err.message.contains("expected PtrToMap"));
+    assert!(err.message.contains("r1 has type PTR_CTX"));
+}
+
+#[test]
+fn step_call_unknown_helper() {
+    let state = VerifierState::initial();
+    let err = step(&state, &BpfInsn::Call { imm: 99 }).unwrap_err();
+    assert!(err.message.contains("unknown helper 99"));
+}
+
+#[test]
+fn step_call_uninit_arg() {
+    // R2 (the key pointer) is uninitialized → #14 error
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::PtrToMap;
+    let err = step(&state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+    assert!(err.message.contains("uninitialized"));
+}
+
+#[test]
+fn verify_mini_prandom_branch() {
+    // end-to-end range program: prandom yields an unknown scalar, then a
+    // branch refines it (#16 in a real program):
+    // 0: call 7         → R0 = [MIN, MAX]
+    // 1: r1 = 0
+    // 2: jeq r0, r1, +1 → taken 4, fall 3
+    // 3: exit           (R0 = [MIN, MAX])
+    // 4: exit           (R0 = [0, 0])
+    let program = vec![
+        BpfInsn::Call { imm: 7 },
+        BpfInsn::MovImm { dst: 1, imm: 0 },
+        BpfInsn::Jeq {
+            dst: 0,
+            src: 1,
+            offset: 1,
+        },
+        BpfInsn::Exit,
+        BpfInsn::Exit,
+    ];
+    // both branches reach exit with R0 set (scalar in both cases)
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn subsumes_ptr_to_map() {
+    let mut map = VerifierState::initial();
+    map.regs[1] = RegState::PtrToMap;
+    let ctx = VerifierState::initial();
+    // same type subsumes itself; a map pointer never subsumes a ctx
+    // pointer (or vice versa)
+    assert!(subsumes(&map, &map));
+    assert!(!subsumes(&map, &ctx));
+    assert!(!subsumes(&ctx, &map));
 }

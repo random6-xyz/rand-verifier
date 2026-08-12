@@ -81,6 +81,7 @@ const NUM_REGS: usize = 11;
 /// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
+/// - `PtrToMap` — a fixed map pointer (kernel's CONST_PTR_TO_MAP)
 /// - `PtrToMapValue` — pointer to a map value (non-null)
 /// - `PtrToMapValueOrNull` — nullable map value pointer; must pass a
 ///   NULL check before use (#27)
@@ -95,8 +96,9 @@ enum RegState {
         offset: i32,
     },
     PtrToCtx,
+    #[allow(dead_code)] // injected at program load (Meso)
+    PtrToMap,
     PtrToMapValue,
-    #[allow(dead_code)] // produced by map lookups (#29)
     PtrToMapValueOrNull,
 }
 
@@ -107,6 +109,7 @@ impl std::fmt::Display for RegState {
             RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
             RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
+            RegState::PtrToMap => write!(f, "PTR_MAP"),
             RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
             RegState::PtrToMapValueOrNull => write!(f, "PTR_MAP_VALUE_OR_NULL"),
         }
@@ -277,6 +280,7 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
         RegState::Scalar { min, max } => Ok((min, max)),
         RegState::PtrToStack { .. }
         | RegState::PtrToCtx
+        | RegState::PtrToMap
         | RegState::PtrToMapValue
         | RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
             NO_PC,
@@ -298,7 +302,7 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
 ///
 /// Instructions that expand to a single successor are executed here;
 /// control flow (Jmp/Jeq/Jgt) is expanded by the worklist driver (#23),
-/// calls are not part of the subset yet (#28), and register-offset
+/// calls are validated as helper invocations (#28), and register-offset
 /// pointer arithmetic is rejected (#20).
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
@@ -359,6 +363,10 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                     NO_PC,
                     format!("arithmetic on context pointer r{} is not allowed", dst),
                 )),
+                RegState::PtrToMap => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("arithmetic on map pointer r{} is not allowed", dst),
+                )),
                 RegState::PtrToMapValue => Err(VerificationFailure::new(
                     NO_PC,
                     format!(
@@ -398,6 +406,7 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                 RegState::Scalar { .. } => {}
                 RegState::PtrToStack { .. }
                 | RegState::PtrToCtx
+                | RegState::PtrToMap
                 | RegState::PtrToMapValue
                 | RegState::PtrToMapValueOrNull => {
                     return Err(VerificationFailure::new(
@@ -445,10 +454,17 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                 "control flow is not executed by step() (see the worklist driver #23)",
             ))
         }
-        BpfInsn::Call { .. } => Err(VerificationFailure::new(
-            NO_PC,
-            "call instruction not supported yet (see #28)",
-        )),
+        // helper call: validate R1..R5 against the helper prototype and
+        // place the return type in R0 (#28); R1..R5 invalidation is #29
+        BpfInsn::Call { imm } => {
+            let helper = helper_prototype(*imm).ok_or_else(|| {
+                VerificationFailure::new(NO_PC, format!("unknown helper {}", imm))
+            })?;
+            check_helper_args(helper, state)?;
+            let mut next = *state;
+            next.regs[0] = helper.return_type;
+            Ok(next)
+        }
     }
 }
 
@@ -563,6 +579,91 @@ fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
     Ok(out)
 }
 
+// ── Helper functions (v0.3 Mini) ─────────────────────────────────────────────
+
+/// Expected type of one helper argument (R1..R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgType {
+    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP).
+    PtrToMap,
+    /// A pointer into the stack frame (key/value buffers).
+    PtrToStack,
+    /// Any scalar value (flags etc.).
+    Scalar,
+}
+
+/// Helper function prototype: argument types and the register state
+/// placed in R0 after the call (cf. the kernel's bpf_func_proto).
+struct HelperPrototype {
+    args: &'static [ArgType],
+    return_type: RegState,
+}
+
+/// The helper table: id → prototype (#28).
+fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
+    match id {
+        // BPF_FUNC_map_lookup_elem: map_lookup(map, key)
+        1 => Some(&HelperPrototype {
+            args: &[ArgType::PtrToMap, ArgType::PtrToStack],
+            return_type: RegState::PtrToMapValueOrNull,
+        }),
+        // BPF_FUNC_map_update_elem: map_update(map, key, value, flags)
+        2 => Some(&HelperPrototype {
+            args: &[
+                ArgType::PtrToMap,
+                ArgType::PtrToStack,
+                ArgType::PtrToStack,
+                ArgType::Scalar,
+            ],
+            return_type: RegState::Scalar { min: 0, max: 0 },
+        }),
+        // BPF_FUNC_get_prandom_u32: no arguments, unknown scalar
+        7 => Some(&HelperPrototype {
+            args: &[],
+            return_type: RegState::Scalar {
+                min: i64::MIN,
+                max: i64::MAX,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// Does the actual register state satisfy the expected argument type?
+fn arg_matches(expected: ArgType, actual: RegState) -> bool {
+    matches!(
+        (expected, actual),
+        (ArgType::PtrToMap, RegState::PtrToMap)
+            | (ArgType::PtrToStack, RegState::PtrToStack { .. })
+            | (ArgType::Scalar, RegState::Scalar { .. })
+    )
+}
+
+/// Validate R1..R5 against the helper's argument types, mirroring the
+/// kernel's check_helper_call (#28).
+fn check_helper_args(
+    helper: &HelperPrototype,
+    state: &VerifierState,
+) -> Result<(), VerificationFailure> {
+    for (i, expected) in helper.args.iter().enumerate() {
+        let reg = (i + 1) as u8; // R1..R5
+        let actual = read_reg(state, reg)?;
+        if !arg_matches(*expected, actual) {
+            return Err(VerificationFailure::new(
+                NO_PC,
+                format!(
+                    "helper arg {}: r{} has type {}, expected {:?}",
+                    i + 1,
+                    reg,
+                    actual,
+                    expected
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
 
 /// One pending state in the path exploration: an instruction index and
@@ -645,10 +746,8 @@ fn successors(
         BpfInsn::Jgt { dst, src, offset } => {
             cond_branch(pc, *dst, *src, *offset, CondOp::Gt, state)
         }
-        BpfInsn::Call { .. } => Err(VerificationFailure::new(
-            NO_PC,
-            "call instruction not supported yet (see #28)",
-        )),
+        // everything else falls through via step() (this includes
+        // helper calls, which step() validates — #28)
         _ => {
             let next = step(state, insn)?;
             Ok(vec![(pc + 1, next)])
@@ -752,6 +851,7 @@ fn cond_branch(
         // refinement; `>` on pointers is not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
         | (RegState::PtrToCtx, RegState::PtrToCtx)
+        | (RegState::PtrToMap, RegState::PtrToMap)
         | (RegState::PtrToMapValue, RegState::PtrToMapValue)
         | (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => match op {
             CondOp::Eq => vec![(taken_pc, *state), (fall_pc, *state)],
@@ -813,6 +913,7 @@ fn reg_subsumes(old: RegState, new: RegState) -> bool {
             RegState::PtrToStack { offset: new_offset },
         ) => old_offset == new_offset,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (RegState::PtrToMap, RegState::PtrToMap) => true,
         (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
         (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => true,
         // a nullable pointer is a superset of the non-null one
