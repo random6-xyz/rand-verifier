@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 
@@ -80,12 +81,25 @@ const NUM_REGS: usize = 11;
 /// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
+/// - `PtrToMap` — a fixed map pointer (kernel's CONST_PTR_TO_MAP)
+/// - `PtrToMapValue` — pointer to a map value (non-null)
+/// - `PtrToMapValueOrNull` — nullable map value pointer; must pass a
+///   NULL check before use (#27)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     Uninit,
-    Scalar { min: i64, max: i64 },
-    PtrToStack { offset: i32 },
+    Scalar {
+        min: i64,
+        max: i64,
+    },
+    PtrToStack {
+        offset: i32,
+    },
     PtrToCtx,
+    #[allow(dead_code)] // injected at program load (Meso)
+    PtrToMap,
+    PtrToMapValue,
+    PtrToMapValueOrNull,
 }
 
 impl std::fmt::Display for RegState {
@@ -95,6 +109,9 @@ impl std::fmt::Display for RegState {
             RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
             RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
+            RegState::PtrToMap => write!(f, "PTR_MAP"),
+            RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
+            RegState::PtrToMapValueOrNull => write!(f, "PTR_MAP_VALUE_OR_NULL"),
         }
     }
 }
@@ -123,19 +140,21 @@ const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 
 /// Abstract state of a single stack slot.
 ///
-/// Slot-level granularity (not byte-level) keeps the model approachable;
-/// scalar ranges and spilled pointer states are not tracked here yet (#30).
+/// Slot-level granularity (not byte-level) keeps the model approachable.
+/// A slot holds the full spilled register state, so pointers and scalar
+/// ranges survive a store/load round-trip (#30) — like the kernel's
+/// STACK_SPILL slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StackSlot {
     Uninit,
-    Scalar,
+    Spilled(RegState),
 }
 
 impl std::fmt::Display for StackSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StackSlot::Uninit => write!(f, "UNINIT"),
-            StackSlot::Scalar => write!(f, "SCALAR"),
+            StackSlot::Spilled(state) => write!(f, "SPILLED({})", state),
         }
     }
 }
@@ -261,7 +280,11 @@ fn read_reg(state: &VerifierState, reg: u8) -> Result<RegState, VerificationFail
 fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), VerificationFailure> {
     match read_reg(state, reg)? {
         RegState::Scalar { min, max } => Ok((min, max)),
-        RegState::PtrToStack { .. } | RegState::PtrToCtx => Err(VerificationFailure::new(
+        RegState::PtrToStack { .. }
+        | RegState::PtrToCtx
+        | RegState::PtrToMap
+        | RegState::PtrToMapValue
+        | RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
             NO_PC,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
@@ -279,9 +302,10 @@ fn read_scalar(state: &VerifierState, reg: u8) -> Result<(i64, i64), Verificatio
 /// a register move copies the source's abstract state, and `exit`
 /// terminates the path without changing the state.
 ///
-/// Instructions outside the micro subset (control flow, register-offset
-/// pointer arithmetic) are rejected with a reference to the issue that
-/// introduces them.
+/// Instructions that expand to a single successor are executed here;
+/// control flow (Jmp/Jeq/Jgt) is expanded by the worklist driver (#23),
+/// calls are validated as helper invocations (#28), and register-offset
+/// pointer arithmetic is rejected (#20).
 #[allow(dead_code)] // consumed by the micro verifier driver (#23)
 fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, VerificationFailure> {
     match insn {
@@ -341,6 +365,24 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                     NO_PC,
                     format!("arithmetic on context pointer r{} is not allowed", dst),
                 )),
+                RegState::PtrToMap => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("arithmetic on map pointer r{} is not allowed", dst),
+                )),
+                RegState::PtrToMapValue => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!(
+                        "arithmetic on map value pointer r{} is not supported yet",
+                        dst
+                    ),
+                )),
+                RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+                    NO_PC,
+                    format!(
+                        "arithmetic on nullable pointer r{} is not allowed (check for NULL first)",
+                        dst
+                    ),
+                )),
                 RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
             }
         }
@@ -357,31 +399,22 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
             };
             Ok(next)
         }
-        // r10[offset] = rY → store the source's abstract state to a stack
-        // slot; only scalars are representable yet (pointer spill is #30)
+        // r10[offset] = rY → spill the source's full abstract state,
+        // including pointers and scalar ranges (#30)
         BpfInsn::StStack { src, offset } => {
             let slot = stack_slot_index(*offset as i32)?;
             let src_state = read_reg(state, *src)?;
-            match src_state {
-                RegState::Scalar { .. } => {}
-                RegState::PtrToStack { .. } | RegState::PtrToCtx => {
-                    return Err(VerificationFailure::new(
-                        NO_PC,
-                        format!("spilling pointer r{} is not supported yet (see #30)", src),
-                    ));
-                }
-                RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
-            }
             let mut next = *state;
-            next.stack.slots[slot] = StackSlot::Scalar;
+            next.stack.slots[slot] = StackSlot::Spilled(src_state);
             Ok(next)
         }
         // rX = r10[offset] → load a stack slot; a slot must have been
-        // written before it is read (write-before-read, #18)
+        // written before it is read (write-before-read, #18). The full
+        // spilled register state is restored, pointers included (#30).
         BpfInsn::LdStack { dst, offset } => {
             check_reg(*dst)?;
             let slot = stack_slot_index(*offset as i32)?;
-            match state.stack.slots[slot] {
+            let spilled = match state.stack.slots[slot] {
                 StackSlot::Uninit => {
                     return Err(VerificationFailure::new(
                         NO_PC,
@@ -391,22 +424,39 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                         ),
                     ));
                 }
-                StackSlot::Scalar => {}
-            }
-            // the slot carries no range yet, so a loaded scalar is unknown
-            let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: i64::MIN,
-                max: i64::MAX,
+                StackSlot::Spilled(spilled) => spilled,
             };
+            let mut next = *state;
+            next.regs[*dst as usize] = spilled;
             Ok(next)
         }
-        // ── outside the micro subset, deferred to later issues ──
-        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } | BpfInsn::Call { .. } => {
+        // control flow is expanded by the worklist driver (#23), which
+        // produces multiple successor states — a single-state step()
+        // cannot execute it; calls are not part of the subset yet
+        BpfInsn::Jeq { .. } | BpfInsn::Jgt { .. } | BpfInsn::Jmp { .. } => {
             Err(VerificationFailure::new(
                 NO_PC,
-                "control flow not supported yet (see #23)",
+                "control flow is not executed by step() (see the worklist driver #23)",
             ))
+        }
+        // helper call: validate R1..R5 against the helper prototype, then
+        // apply the eBPF calling convention (#28/#29): R1..R5 are
+        // clobbered by the call (kernel's check_helper_call resets them
+        // to NOT_INIT), R6..R9 are preserved, and R0 gets the return type
+        BpfInsn::Call { imm } => {
+            // helper ids are encoded as negative immediates (kernel
+            // convention); positive immediates are BPF-to-BPF calls
+            let helper = helper_prototype(-*imm).ok_or_else(|| {
+                VerificationFailure::new(NO_PC, format!("unknown helper {}", imm))
+            })?;
+            check_helper_args(helper, state)?;
+            let mut next = *state;
+            // argument registers are scratch — invalidated by the call
+            for reg in 1..=5 {
+                next.regs[reg] = RegState::Uninit;
+            }
+            next.regs[0] = helper.return_type;
+            Ok(next)
         }
     }
 }
@@ -453,6 +503,112 @@ fn refine_gt(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
 fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
     let inter = (dst.0.max(src.0), dst.1.min(src.1));
     ((inter, inter), (dst, src))
+}
+
+// ── Tracked number abstraction (tnum) (v0.3 Mini) ────────────────────────────
+
+/// A tracked number: `value` holds the known bits and `mask` the unknown
+/// ones (a 1 in `mask` means the bit may be either 0 or 1).
+///
+/// This is the simplified counterpart of the kernel's `struct tnum`
+/// (tnum_var_off); it is not wired into RegState yet — that happens in
+/// Meso, alongside the min/max ranges the kernel keeps next to it.
+#[allow(dead_code)] // wired into RegState in Meso
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tnum {
+    value: u64,
+    mask: u64,
+}
+
+#[allow(dead_code)] // wired into RegState in Meso
+impl Tnum {
+    /// A fully known constant.
+    fn constant(value: u64) -> Self {
+        Self { value, mask: 0 }
+    }
+
+    /// A fully unknown value (every bit may be anything).
+    fn unknown() -> Self {
+        Self {
+            value: 0,
+            mask: u64::MAX,
+        }
+    }
+
+    /// Whether every bit is known.
+    fn is_constant(&self) -> bool {
+        self.mask == 0
+    }
+
+    /// Whether no bit is known.
+    fn is_unknown(&self) -> bool {
+        self.mask == u64::MAX
+    }
+
+    /// The bits that are known to be 1.
+    fn known_ones(&self) -> u64 {
+        self.value & !self.mask
+    }
+
+    /// Addition with carry, following the kernel's tnum_add(): the
+    /// possible carry chain is folded into the mask.
+    fn add(self, other: Tnum) -> Self {
+        // kernel: sm = a.mask + b.mask; sv = a.value + b.value;
+        // sigma = sm + sv; chi = sigma ^ sv; mu = chi | a.mask | b.mask
+        let sm = self.mask.wrapping_add(other.mask);
+        let sv = self.value.wrapping_add(other.value);
+        let sigma = sm.wrapping_add(sv);
+        let chi = sigma ^ sv;
+        let mu = chi | self.mask | other.mask;
+        Self {
+            value: sv & !mu,
+            mask: mu,
+        }
+    }
+
+    /// Bitwise AND: a bit is known 1 only if both operands are known 1
+    /// there; it is unknown if either operand could be 0 there.
+    fn and(self, other: Tnum) -> Self {
+        let alpha = self.value | self.mask; // possible 1s of self
+        let beta = other.value | other.mask; // possible 1s of other
+        let value = self.value & other.value;
+        let mask = (alpha & beta) ^ value;
+        Self { value, mask }
+    }
+
+    /// Bitwise OR: a bit is known 1 if either operand is known 1 there,
+    /// and known 0 if both operands are known 0.
+    fn or(self, other: Tnum) -> Self {
+        let known_one = self.known_ones() | other.known_ones();
+        let known_zero = (!self.value & !self.mask) & (!other.value & !other.mask);
+        Self {
+            value: known_one,
+            mask: !(known_one | known_zero),
+        }
+    }
+
+    /// The values common to both abstractions (kernel's tnum_intersect).
+    fn intersect(self, other: Tnum) -> Self {
+        let v = self.value | other.value;
+        let mu = self.mask & other.mask;
+        Self {
+            value: v & !mu,
+            mask: mu,
+        }
+    }
+
+    /// Does `self` contain every value of `other` (a partial order)?
+    /// A bit known in `self` must be known with the same value in
+    /// `other`; unknown bits of `self` may be refined in `other`.
+    fn subsumes(self, other: Tnum) -> bool {
+        (other.mask & !self.mask) == 0 && (other.value & !self.mask) == (self.value & !self.mask)
+    }
+}
+
+impl std::fmt::Display for Tnum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TNUM({:#x},{:#x})", self.value, self.mask)
+    }
 }
 
 // ── Execution trace (v0.2 Micro) ─────────────────────────────────────────────
@@ -506,10 +662,10 @@ fn trace_step(pc: u32, insn: &BpfInsn, before: &VerifierState, after: &VerifierS
 
 /// Execute a straight-line program and render the execution trace.
 ///
-/// Micro-stage driver: steps through every instruction in order and stops
-/// at the first unsupported one (control flow, #23). The worklist driver
-/// (#23) will supersede this.
-#[allow(dead_code)] // wired into the CLI once the worklist driver lands (#23)
+/// Micro-stage trace renderer: steps through every instruction in order
+/// and stops at the first instruction step() cannot execute (control
+/// flow is expanded by the worklist driver #23 instead).
+#[allow(dead_code)] // rendered through the CLI once the worklist driver lands (#23)
 fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
     let mut out = String::new();
     let mut state = VerifierState::initial();
@@ -520,6 +676,462 @@ fn run_trace(program: &[BpfInsn]) -> Result<String, VerificationFailure> {
         state = next;
     }
     Ok(out)
+}
+
+// ── Helper functions (v0.3 Mini) ─────────────────────────────────────────────
+
+/// Expected type of one helper argument (R1..R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgType {
+    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP).
+    PtrToMap,
+    /// A pointer into the stack frame (key/value buffers).
+    PtrToStack,
+    /// Any scalar value (flags etc.).
+    Scalar,
+}
+
+/// Helper function prototype: argument types and the register state
+/// placed in R0 after the call (cf. the kernel's bpf_func_proto).
+struct HelperPrototype {
+    args: &'static [ArgType],
+    return_type: RegState,
+}
+
+/// The helper table: id → prototype (#28). Calls encode the helper id
+/// as a negative immediate, like the kernel (positive immediates are
+/// BPF-to-BPF calls, handled by the nano pass).
+fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
+    match id {
+        // BPF_FUNC_map_lookup_elem: map_lookup(map, key)
+        1 => Some(&HelperPrototype {
+            args: &[ArgType::PtrToMap, ArgType::PtrToStack],
+            return_type: RegState::PtrToMapValueOrNull,
+        }),
+        // BPF_FUNC_map_update_elem: map_update(map, key, value, flags)
+        2 => Some(&HelperPrototype {
+            args: &[
+                ArgType::PtrToMap,
+                ArgType::PtrToStack,
+                ArgType::PtrToStack,
+                ArgType::Scalar,
+            ],
+            return_type: RegState::Scalar { min: 0, max: 0 },
+        }),
+        // BPF_FUNC_get_prandom_u32: no arguments, unknown scalar
+        7 => Some(&HelperPrototype {
+            args: &[],
+            return_type: RegState::Scalar {
+                min: i64::MIN,
+                max: i64::MAX,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// Does the actual register state satisfy the expected argument type?
+fn arg_matches(expected: ArgType, actual: RegState) -> bool {
+    matches!(
+        (expected, actual),
+        (ArgType::PtrToMap, RegState::PtrToMap)
+            | (ArgType::PtrToStack, RegState::PtrToStack { .. })
+            | (ArgType::Scalar, RegState::Scalar { .. })
+    )
+}
+
+/// Validate R1..R5 against the helper's argument types, mirroring the
+/// kernel's check_helper_call (#28).
+fn check_helper_args(
+    helper: &HelperPrototype,
+    state: &VerifierState,
+) -> Result<(), VerificationFailure> {
+    for (i, expected) in helper.args.iter().enumerate() {
+        let reg = (i + 1) as u8; // R1..R5
+        let actual = read_reg(state, reg)?;
+        if !arg_matches(*expected, actual) {
+            return Err(VerificationFailure::new(
+                NO_PC,
+                format!(
+                    "helper arg {}: r{} has type {}, expected {:?}",
+                    i + 1,
+                    reg,
+                    actual,
+                    expected
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
+
+/// One pending state in the path exploration: an instruction index and
+/// the verifier state carried to it (cf. the kernel's verifier stack).
+struct WorkItem {
+    pc: u32,
+    state: VerifierState,
+}
+
+/// The conditional comparisons in the mini subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CondOp {
+    Eq,
+    Gt,
+}
+
+/// PC-relative branch target: the offset is relative to the next insn.
+fn branch_target(pc: u32, offset: i16) -> u32 {
+    (pc as i32 + 1 + offset as i32) as u32
+}
+
+/// Static verdict of a comparison over two scalar ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchVerdict {
+    /// The condition holds for every concrete value in the ranges.
+    AlwaysTaken,
+    /// The condition fails for every concrete value in the ranges.
+    AlwaysNotTaken,
+    /// Both outcomes are possible.
+    Unknown,
+}
+
+/// Decide whether a conditional branch is statically always taken,
+/// never taken, or unknown for the given scalar ranges (cf. the
+/// kernel's is_branch_taken()).
+fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerdict {
+    match op {
+        // dst > src: always true iff dst.min > src.max,
+        // always false iff dst.max <= src.min
+        CondOp::Gt => {
+            if dst.0 > src.1 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.1 <= src.0 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+        // dst == src: always true iff both are the same constant,
+        // always false iff the ranges are disjoint
+        CondOp::Eq => {
+            if dst.0 == dst.1 && src.0 == src.1 && dst.0 == src.0 {
+                BranchVerdict::AlwaysTaken
+            } else if dst.1 < src.0 || dst.0 > src.1 {
+                BranchVerdict::AlwaysNotTaken
+            } else {
+                BranchVerdict::Unknown
+            }
+        }
+    }
+}
+
+/// Expand the instruction at `pc` into its successor (pc, state) pairs.
+///
+/// Control flow is expanded here, not in `step()` (which is single-state):
+/// exit terminates the path, Jmp follows only its target, Jeq/Jgt fork
+/// into both branches with scalar range refinement (#16), and everything
+/// else falls through via `step()`.
+fn successors(
+    pc: u32,
+    insn: &BpfInsn,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    match insn {
+        BpfInsn::Exit => Ok(vec![]),
+        BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
+        BpfInsn::Jeq { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Eq, state)
+        }
+        BpfInsn::Jgt { dst, src, offset } => {
+            cond_branch(pc, *dst, *src, *offset, CondOp::Gt, state)
+        }
+        // everything else falls through via step() (this includes
+        // helper calls, which step() validates — #28)
+        _ => {
+            let next = step(state, insn)?;
+            Ok(vec![(pc + 1, next)])
+        }
+    }
+}
+
+/// Fork a conditional branch into taken and fall-through successors.
+///
+/// Scalar operands are refined on both sides via #16 (like the kernel's
+/// check_cond_jmp_op / regs_refine_cond_op); a branch that the static
+/// verdict (#24) rules out is not explored at all, mirroring the
+/// kernel's is_branch_taken(). A nullable pointer compared to the
+/// constant 0 is a NULL check (#27): the taken branch turns it into the
+/// scalar 0 (kernel style) and the fall-through refines it to a valid
+/// map value pointer (mark_ptr_not_null_reg). Pointers of the same type
+/// may be compared for equality without refinement; `>` on pointers and
+/// mixed-type comparisons are rejected, mirroring the kernel.
+fn cond_branch(
+    pc: u32,
+    dst: u8,
+    src: u8,
+    offset: i16,
+    op: CondOp,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    let dst_state = read_reg(state, dst)?;
+    let src_state = read_reg(state, src)?;
+    let taken_pc = branch_target(pc, offset);
+    let fall_pc = pc + 1;
+
+    let out = match (dst_state, src_state) {
+        (
+            RegState::Scalar {
+                min: dmin,
+                max: dmax,
+            },
+            RegState::Scalar {
+                min: smin,
+                max: smax,
+            },
+        ) => {
+            let verdict = is_branch_taken(op, (dmin, dmax), (smin, smax));
+            let ((t_dst, t_src), (f_dst, f_src)) = match op {
+                CondOp::Eq => refine_eq((dmin, dmax), (smin, smax)),
+                CondOp::Gt => refine_gt((dmin, dmax), (smin, smax)),
+            };
+            let mut out = Vec::with_capacity(2);
+            // a statically impossible branch is never explored
+            if !matches!(verdict, BranchVerdict::AlwaysNotTaken) {
+                let mut taken = *state;
+                taken.regs[dst as usize] = RegState::Scalar {
+                    min: t_dst.0,
+                    max: t_dst.1,
+                };
+                taken.regs[src as usize] = RegState::Scalar {
+                    min: t_src.0,
+                    max: t_src.1,
+                };
+                out.push((taken_pc, taken));
+            }
+            if !matches!(verdict, BranchVerdict::AlwaysTaken) {
+                let mut fall = *state;
+                fall.regs[dst as usize] = RegState::Scalar {
+                    min: f_dst.0,
+                    max: f_dst.1,
+                };
+                fall.regs[src as usize] = RegState::Scalar {
+                    min: f_src.0,
+                    max: f_src.1,
+                };
+                out.push((fall_pc, fall));
+            }
+            out
+        }
+        // NULL check: a nullable pointer compared to the constant 0
+        (RegState::PtrToMapValueOrNull, RegState::Scalar { min: 0, max: 0 })
+        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValueOrNull) => {
+            let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
+                dst
+            } else {
+                src
+            };
+            // taken (== 0): the pointer becomes the constant 0 (kernel
+            // style — NULL is a scalar zero, not a pointer type)
+            let mut taken = *state;
+            taken.regs[ptr_reg as usize] = RegState::Scalar { min: 0, max: 0 };
+            // fall (!= 0): refined to a valid map value pointer
+            let mut not_null = *state;
+            not_null.regs[ptr_reg as usize] = RegState::PtrToMapValue;
+            vec![(taken_pc, taken), (fall_pc, not_null)]
+        }
+        // a non-null map value pointer compared to 0: both branches are
+        // kept without refinement (simplified — the kernel marks the
+        // taken branch infeasible)
+        (RegState::PtrToMapValue, RegState::Scalar { min: 0, max: 0 })
+        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValue) => {
+            vec![(taken_pc, *state), (fall_pc, *state)]
+        }
+        // pointers of the same type: equality is allowed without
+        // refinement; `>` on pointers is not
+        (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
+        | (RegState::PtrToCtx, RegState::PtrToCtx)
+        | (RegState::PtrToMap, RegState::PtrToMap)
+        | (RegState::PtrToMapValue, RegState::PtrToMapValue)
+        | (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => match op {
+            CondOp::Eq => vec![(taken_pc, *state), (fall_pc, *state)],
+            CondOp::Gt => {
+                return Err(VerificationFailure::new(
+                    NO_PC,
+                    format!("comparing pointers r{} > r{} is not allowed", dst, src),
+                ));
+            }
+        },
+        // read_reg rejects uninitialized registers before we get here
+        (RegState::Uninit, _) | (_, RegState::Uninit) => {
+            unreachable!("read_reg rejects uninitialized registers")
+        }
+        // scalar vs pointer, or pointers of different types
+        _ => {
+            return Err(VerificationFailure::new(
+                NO_PC,
+                format!(
+                    "invalid comparison of r{} with r{} (different types)",
+                    dst, src
+                ),
+            ));
+        }
+    };
+
+    Ok(out)
+}
+
+/// Does `old` subsume `new`, i.e. is `new` strictly more specific?
+///
+/// A subsumed state needs no analysis: step() and successors() are
+/// monotone, so every outcome reachable from `new` is also reachable
+/// from `old`, and `old` has already been analyzed (#26).
+fn subsumes(old: &VerifierState, new: &VerifierState) -> bool {
+    old.regs
+        .iter()
+        .zip(&new.regs)
+        .all(|(old, new)| reg_subsumes(*old, *new))
+        && old.stack == new.stack
+}
+
+/// Per-register part of `subsumes`: the old range must contain the new one.
+fn reg_subsumes(old: RegState, new: RegState) -> bool {
+    match (old, new) {
+        (RegState::Uninit, RegState::Uninit) => true,
+        (
+            RegState::Scalar {
+                min: old_min,
+                max: old_max,
+            },
+            RegState::Scalar {
+                min: new_min,
+                max: new_max,
+            },
+        ) => old_min <= new_min && old_max >= new_max,
+        (
+            RegState::PtrToStack { offset: old_offset },
+            RegState::PtrToStack { offset: new_offset },
+        ) => old_offset == new_offset,
+        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (RegState::PtrToMap, RegState::PtrToMap) => true,
+        (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
+        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => true,
+        // a nullable pointer is a superset of the non-null one
+        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValue) => true,
+        // different types are never comparable
+        _ => false,
+    }
+}
+
+/// Bounds for the exploration (#32): exceeding either rejects the
+/// program with a complexity error, mirroring the kernel's
+/// BPF_COMPLEXITY_LIMIT_* checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifierLimits {
+    /// Maximum number of distinct (pc, state) pairs analyzed.
+    max_states: usize,
+    /// Maximum number of worklist steps (states popped).
+    max_steps: usize,
+}
+
+impl Default for VerifierLimits {
+    fn default() -> Self {
+        Self {
+            max_states: 1024,
+            max_steps: 100_000,
+        }
+    }
+}
+
+/// Path-sensitive verification: explore every execution path with a
+/// worklist until it is empty.
+///
+/// - states are processed LIFO (depth-first), like the kernel's
+///   push_stack/pop_stack verifier stack
+/// - a state is analyzed at most once per pc: a new state is skipped
+///   when an already-analyzed state subsumes it (cf. the kernel's
+///   is_state_visited / states_equal); step() and successors() are
+///   monotone, so the subsumed state cannot reach a new outcome — the
+///   first defense against state explosion (#25/#26)
+/// - every path must reach `exit` with R0 initialized (cf. the kernel's
+///   R0 !read_ok check at exit)
+/// - branches ruled out by the static verdict (#24) are never explored
+/// - termination is guaranteed because the nano pass (#6) rejects loops,
+///   so the CFG is acyclic; the exploration is additionally bounded by
+///   `limits` (#32)
+///
+/// Returns the number of distinct (pc, state) pairs analyzed.
+fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
+    verify_mini_with_limits(program, &VerifierLimits::default())
+}
+
+/// `verify_mini` with explicit exploration limits (#32).
+fn verify_mini_with_limits(
+    program: &[BpfInsn],
+    limits: &VerifierLimits,
+) -> Result<usize, VerificationFailure> {
+    let mut worklist = vec![WorkItem {
+        pc: 0,
+        state: VerifierState::initial(),
+    }];
+    // states already analyzed at each pc: a new state is skipped when an
+    // analyzed one subsumes it, like the kernel's per-pc state list
+    let mut visited: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+    let mut explored = 0usize;
+    let mut steps = 0usize;
+
+    while let Some(item) = worklist.pop() {
+        // worklist bound: every pop counts, even skipped ones
+        steps += 1;
+        if steps > limits.max_steps {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!(
+                    "verification complexity limit exceeded (max_steps {})",
+                    limits.max_steps
+                ),
+            ));
+        }
+
+        // skip states subsumed by an already-analyzed state at this pc
+        let seen = visited.entry(item.pc).or_default();
+        if seen.iter().any(|old| subsumes(old, &item.state)) {
+            continue;
+        }
+        seen.push(item.state);
+        explored += 1;
+        // analyzed-state bound: this is where pruning pays off — without
+        // subsumption (#26), diamond chains would hit this limit fast
+        if explored > limits.max_states {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!(
+                    "verification complexity limit exceeded (max_states {})",
+                    limits.max_states
+                ),
+            ));
+        }
+
+        let insn = program.get(item.pc as usize).ok_or_else(|| {
+            VerificationFailure::new(item.pc, "internal error: pc out of program range")
+        })?;
+
+        // a path ends at exit; R0 must hold a valid value there
+        if matches!(insn, BpfInsn::Exit) {
+            read_reg(&item.state, 0)
+                .map_err(|_| VerificationFailure::new(item.pc, "r0 is uninitialized at exit"))?;
+            continue;
+        }
+
+        for (next_pc, next_state) in successors(item.pc, insn, &item.state)? {
+            worklist.push(WorkItem {
+                pc: next_pc,
+                state: next_state,
+            });
+        }
+    }
+    Ok(explored)
 }
 
 /// Validate and register a single call target as a subprogram entry point.
@@ -564,7 +1176,11 @@ fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
     let mut subprogs = vec![0u32];
 
     for (idx, insn) in insns.iter().enumerate() {
-        if let BpfInsn::Call { imm } = insn {
+        // helper calls use negative immediates (kernel convention) and
+        // are not subprograms
+        if let BpfInsn::Call { imm } = insn
+            && *imm >= 0
+        {
             register_subprog(idx as u32, *imm, insn_cnt, &mut subprogs)?;
         }
     }
@@ -640,8 +1256,12 @@ fn visit_insn(
             }
             vec![target, idx + 1]
         }
-        // subprogram call — callee entry + return address
+        // subprogram call (imm >= 0) — callee entry + return address;
+        // helper calls (imm < 0, kernel convention) fall straight through
         BpfInsn::Call { imm } => {
+            if *imm < 0 {
+                return Ok(vec![idx + 1]);
+            }
             let target = *imm as u32;
             if target >= insn_cnt {
                 return Err(VerificationFailure::new(
@@ -807,6 +1427,10 @@ impl BpfVerifierEnv {
 
     /// Run verification. A verification failure is not an error —
     /// it is returned as Ok(Verdict::Unsafe(...)).
+    /// Run the full verification pipeline: structural checks (nano),
+    /// then path-sensitive exploration (mini — the most advanced pass,
+    /// which includes the micro abstract execution). A verification
+    /// failure is not an error — it is returned as Ok(Verdict::Unsafe).
     fn verify(&mut self) -> Result<Verdict> {
         let subprogs = match add_subprog(&self.prog.insns) {
             Ok(subprogs) => subprogs,
@@ -815,7 +1439,12 @@ impl BpfVerifierEnv {
         self.prog.subprogs = subprogs;
 
         match check_cfg(&self.prog.insns, &self.prog.subprogs) {
-            Ok(()) => Ok(Verdict::Safe),
+            Ok(()) => {}
+            Err(failure) => return Ok(Verdict::Unsafe(failure)),
+        }
+
+        match verify_mini(&self.prog.insns) {
+            Ok(_) => Ok(Verdict::Safe),
             Err(failure) => Ok(Verdict::Unsafe(failure)),
         }
     }
