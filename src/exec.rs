@@ -4,7 +4,7 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    RegState, STACK_SIZE, StackSlot, VerifierState, check_reg, read_reg, read_scalar,
+    RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg, read_reg, read_scalar,
     stack_slot_index,
 };
 
@@ -46,14 +46,12 @@ pub(crate) fn step(
     insn: &BpfInsn,
 ) -> Result<VerifierState, VerificationFailure> {
     match insn {
-        // rX = imm → constant scalar
+        // rX = imm → constant scalar (both interpretations carry the
+        // same bits: -1 is -1 signed and u64::MAX unsigned, #40)
         BpfInsn::MovImm { dst, imm } => {
             check_reg(pc, *dst)?;
             let mut next = *state;
-            next.regs[*dst as usize] = RegState::Scalar {
-                min: *imm as i64,
-                max: *imm as i64,
-            };
+            next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::constant(*imm as i64));
             Ok(next)
         }
         // rX = rY → copy the source's abstract state;
@@ -197,16 +195,10 @@ fn alu_imm(
     }
     let dst_state = read_reg(pc, state, dst)?;
     match dst_state {
-        RegState::Scalar { min, max } => {
-            let (nmin, nmax) = match width {
-                AluWidth::W64 => alu64(op, min, max, imm as i64, imm as i64),
-                AluWidth::W32 => alu32(op, min, max, imm as i64, imm as i64),
-            };
+        RegState::Scalar(d) => {
+            let next_bounds = apply_alu(op, width, d, ScalarBounds::constant(imm as i64));
             let mut next = *state;
-            next.regs[dst as usize] = RegState::Scalar {
-                min: nmin,
-                max: nmax,
-            };
+            next.regs[dst as usize] = RegState::Scalar(next_bounds);
             Ok(next)
         }
         // PtrToStack + imm => PtrToStack at the shifted offset;
@@ -277,8 +269,8 @@ fn alu_reg(
 ) -> Result<VerifierState, VerificationFailure> {
     check_reg(pc, dst)?;
     let dst_state = read_reg(pc, state, dst)?;
-    let (dmin, dmax) = match dst_state {
-        RegState::Scalar { min, max } => (min, max),
+    let d = match dst_state {
+        RegState::Scalar(bounds) => bounds,
         _ => {
             return Err(VerificationFailure::new(
                 pc,
@@ -289,52 +281,122 @@ fn alu_reg(
             ));
         }
     };
-    let (smin, smax) = read_scalar(pc, state, src)?;
+    let s = read_scalar(pc, state, src)?;
     // shifts require a provable amount in 0..64 (kernel check_alu_op)
     if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
-        check_shift_amount(pc, smin, smax)?;
+        check_shift_amount(pc, s)?;
     }
-    let (nmin, nmax) = match width {
-        AluWidth::W64 => alu64(op, dmin, dmax, smin, smax),
-        AluWidth::W32 => alu32(op, dmin, dmax, smin, smax),
-    };
+    let next_bounds = apply_alu(op, width, d, s);
     let mut next = *state;
-    next.regs[dst as usize] = RegState::Scalar {
-        min: nmin,
-        max: nmax,
-    };
+    next.regs[dst as usize] = RegState::Scalar(next_bounds);
     Ok(next)
 }
 
+/// Apply an ALU operation to scalar bounds: both interpretations are
+/// updated (#40). Exact constants propagate bit-exactly; ranges get a
+/// sound per-family over-approximation; ALU32 truncates to 32 bits and
+/// zero-extends (the result always lies in `[0, 0xFFFFFFFF]`). The result
+/// is re-synced (kernel reg_bounds_sync) so the two interpretations stay
+/// consistent.
+fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> ScalarBounds {
+    // exact constants propagate bit-exactly in both interpretations
+    if d.is_constant() && s.is_constant() {
+        let bits = match width {
+            AluWidth::W64 => alu_const64(op, d.smin as u64, s.smin as u64),
+            AluWidth::W32 => alu_const32(op, d.smin as u64, s.smin as u64),
+        };
+        return ScalarBounds::constant(bits as i64);
+    }
+    match width {
+        AluWidth::W64 => {
+            let (sm, sx) = alu64_signed(op, d.signed(), s.signed());
+            // the shift amount is validated on the signed family; the
+            // unsigned family uses the same amount range
+            let amount = if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
+                (s.smin as u64, s.smax as u64)
+            } else {
+                s.unsigned()
+            };
+            let (um, ux) = alu64_unsigned(op, d.unsigned(), amount);
+            ScalarBounds {
+                smin: sm,
+                smax: sx,
+                umin: um,
+                umax: ux,
+            }
+            .synced()
+        }
+        // ALU32 with a non-constant operand: the truncated result is
+        // zero-extended, so the full 32-bit range is sound (the precise
+        // truncation of ranges lands in #41)
+        AluWidth::W32 => ScalarBounds {
+            smin: 0,
+            smax: 0xFFFF_FFFF,
+            umin: 0,
+            umax: 0xFFFF_FFFF,
+        },
+    }
+}
+
+/// Exact 64-bit ALU on constant bits (wrapping is exact bit arithmetic).
+/// Shift amounts are validated by the caller.
+fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
+    match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub => a.wrapping_sub(b),
+        AluOp::And => a & b,
+        AluOp::Or => a | b,
+        AluOp::Xor => a ^ b,
+        AluOp::Lsh => a.wrapping_shl(b as u32),
+        AluOp::Rsh => a.wrapping_shr(b as u32),
+        AluOp::Arsh => ((a as i64) >> b) as u64,
+    }
+}
+
+/// Exact 32-bit ALU on constant bits: truncate, compute, zero-extend.
+fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
+    let a = a as u32;
+    let b = b as u32;
+    let r = match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub => a.wrapping_sub(b),
+        AluOp::And => a & b,
+        AluOp::Or => a | b,
+        AluOp::Xor => a ^ b,
+        AluOp::Lsh => a.checked_shl(b).unwrap_or(0),
+        AluOp::Rsh => a.checked_shr(b).unwrap_or(0),
+        AluOp::Arsh => (a as i32)
+            .checked_shr(b)
+            .unwrap_or(if (a as i32) < 0 { -1 } else { 0 }) as u32,
+    };
+    r as u64
+}
+
 /// Validate a shift amount: the kernel rejects shifts that are not provably
-/// in `0..64` (check_alu_op's "invalid shift").
-fn check_shift_amount(pc: u32, min: i64, max: i64) -> Result<(), VerificationFailure> {
-    if min < 0 || max >= 64 {
+/// in `0..64` (check_alu_op's "invalid shift"). Both interpretations are
+/// consulted so a diverged state cannot smuggle an invalid amount.
+fn check_shift_amount(pc: u32, s: ScalarBounds) -> Result<(), VerificationFailure> {
+    if s.smin < 0 || s.smax >= 64 || s.umax >= 64 {
         return Err(VerificationFailure::new(
             pc,
-            format!("invalid shift amount range [{}, {}]", min, max),
+            format!("invalid shift amount range [{}, {}]", s.smin, s.smax),
         ));
     }
     Ok(())
 }
 
-/// 64-bit ALU range arithmetic (#39).
+/// 64-bit signed-family range arithmetic (#39, the signed view of #40).
 ///
-/// Constants (min == max) propagate exactly; ranges get a sound
-/// over-approximation where an exact interval is not easy to derive. The
-/// deep semantics (dual signed/unsigned ranges, ALU32 ranges, tnum,
-/// overflow handling) land in the follow-up issues #40..#43.
-fn alu64(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64, i64) {
+/// Constants propagate exactly; ranges get a sound over-approximation
+/// where an exact interval is not easy to derive. Overflow handling
+/// lands in #43. Shift amounts are validated by the caller.
+fn alu64_signed(op: AluOp, d: (i64, i64), s: (i64, i64)) -> (i64, i64) {
+    let (dmin, dmax) = d;
+    let (smin, smax) = s;
     // constants propagate exactly (wrapping is exact bit arithmetic)
     if dmin == dmax && smin == smax {
-        return match op {
-            AluOp::Add => (dmin.wrapping_add(smin), dmin.wrapping_add(smin)),
-            AluOp::Sub => (dmin.wrapping_sub(smin), dmin.wrapping_sub(smin)),
-            AluOp::And => (dmin & smin, dmin & smin),
-            AluOp::Or => (dmin | smin, dmin | smin),
-            AluOp::Xor => (dmin ^ smin, dmin ^ smin),
-            AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift64_const(op, dmin, smin),
-        };
+        let bits = alu_const64(op, dmin as u64, smin as u64);
+        return (bits as i64, bits as i64);
     }
     match op {
         AluOp::Add => (dmin.wrapping_add(smin), dmax.wrapping_add(smax)),
@@ -369,19 +431,37 @@ fn alu64(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64, i64) {
     }
 }
 
-/// Shift a constant (exact). `k` is validated by the caller.
-fn shift64_const(op: AluOp, value: i64, k: i64) -> (i64, i64) {
-    let k = k as u32;
-    let r = match op {
-        AluOp::Lsh => (value as u64).wrapping_shl(k) as i64,
-        AluOp::Rsh => (value as u64).wrapping_shr(k) as i64,
-        // arithmetic shift (Rust's >> on i64)
-        AluOp::Arsh => value
-            .checked_shr(k)
-            .unwrap_or(if value < 0 { -1 } else { 0 }),
-        _ => unreachable!("shift64_const only handles shifts"),
-    };
-    (r, r)
+/// 64-bit unsigned-family range arithmetic (the u64 view, #40). The
+/// shift amount range is passed in by the caller (validated on the
+/// signed family).
+fn alu64_unsigned(op: AluOp, d: (u64, u64), s: (u64, u64)) -> (u64, u64) {
+    let (dmin, dmax) = d;
+    let (smin, smax) = s;
+    match op {
+        AluOp::Add => (dmin.wrapping_add(smin), dmax.wrapping_add(smax)),
+        AluOp::Sub => (dmin.wrapping_sub(smax), dmax.wrapping_sub(smin)),
+        // u64 values are never negative: AND clears bits, OR sets them,
+        // XOR is unbounded below the mask
+        AluOp::And => (0, dmax.min(smax)),
+        AluOp::Or => (dmin.max(smin), u64::MAX),
+        AluOp::Xor => (0, u64::MAX),
+        AluOp::Lsh => {
+            if smin == smax && dmax <= (u64::MAX >> smin as u32) {
+                (dmin << smin as u32, dmax << smin as u32)
+            } else {
+                (0, u64::MAX)
+            }
+        }
+        AluOp::Rsh => {
+            if smin == smax {
+                (dmin >> smin as u32, dmax >> smin as u32)
+            } else {
+                (0, dmax)
+            }
+        }
+        // arithmetic shift on the unsigned view is unbounded
+        AluOp::Arsh => (0, u64::MAX),
+    }
 }
 
 /// Shift a range by a constant shift amount (validated in `0..64`).
@@ -441,48 +521,223 @@ fn shift64_range(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64,
     }
 }
 
-/// 32-bit ALU range arithmetic (#39): operands are truncated to 32 bits
-/// and the result is zero-extended, so it always lies in `[0, 0xFFFFFFFF]`.
-/// Constants propagate exactly; the precise truncation of ranges lands in
-/// #41.
-/// 32-bit ALU range arithmetic (#39): operands are truncated to 32 bits
-/// and the result is zero-extended, so it always lies in `[0, 0xFFFFFFFF]`.
-/// Constants propagate exactly; the precise truncation of ranges lands in
-/// #41. Shift amounts are validated by the caller.
-fn alu32(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64, i64) {
-    if dmin == dmax && smin == smax {
-        let a = dmin as u32;
-        let b = smin as u32;
-        let k = smin as u32;
-        let r = match op {
-            AluOp::Add => a.wrapping_add(b),
-            AluOp::Sub => a.wrapping_sub(b),
-            AluOp::And => a & b,
-            AluOp::Or => a | b,
-            AluOp::Xor => a ^ b,
-            AluOp::Lsh => a.checked_shl(k).unwrap_or(0),
-            AluOp::Rsh => a.checked_shr(k).unwrap_or(0),
-            AluOp::Arsh => (a as i32)
-                .checked_shr(k)
-                .unwrap_or(if (a as i32) < 0 { -1 } else { 0 }) as u32,
-        };
-        return (r as i64, r as i64);
-    }
-    // non-constant operand: the truncated result is zero-extended, so the
-    // full 32-bit range is a sound over-approximation
-    (0, 0xFFFF_FFFF)
+// ── Branch refinement (v0.2 Micro, dual ranges in Meso #40) ────────────────
+
+/// Minimal numeric operations for the refinement equations, shared by
+/// the i64 (signed) and u64 (unsigned) interval families.
+trait WrapInt: Copy + Ord {
+    const MIN: Self;
+    const MAX: Self;
+    const ONE: Self;
+    fn wrapping_add(self, rhs: Self) -> Self;
+    fn wrapping_sub(self, rhs: Self) -> Self;
 }
 
-// ── Branch refinement (v0.2 Micro, extended in Meso #39) ────────────────────
+impl WrapInt for i64 {
+    const MIN: Self = i64::MIN;
+    const MAX: Self = i64::MAX;
+    const ONE: Self = 1;
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        self.wrapping_sub(rhs)
+    }
+}
 
-/// A scalar value range [min, max].
-pub(crate) type ScalarRange = (i64, i64);
+impl WrapInt for u64 {
+    const MIN: Self = u64::MIN;
+    const MAX: Self = u64::MAX;
+    const ONE: Self = 1;
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        self.wrapping_sub(rhs)
+    }
+}
+
+/// Ordered comparison shape without signedness (the kernel equations are
+/// shared by both interval families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrdOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
 
 /// Both operands of a comparison refined for one branch side: (dst, src).
-type RefinedPair = (ScalarRange, ScalarRange);
+type RefinedPair = (ScalarBounds, ScalarBounds);
 
 /// Refinement result of a comparison: (true branch, false branch).
 type RefinedBranches = (RefinedPair, RefinedPair);
+
+/// Refined intervals of one interval family: (true, false) × (dst, src).
+type RefinedFamily<T> = (((T, T), (T, T)), ((T, T), (T, T)));
+
+/// The kernel's refinement equations (reg_set_min_max / inv) for one
+/// ordered comparison on one interval family.
+fn refine_ordered<T: WrapInt>(op: OrdOp, dst: (T, T), src: (T, T)) -> RefinedFamily<T> {
+    match op {
+        // true: dst > src → dst >= src.min + 1, src <= dst.max - 1
+        // false: dst <= src → dst <= src.max, src >= dst.min
+        OrdOp::Gt => {
+            let true_dst = (dst.0.max(src.0.wrapping_add(T::ONE)), dst.1);
+            let true_src = (src.0, src.1.min(dst.1.wrapping_sub(T::ONE)));
+            let false_dst = (dst.0, dst.1.min(src.1));
+            let false_src = (src.0.max(dst.0), src.1);
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst >= src → dst >= src.min, src <= dst.max
+        // false: dst < src → dst <= src.min - 1, src >= dst.min + 1
+        OrdOp::Ge => {
+            let true_dst = (dst.0.max(src.0), dst.1);
+            let true_src = (src.0, src.1.min(dst.1));
+            let false_dst = (dst.0, dst.1.min(src.0.wrapping_sub(T::ONE)));
+            let false_src = (src.0.max(dst.0.wrapping_add(T::ONE)), src.1);
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst < src → dst <= src.max - 1, src >= dst.min + 1
+        // false: dst >= src → dst >= src.min, src <= dst.max
+        OrdOp::Lt => {
+            let true_dst = (dst.0, dst.1.min(src.1.wrapping_sub(T::ONE)));
+            let true_src = (src.0.max(dst.0.wrapping_add(T::ONE)), src.1);
+            let false_dst = (dst.0.max(src.0), dst.1);
+            let false_src = (src.0, src.1.min(dst.1));
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+        // true: dst <= src → dst <= src.max, src >= dst.min
+        // false: dst > src → dst >= src.min + 1, src <= dst.max - 1
+        OrdOp::Le => {
+            let true_dst = (dst.0, dst.1.min(src.1));
+            let true_src = (src.0.max(dst.0), src.1);
+            let false_dst = (dst.0.max(src.0.wrapping_add(T::ONE)), dst.1);
+            let false_src = (src.0, src.1.min(dst.1.wrapping_sub(T::ONE)));
+            ((true_dst, true_src), (false_dst, false_src))
+        }
+    }
+}
+
+/// Refine two scalar bounds for both branch sides of `dst OP src`.
+///
+/// The opcode family decides which interval family is narrowed (kernel
+/// regs_refine_cond_op): unsigned compares narrow `umin`/`umax`, signed
+/// compares narrow `smin`/`smax`; equality and inequality narrow both.
+/// Every refined state is re-synced so the interpretations stay
+/// consistent (kernel reg_bounds_sync). A refined range with min > max
+/// means the branch is infeasible.
+pub(crate) fn refine_cmp(op: CondOp, dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    match op {
+        CondOp::Eq => refine_eq(dst, src),
+        CondOp::Ne => refine_ne(dst, src),
+        _ => {
+            let ord = op.ord().expect("ordered comparison");
+            if op.is_signed() {
+                let ((td, ts), (fd, fs)) = refine_ordered(ord, dst.signed(), src.signed());
+                (
+                    (with_signed(dst, td).synced(), with_signed(src, ts).synced()),
+                    (with_signed(dst, fd).synced(), with_signed(src, fs).synced()),
+                )
+            } else {
+                let ((td, ts), (fd, fs)) = refine_ordered(ord, dst.unsigned(), src.unsigned());
+                (
+                    (
+                        with_unsigned(dst, td).synced(),
+                        with_unsigned(src, ts).synced(),
+                    ),
+                    (
+                        with_unsigned(dst, fd).synced(),
+                        with_unsigned(src, fs).synced(),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+fn with_signed(b: ScalarBounds, r: (i64, i64)) -> ScalarBounds {
+    let mut b = b;
+    b.smin = r.0;
+    b.smax = r.1;
+    b
+}
+
+fn with_unsigned(b: ScalarBounds, r: (u64, u64)) -> ScalarBounds {
+    let mut b = b;
+    b.umin = r.0;
+    b.umax = r.1;
+    b
+}
+
+/// Refine two scalar bounds on the `dst == src` comparison.
+///
+/// - true branch: both operands take the intersection of the two bounds
+///   per interval family (min > max means the branch is infeasible)
+/// - false branch: a single interval cannot represent the complement of
+///   another interval, so no safe narrowing is possible — both are kept
+pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    let inter = ScalarBounds {
+        smin: dst.smin.max(src.smin),
+        smax: dst.smax.min(src.smax),
+        umin: dst.umin.max(src.umin),
+        umax: dst.umax.min(src.umax),
+    };
+    ((inter, inter), (dst, src))
+}
+
+/// Narrow `a` by excluding `b`'s values, when the complement is still a
+/// single interval. `None` means no narrowing is representable.
+fn exclude_interval<T: WrapInt>(a: (T, T), b: (T, T)) -> Option<(T, T)> {
+    // b covers everything of a → the branch is infeasible (empty range)
+    if b.0 <= a.0 && b.1 >= a.1 {
+        return Some((T::MAX, T::MIN));
+    }
+    // b sits at the low end of a → a ∈ [b.1 + 1, a.1]
+    if b.0 <= a.0 {
+        return Some((b.1.wrapping_add(T::ONE), a.1));
+    }
+    // b sits at the high end of a → a ∈ [a.0, b.0 - 1]
+    if b.1 >= a.1 {
+        return Some((a.0, b.0.wrapping_sub(T::ONE)));
+    }
+    // b is strictly inside a → the complement is two intervals
+    None
+}
+
+/// Narrow every interval family of `a` by excluding `b`'s values where
+/// a single interval still represents the complement.
+fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
+    let s = exclude_interval(a.signed(), b.signed()).unwrap_or(a.signed());
+    let u = exclude_interval(a.unsigned(), b.unsigned()).unwrap_or(a.unsigned());
+    ScalarBounds {
+        smin: s.0,
+        smax: s.1,
+        umin: u.0,
+        umax: u.1,
+    }
+}
+
+/// Refine two scalar bounds on the `dst != src` comparison.
+///
+/// - true branch: each operand excludes the other's bounds, where a
+///   single interval still represents the complement
+/// - false branch: both operands take the intersection (equality)
+pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches {
+    let inter = ScalarBounds {
+        smin: dst.smin.max(src.smin),
+        smax: dst.smax.min(src.smax),
+        umin: dst.umin.max(src.umin),
+        umax: dst.umax.min(src.umax),
+    };
+    (
+        (
+            exclude_bounds(dst, src).synced(),
+            exclude_bounds(src, dst).synced(),
+        ),
+        (inter, inter),
+    )
+}
 
 /// The conditional comparisons of the mini/meso subset.
 ///
@@ -518,216 +773,22 @@ impl CondOp {
             CondOp::Ule | CondOp::Sle => "<=",
         }
     }
-}
 
-/// Refine two scalar ranges on `dst OP src` for both branch sides
-/// (cf. the kernel's reg_set_min_max / reg_set_min_max_inv).
-///
-/// - signed comparisons: the kernel equations on i64
-/// - unsigned comparisons: the same equations, but only when both ranges
-///   are fully non-negative — a range containing negatives has no single
-///   u64 interval representation, so no narrowing is possible (a sound
-///   over-approximation; the dual-range representation in #40 removes
-///   this restriction)
-/// - equality: intersection; inequality: the complement where a single
-///   interval still represents it
-///
-/// A refined range with min > max means the branch is infeasible.
-pub(crate) fn refine_cmp(op: CondOp, dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    match op {
-        CondOp::Eq => refine_eq(dst, src),
-        CondOp::Ne => refine_ne(dst, src),
-        CondOp::Ugt | CondOp::Uge | CondOp::Ult | CondOp::Ule => {
-            // the u64 view is a single interval for fully non-negative and
-            // fully negative ranges; a range straddling zero wraps and
-            // cannot be narrowed (sound over-approximation — the dual-range
-            // representation in #40 removes this restriction)
-            match (to_u64_interval(dst), to_u64_interval(src)) {
-                (Some(d), Some(s)) => {
-                    let refined = refine_unsigned_cmp(op, d, s);
-                    match (
-                        from_u64_interval(refined.0.0),
-                        from_u64_interval(refined.0.1),
-                        from_u64_interval(refined.1.0),
-                        from_u64_interval(refined.1.1),
-                    ) {
-                        (Some(td), Some(ts), Some(fd), Some(fs)) => ((td, ts), (fd, fs)),
-                        // a refinement crossed the sign half: keep the
-                        // original ranges (no narrowing)
-                        _ => ((dst, src), (dst, src)),
-                    }
-                }
-                _ => ((dst, src), (dst, src)),
-            }
+    /// The ordered comparison shape, or `None` for equality/inequality.
+    pub(crate) fn ord(self) -> Option<OrdOp> {
+        match self {
+            CondOp::Ugt | CondOp::Sgt => Some(OrdOp::Gt),
+            CondOp::Uge | CondOp::Sge => Some(OrdOp::Ge),
+            CondOp::Ult | CondOp::Slt => Some(OrdOp::Lt),
+            CondOp::Ule | CondOp::Sle => Some(OrdOp::Le),
+            CondOp::Eq | CondOp::Ne => None,
         }
-        CondOp::Sgt | CondOp::Sge | CondOp::Slt | CondOp::Sle => refine_signed_cmp(op, dst, src),
     }
-}
 
-/// An i64 range as a single u64 interval: fully non-negative ranges keep
-/// their order, fully negative ranges reverse it (the u64 view of a
-/// negative i64 is large). Ranges straddling zero return `None` — the u64
-/// view wraps into two intervals.
-fn to_u64_interval(r: ScalarRange) -> Option<(u64, u64)> {
-    let (min, max) = r;
-    if min >= 0 {
-        Some((min as u64, max as u64))
-    } else if max < 0 {
-        Some((max as u64, min as u64))
-    } else {
-        None
+    /// Whether this opcode belongs to the signed family (JSGT/JSGE/…).
+    pub(crate) fn is_signed(self) -> bool {
+        matches!(self, CondOp::Sgt | CondOp::Sge | CondOp::Slt | CondOp::Sle)
     }
-}
-
-/// A u64 interval back to i64, when it stays within one sign half (a
-/// crossing interval has no i64 single-interval representation).
-fn from_u64_interval(r: (u64, u64)) -> Option<ScalarRange> {
-    let (lo, hi) = r;
-    if hi < (1 << 63) || lo >= (1 << 63) {
-        Some((lo as i64, hi as i64))
-    } else {
-        None
-    }
-}
-
-/// A u64 interval [min, max].
-type U64Range = (u64, u64);
-
-/// Both u64 operands of a comparison refined for one branch side: (dst, src).
-type U64RefinedPair = (U64Range, U64Range);
-
-/// The unsigned refinement equations on u64 intervals.
-fn refine_unsigned_cmp(
-    op: CondOp,
-    dst: U64Range,
-    src: U64Range,
-) -> (U64RefinedPair, U64RefinedPair) {
-    match op {
-        // true: dst > src → dst >= src.min + 1, src <= dst.max - 1
-        // false: dst <= src → dst <= src.max, src >= dst.min
-        CondOp::Ugt => {
-            let true_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
-            let true_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
-            let false_dst = (dst.0, dst.1.min(src.1));
-            let false_src = (src.0.max(dst.0), src.1);
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst >= src → dst >= src.min, src <= dst.max
-        // false: dst < src → dst <= src.min - 1, src >= dst.min + 1
-        CondOp::Uge => {
-            let true_dst = (dst.0.max(src.0), dst.1);
-            let true_src = (src.0, src.1.min(dst.1));
-            let false_dst = (dst.0, dst.1.min(src.0.wrapping_sub(1)));
-            let false_src = (src.0.max(dst.0.wrapping_add(1)), src.1);
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst < src → dst <= src.max - 1, src >= dst.min + 1
-        // false: dst >= src → dst >= src.min, src <= dst.max
-        CondOp::Ult => {
-            let true_dst = (dst.0, dst.1.min(src.1.wrapping_sub(1)));
-            let true_src = (src.0.max(dst.0.wrapping_add(1)), src.1);
-            let false_dst = (dst.0.max(src.0), dst.1);
-            let false_src = (src.0, src.1.min(dst.1));
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst <= src → dst <= src.max, src >= dst.min
-        // false: dst > src → dst >= src.min + 1, src <= dst.max - 1
-        CondOp::Ule => {
-            let true_dst = (dst.0, dst.1.min(src.1));
-            let true_src = (src.0.max(dst.0), src.1);
-            let false_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
-            let false_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        _ => unreachable!("refine_unsigned_cmp handles only unsigned compares"),
-    }
-}
-
-/// The kernel's refinement equations for one (signed) comparison. For
-/// non-negative operands the unsigned and signed views coincide, so the
-/// unsigned family reuses this with its own bounds.
-fn refine_signed_cmp(op: CondOp, dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    match op {
-        // true: dst > src → dst >= src.min + 1, src <= dst.max - 1
-        // false: dst <= src → dst <= src.max, src >= dst.min
-        CondOp::Sgt | CondOp::Ugt => {
-            let true_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
-            let true_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
-            let false_dst = (dst.0, dst.1.min(src.1));
-            let false_src = (src.0.max(dst.0), src.1);
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst >= src → dst >= src.min, src <= dst.max
-        // false: dst < src → dst <= src.min - 1, src >= dst.min + 1
-        CondOp::Sge | CondOp::Uge => {
-            let true_dst = (dst.0.max(src.0), dst.1);
-            let true_src = (src.0, src.1.min(dst.1));
-            let false_dst = (dst.0, dst.1.min(src.0.wrapping_sub(1)));
-            let false_src = (src.0.max(dst.0.wrapping_add(1)), src.1);
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst < src → dst <= src.max - 1, src >= dst.min + 1
-        // false: dst >= src → dst >= src.min, src <= dst.max
-        CondOp::Slt | CondOp::Ult => {
-            let true_dst = (dst.0, dst.1.min(src.1.wrapping_sub(1)));
-            let true_src = (src.0.max(dst.0.wrapping_add(1)), src.1);
-            let false_dst = (dst.0.max(src.0), dst.1);
-            let false_src = (src.0, src.1.min(dst.1));
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        // true: dst <= src → dst <= src.max, src >= dst.min
-        // false: dst > src → dst >= src.min + 1, src <= dst.max - 1
-        CondOp::Sle | CondOp::Ule => {
-            let true_dst = (dst.0, dst.1.min(src.1));
-            let true_src = (src.0.max(dst.0), src.1);
-            let false_dst = (dst.0.max(src.0.wrapping_add(1)), dst.1);
-            let false_src = (src.0, src.1.min(dst.1.wrapping_sub(1)));
-            ((true_dst, true_src), (false_dst, false_src))
-        }
-        CondOp::Eq | CondOp::Ne => unreachable!("refine_signed_cmp handles only ordered compares"),
-    }
-}
-
-/// Refine two scalar ranges on the `dst == src` comparison.
-///
-/// - true branch: both operands take the intersection of the two ranges
-///   (min > max means the branch is infeasible)
-/// - false branch: a single interval cannot represent the complement of
-///   another interval, so no safe narrowing is possible — both are kept
-pub(crate) fn refine_eq(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    let inter = (dst.0.max(src.0), dst.1.min(src.1));
-    ((inter, inter), (dst, src))
-}
-
-/// Narrow `a` by excluding the values of `b`, when the complement is
-/// still a single interval. `None` means no narrowing is representable.
-fn exclude_interval(a: ScalarRange, b: ScalarRange) -> Option<ScalarRange> {
-    // b covers everything of a → the branch is infeasible (empty range)
-    if b.0 <= a.0 && b.1 >= a.1 {
-        return Some((i64::MAX, i64::MIN));
-    }
-    // b sits at the low end of a → a ∈ [b.1 + 1, a.1]
-    if b.0 <= a.0 {
-        return Some((b.1 + 1, a.1));
-    }
-    // b sits at the high end of a → a ∈ [a.0, b.0 - 1]
-    if b.1 >= a.1 {
-        return Some((a.0, b.0 - 1));
-    }
-    // b is strictly inside a → the complement is two intervals
-    None
-}
-
-/// Refine two scalar ranges on the `dst != src` comparison.
-///
-/// - true branch: each operand excludes the other's range, where a single
-///   interval still represents the complement
-/// - false branch: both operands take the intersection (equality)
-pub(crate) fn refine_ne(dst: ScalarRange, src: ScalarRange) -> RefinedBranches {
-    let inter = (dst.0.max(src.0), dst.1.min(src.1));
-    let true_dst = exclude_interval(dst, src).unwrap_or(dst);
-    let true_src = exclude_interval(src, dst).unwrap_or(src);
-    ((true_dst, true_src), (inter, inter))
 }
 
 // ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
@@ -755,11 +816,11 @@ pub(crate) enum BranchVerdict {
     Unknown,
 }
 
-/// The signed verdict for one ordered comparison (the unsigned family is
-/// the same on non-negative ranges).
-fn ordered_verdict(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerdict {
+/// The static verdict for one ordered comparison on one interval family
+/// (sound for any `Ord` type).
+fn ordered_verdict<T: Ord>(op: OrdOp, dst: (T, T), src: (T, T)) -> BranchVerdict {
     match op {
-        CondOp::Sgt | CondOp::Ugt => {
+        OrdOp::Gt => {
             if dst.0 > src.1 {
                 BranchVerdict::AlwaysTaken
             } else if dst.1 <= src.0 {
@@ -768,7 +829,7 @@ fn ordered_verdict(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerd
                 BranchVerdict::Unknown
             }
         }
-        CondOp::Sge | CondOp::Uge => {
+        OrdOp::Ge => {
             if dst.0 >= src.1 {
                 BranchVerdict::AlwaysTaken
             } else if dst.1 < src.0 {
@@ -777,7 +838,7 @@ fn ordered_verdict(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerd
                 BranchVerdict::Unknown
             }
         }
-        CondOp::Slt | CondOp::Ult => {
+        OrdOp::Lt => {
             if dst.1 < src.0 {
                 BranchVerdict::AlwaysTaken
             } else if dst.0 >= src.1 {
@@ -786,7 +847,7 @@ fn ordered_verdict(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerd
                 BranchVerdict::Unknown
             }
         }
-        CondOp::Sle | CondOp::Ule => {
+        OrdOp::Le => {
             if dst.1 <= src.0 {
                 BranchVerdict::AlwaysTaken
             } else if dst.0 > src.1 {
@@ -795,69 +856,39 @@ fn ordered_verdict(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerd
                 BranchVerdict::Unknown
             }
         }
-        CondOp::Eq | CondOp::Ne => unreachable!("ordered_verdict handles only ordered compares"),
     }
 }
 
-/// The unsigned verdict on u64 intervals (the signed counterpart is
-/// `ordered_verdict` on i64).
-fn ordered_verdict_u64(op: CondOp, dst: (u64, u64), src: (u64, u64)) -> BranchVerdict {
-    match op {
-        CondOp::Ugt => {
-            if dst.0 > src.1 {
-                BranchVerdict::AlwaysTaken
-            } else if dst.1 <= src.0 {
-                BranchVerdict::AlwaysNotTaken
-            } else {
-                BranchVerdict::Unknown
-            }
-        }
-        CondOp::Uge => {
-            if dst.0 >= src.1 {
-                BranchVerdict::AlwaysTaken
-            } else if dst.1 < src.0 {
-                BranchVerdict::AlwaysNotTaken
-            } else {
-                BranchVerdict::Unknown
-            }
-        }
-        CondOp::Ult => {
-            if dst.1 < src.0 {
-                BranchVerdict::AlwaysTaken
-            } else if dst.0 >= src.1 {
-                BranchVerdict::AlwaysNotTaken
-            } else {
-                BranchVerdict::Unknown
-            }
-        }
-        CondOp::Ule => {
-            if dst.1 <= src.0 {
-                BranchVerdict::AlwaysTaken
-            } else if dst.0 > src.1 {
-                BranchVerdict::AlwaysNotTaken
-            } else {
-                BranchVerdict::Unknown
-            }
-        }
-        _ => unreachable!("ordered_verdict_u64 handles only unsigned compares"),
-    }
+/// Whether two ranges of one interval family are disjoint.
+fn ranges_disjoint<T: Ord>(a: (T, T), b: (T, T)) -> bool {
+    a.1 < b.0 || a.0 > b.1
 }
 
 /// Decide whether a conditional branch is statically always taken,
-/// never taken, or unknown for the given scalar ranges (cf. the
+/// never taken, or unknown for the given scalar bounds (cf. the
 /// kernel's is_branch_taken()).
 ///
-/// The unsigned family (JGT/JGE/JLT/JLE) decides on the u64 interval
-/// view; a range straddling zero wraps and yields `Unknown` (a sound
-/// over-approximation; resolved by the dual-range tracking in #40).
-pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) -> BranchVerdict {
+/// Ordered comparisons decide on the opcode's interval family: the
+/// unsigned family (JGT/JGE/JLT/JLE) on `umin`/`umax`, the signed
+/// family (JSGT/JSGE/JSLT/JSLE) on `smin`/`smax`. Equality needs both
+/// families: it always holds only for the same constant, and can never
+/// hold when either family pair is disjoint (sound because a scalar's
+/// value set is contained in both of its intervals; synced states keep
+/// this precise).
+pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarBounds, src: ScalarBounds) -> BranchVerdict {
     match op {
-        // dst == src: always true iff both are the same constant,
-        // always false iff the ranges are disjoint
+        // dst == src: always true iff both are the same constant in both
+        // interpretations, always false iff either family is disjoint
         CondOp::Eq => {
-            if dst.0 == dst.1 && src.0 == src.1 && dst.0 == src.0 {
+            if dst.is_constant()
+                && src.is_constant()
+                && dst.smin == src.smin
+                && dst.umin == src.umin
+            {
                 BranchVerdict::AlwaysTaken
-            } else if dst.1 < src.0 || dst.0 > src.1 {
+            } else if ranges_disjoint(dst.signed(), src.signed())
+                || ranges_disjoint(dst.unsigned(), src.unsigned())
+            {
                 BranchVerdict::AlwaysNotTaken
             } else {
                 BranchVerdict::Unknown
@@ -865,21 +896,28 @@ pub(crate) fn is_branch_taken(op: CondOp, dst: ScalarRange, src: ScalarRange) ->
         }
         // dst != src: the dual of equality
         CondOp::Ne => {
-            if dst.0 == dst.1 && src.0 == src.1 && dst.0 == src.0 {
+            if dst.is_constant()
+                && src.is_constant()
+                && dst.smin == src.smin
+                && dst.umin == src.umin
+            {
                 BranchVerdict::AlwaysNotTaken
-            } else if dst.1 < src.0 || dst.0 > src.1 {
+            } else if ranges_disjoint(dst.signed(), src.signed())
+                || ranges_disjoint(dst.unsigned(), src.unsigned())
+            {
                 BranchVerdict::AlwaysTaken
             } else {
                 BranchVerdict::Unknown
             }
         }
-        CondOp::Ugt | CondOp::Uge | CondOp::Ult | CondOp::Ule => {
-            match (to_u64_interval(dst), to_u64_interval(src)) {
-                (Some(d), Some(s)) => ordered_verdict_u64(op, d, s),
-                _ => BranchVerdict::Unknown,
+        _ => {
+            let ord = op.ord().expect("ordered comparison");
+            if op.is_signed() {
+                ordered_verdict(ord, dst.signed(), src.signed())
+            } else {
+                ordered_verdict(ord, dst.unsigned(), src.unsigned())
             }
         }
-        CondOp::Sgt | CondOp::Sge | CondOp::Slt | CondOp::Sle => ordered_verdict(op, dst, src),
     }
 }
 
@@ -961,42 +999,21 @@ pub(crate) fn cond_branch(
     let fall_pc = pc + 1;
 
     let out = match (dst_state, src_state) {
-        (
-            RegState::Scalar {
-                min: dmin,
-                max: dmax,
-            },
-            RegState::Scalar {
-                min: smin,
-                max: smax,
-            },
-        ) => {
-            let verdict = is_branch_taken(op, (dmin, dmax), (smin, smax));
-            let ((t_dst, t_src), (f_dst, f_src)) = refine_cmp(op, (dmin, dmax), (smin, smax));
+        (RegState::Scalar(d), RegState::Scalar(s)) => {
+            let verdict = is_branch_taken(op, d, s);
+            let ((t_dst, t_src), (f_dst, f_src)) = refine_cmp(op, d, s);
             let mut out = Vec::with_capacity(2);
             // a statically impossible branch is never explored
             if !matches!(verdict, BranchVerdict::AlwaysNotTaken) {
                 let mut taken = *state;
-                taken.regs[dst as usize] = RegState::Scalar {
-                    min: t_dst.0,
-                    max: t_dst.1,
-                };
-                taken.regs[src as usize] = RegState::Scalar {
-                    min: t_src.0,
-                    max: t_src.1,
-                };
+                taken.regs[dst as usize] = RegState::Scalar(t_dst);
+                taken.regs[src as usize] = RegState::Scalar(t_src);
                 out.push((taken_pc, taken));
             }
             if !matches!(verdict, BranchVerdict::AlwaysTaken) {
                 let mut fall = *state;
-                fall.regs[dst as usize] = RegState::Scalar {
-                    min: f_dst.0,
-                    max: f_dst.1,
-                };
-                fall.regs[src as usize] = RegState::Scalar {
-                    min: f_src.0,
-                    max: f_src.1,
-                };
+                fall.regs[dst as usize] = RegState::Scalar(f_dst);
+                fall.regs[src as usize] = RegState::Scalar(f_src);
                 out.push((fall_pc, fall));
             }
             out
@@ -1004,53 +1021,61 @@ pub(crate) fn cond_branch(
         // NULL check: a nullable pointer compared to the constant 0. For
         // `== 0` the taken branch becomes the scalar 0 and the fall-through
         // a valid map value pointer; for `!= 0` the roles are swapped.
-        (RegState::PtrToMapValueOrNull, RegState::Scalar { min: 0, max: 0 })
-        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValueOrNull) => match op {
-            CondOp::Eq | CondOp::Ne => {
-                let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
-                    dst
-                } else {
-                    src
-                };
-                let (null_side, valid_side) = match op {
-                    // == 0: taken is NULL, fall is the valid pointer
-                    CondOp::Eq => (taken_pc, fall_pc),
-                    // != 0: taken is the valid pointer, fall is NULL
-                    CondOp::Ne => (fall_pc, taken_pc),
-                    _ => unreachable!(),
-                };
-                let mut null_state = *state;
-                null_state.regs[ptr_reg as usize] = RegState::Scalar { min: 0, max: 0 };
-                let mut valid = *state;
-                valid.regs[ptr_reg as usize] = RegState::PtrToMapValue;
-                vec![(null_side, null_state), (valid_side, valid)]
+        (RegState::PtrToMapValueOrNull, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull)
+            if s.is_zero() =>
+        {
+            match op {
+                CondOp::Eq | CondOp::Ne => {
+                    let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
+                        dst
+                    } else {
+                        src
+                    };
+                    let (null_side, valid_side) = match op {
+                        // == 0: taken is NULL, fall is the valid pointer
+                        CondOp::Eq => (taken_pc, fall_pc),
+                        // != 0: taken is the valid pointer, fall is NULL
+                        CondOp::Ne => (fall_pc, taken_pc),
+                        _ => unreachable!(),
+                    };
+                    let mut null_state = *state;
+                    null_state.regs[ptr_reg as usize] = RegState::Scalar(ScalarBounds::constant(0));
+                    let mut valid = *state;
+                    valid.regs[ptr_reg as usize] = RegState::PtrToMapValue;
+                    vec![(null_side, null_state), (valid_side, valid)]
+                }
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "invalid comparison of r{} with r{} (different types)",
+                            dst, src
+                        ),
+                    ));
+                }
             }
-            _ => {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "invalid comparison of r{} with r{} (different types)",
-                        dst, src
-                    ),
-                ));
-            }
-        },
+        }
         // a non-null map value pointer compared to 0: equality and
         // inequality are kept without refinement (simplified — the kernel
         // marks the taken branch of == 0 infeasible)
-        (RegState::PtrToMapValue, RegState::Scalar { min: 0, max: 0 })
-        | (RegState::Scalar { min: 0, max: 0 }, RegState::PtrToMapValue) => match op {
-            CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
-            _ => {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "invalid comparison of r{} with r{} (different types)",
-                        dst, src
-                    ),
-                ));
+        (RegState::PtrToMapValue, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValue)
+            if s.is_zero() =>
+        {
+            match op {
+                CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "invalid comparison of r{} with r{} (different types)",
+                            dst, src
+                        ),
+                    ));
+                }
             }
-        },
+        }
         // pointers of the same type: equality and inequality are allowed
         // without refinement; ordered comparisons on pointers are not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
@@ -1104,7 +1129,7 @@ mod tests {
         // Before: R2 = Uninit;  r2 = 10;  After: R2 = Scalar(10..10)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
-        assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(10)));
         // other registers untouched
         assert_eq!(next.regs[1], RegState::PtrToCtx);
         assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
@@ -1115,7 +1140,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
-        assert_eq!(next.regs[2], RegState::Scalar { min: 20, max: 20 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(20)));
     }
 
     #[test]
@@ -1123,7 +1148,7 @@ mod tests {
         // i32 imm is sign-extended into the i64 scalar range
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: -7 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: -7, max: -7 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(-7)));
     }
 
     #[test]
@@ -1131,7 +1156,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovReg { dst: 3, src: 2 }).unwrap();
-        assert_eq!(next.regs[3], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[3], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -1166,7 +1191,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::MovReg { dst: 0, src: 2 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -1203,7 +1228,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 20 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 30, max: 30 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(30)));
     }
 
     #[test]
@@ -1211,7 +1236,7 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: -3 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
     }
 
     #[test]
@@ -1220,9 +1245,9 @@ mod tests {
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 15, max: 15 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(15)));
         // the source register is unchanged
-        assert_eq!(next.regs[2], RegState::Scalar { min: 5, max: 5 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(5)));
     }
 
     #[test]
@@ -1231,26 +1256,32 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 1 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 20, max: 20 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(20)));
     }
 
     #[test]
     fn step_add_imm_range() {
         // range shift, a preview of #16: [0, 100] + 10 → [10, 110]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 10, max: 110 });
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(10, 110))
+        );
     }
 
     #[test]
     fn step_add_reg_ranges() {
         // [0, 100] + [5, 5] → [5, 105]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(5));
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 5, max: 105 });
+        assert_eq!(
+            next.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(5, 105))
+        );
     }
 
     #[test]
@@ -1282,12 +1313,43 @@ mod tests {
     // ── ALU extension (Meso #39) ─────────────────────────────────────────────
 
     #[test]
+    fn step_alu_dual_ranges_propagate() {
+        // r1 = -1; r1 += -1 → -2 in both interpretations (u64 wraps too)
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: -1 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(b.signed(), (-2, -2));
+        assert_eq!(b.unsigned(), (u64::MAX - 1, u64::MAX - 1));
+    }
+
+    #[test]
+    fn step_alu_sync_after_mixed_ops() {
+        // a signed-range operand keeps both families consistent: prandom
+        // then JSLE 100 refines smax and the sync narrows umax too
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
+        let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 100 }).unwrap();
+        let next = step(0, &next, &BpfInsn::SubReg { dst: 1, src: 2 }).unwrap();
+        // [MIN, MAX] - 100 → [MIN, MAX] with wrapped edges synced back
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!(
+            b.signed(),
+            (i64::MIN.wrapping_sub(100), i64::MAX.wrapping_sub(100))
+        );
+    }
+
+    #[test]
     fn step_sub_imm_issue_example() {
         // r1 = 10; r1 -= 3 → R1 = Scalar(7..7)
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let next = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 3 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
     }
 
     #[test]
@@ -1297,7 +1359,7 @@ mod tests {
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 10 }).unwrap();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 20 }).unwrap();
         let next = step(0, &state, &BpfInsn::SubReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: -10, max: -10 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(-10)));
     }
 
     #[test]
@@ -1306,20 +1368,23 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 12 }).unwrap();
         let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 10 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 8, max: 8 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(8)));
         let next = step(0, &next, &BpfInsn::OrImm { dst: 1, imm: 3 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 11, max: 11 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(11)));
         let next = step(0, &next, &BpfInsn::XorImm { dst: 1, imm: 12 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 7, max: 7 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(7)));
     }
 
     #[test]
     fn step_and_reg_tnum_like_precision() {
         // r2 = [0, 100]; r2 &= 1 → the result is bounded by the AND mask
         let mut state = VerifierState::initial();
-        state.regs[2] = RegState::Scalar { min: 0, max: 100 };
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let next = step(0, &state, &BpfInsn::AndImm { dst: 2, imm: 1 }).unwrap();
-        assert_eq!(next.regs[2], RegState::Scalar { min: 0, max: 1 });
+        assert_eq!(
+            next.regs[2],
+            RegState::Scalar(ScalarBounds::from_signed(0, 1))
+        );
     }
 
     #[test]
@@ -1328,16 +1393,16 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
         let next = step(0, &state, &BpfInsn::LshImm { dst: 1, imm: 4 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 16, max: 16 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(16)));
         let next = step(0, &next, &BpfInsn::RshImm { dst: 1, imm: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 4, max: 4 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(4)));
         let next = step(0, &next, &BpfInsn::ArshImm { dst: 1, imm: 1 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 2, max: 2 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(2)));
         // arithmetic shift sign-extends: -8 s>> 1 = -4
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -8 }).unwrap();
         let next = step(0, &state, &BpfInsn::ArshImm { dst: 1, imm: 1 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: -4, max: -4 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(-4)));
     }
 
     #[test]
@@ -1347,7 +1412,7 @@ mod tests {
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 4 }).unwrap();
         let next = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 16, max: 16 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(16)));
     }
 
     #[test]
@@ -1390,14 +1455,11 @@ mod tests {
         let state = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 3 }).unwrap();
         assert_eq!(
             state.regs[1],
-            RegState::Scalar {
-                min: 0x1_0000_0001,
-                max: 0x1_0000_0001
-            }
+            RegState::Scalar(ScalarBounds::constant(0x1_0000_0001))
         );
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
         // the high 32 bits are zero-extended away
-        assert_eq!(next.regs[1], RegState::Scalar { min: 1, max: 1 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(1)));
     }
 
     #[test]
@@ -1406,24 +1468,18 @@ mod tests {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 1 }).unwrap();
-        assert_eq!(next.regs[1], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::constant(0)));
     }
 
     #[test]
     fn step_alu32_range_zero_extended() {
         // a non-constant ALU32 result is zero-extended: [0, 0xFFFFFFFF]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar {
-            min: -100,
-            max: 100,
-        };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-100, 100));
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
         assert_eq!(
             next.regs[1],
-            RegState::Scalar {
-                min: 0,
-                max: 0xFFFF_FFFF
-            }
+            RegState::Scalar(ScalarBounds::from_signed(0, 0xFFFF_FFFF))
         );
     }
 
@@ -1477,8 +1533,8 @@ mod tests {
     fn successors_jne_issue_example() {
         // r1 = 5 != r2 = 7 is always true: only the taken branch
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 5, max: 5 };
-        state.regs[2] = RegState::Scalar { min: 7, max: 7 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(5));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(7));
         let nexts = successors(
             0,
             &BpfInsn::Jne {
@@ -1497,8 +1553,8 @@ mod tests {
     fn successors_jne_refines_equality_side() {
         // r1 = [0, 100] != 42: the fall-through (== 42) keeps both in [42, 42]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 42, max: 42 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(42));
         let nexts = successors(
             0,
             &BpfInsn::Jne {
@@ -1511,17 +1567,23 @@ mod tests {
         .unwrap();
         assert_eq!(nexts.len(), 2);
         // taken: r1 = [0, 100] (complement not representable)
-        assert_eq!(nexts[0].1.regs[1], RegState::Scalar { min: 0, max: 100 });
+        assert_eq!(
+            nexts[0].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 100))
+        );
         // fall: equality narrows to the constant
-        assert_eq!(nexts[1].1.regs[1], RegState::Scalar { min: 42, max: 42 });
+        assert_eq!(
+            nexts[1].1.regs[1],
+            RegState::Scalar(ScalarBounds::constant(42))
+        );
     }
 
     #[test]
     fn successors_jsgt_vs_jgt_negative_constants() {
         // r1 = -1: signed says never taken, unsigned says always taken
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: -1, max: -1 };
-        state.regs[2] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(-1));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jsgt {
@@ -1552,8 +1614,8 @@ mod tests {
     fn successors_unsigned_refines_on_non_negative() {
         // JGE: r1 = [0, 100] >= 50 → taken r1 = [50, 100], fall r1 = [0, 49]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
         let nexts = successors(
             0,
             &BpfInsn::Jge {
@@ -1565,16 +1627,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nexts.len(), 2);
-        assert_eq!(nexts[0].1.regs[1], RegState::Scalar { min: 50, max: 100 });
-        assert_eq!(nexts[1].1.regs[1], RegState::Scalar { min: 0, max: 49 });
+        assert_eq!(
+            nexts[0].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(50, 100))
+        );
+        assert_eq!(
+            nexts[1].1.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 49))
+        );
     }
 
     #[test]
     fn successors_signed_lt_negative_refines() {
         // JSLT: r1 = [-10, -1] < 0 is always true → only taken
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: -10, max: -1 };
-        state.regs[2] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-10, -1));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jslt {
@@ -1595,7 +1663,7 @@ mod tests {
         // fall-through is NULL (scalar 0)
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jne {
@@ -1610,7 +1678,7 @@ mod tests {
         // fall (r0 == 0): the constant 0 comes first
         let (null_pc, null) = &nexts[0];
         assert_eq!(*null_pc, 1);
-        assert_eq!(null.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(null.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
         // taken (r0 != 0): a valid map value pointer
         let (valid_pc, valid) = &nexts[1];
         assert_eq!(*valid_pc, 2);
@@ -1719,170 +1787,265 @@ mod tests {
     fn refine_gt_issue_example() {
         // issue example: R1 = [0, 100]; if R1 > 50 (signed)
         // true: R1 = [51, 100], false: R1 = [0, 50]
-        let ((true_dst, true_src), (false_dst, false_src)) =
-            refine_cmp(CondOp::Sgt, (0, 100), (50, 50));
-        assert_eq!(true_dst, (51, 100));
-        assert_eq!(true_src, (50, 50));
-        assert_eq!(false_dst, (0, 50));
-        assert_eq!(false_src, (50, 50));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
+        assert_eq!(true_dst.signed(), (51, 100));
+        assert_eq!(true_src.signed(), (50, 50));
+        assert_eq!(false_dst.signed(), (0, 50));
+        assert_eq!(false_src.signed(), (50, 50));
     }
 
     #[test]
     fn refine_gt_unsigned_matches_signed_on_non_negative() {
-        // on non-negative ranges the unsigned and signed views coincide
-        let signed = refine_cmp(CondOp::Sgt, (0, 100), (50, 50));
-        let unsigned = refine_cmp(CondOp::Ugt, (0, 100), (50, 50));
+        // on non-negative ranges the unsigned and signed views coincide,
+        // and the sync keeps both interpretations identical afterwards
+        let signed = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
+        let unsigned = refine_cmp(
+            CondOp::Ugt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(50, 50),
+        );
         assert_eq!(signed, unsigned);
         let ((true_dst, _), _) = unsigned;
-        assert_eq!(true_dst, (51, 100));
+        assert_eq!(true_dst.unsigned(), (51, 100));
+        assert_eq!(true_dst.signed(), (51, 100));
     }
 
     #[test]
-    fn refine_gt_unsigned_negative_range_not_narrowed() {
-        // a range containing negatives has no single u64 interval view:
-        // no narrowing may happen on either side (sound over-approximation)
-        let ((true_dst, true_src), (false_dst, false_src)) =
-            refine_cmp(CondOp::Ugt, (-10, 10), (0, 0));
-        assert_eq!(true_dst, (-10, 10));
-        assert_eq!(true_src, (0, 0));
-        assert_eq!(false_dst, (-10, 10));
-        assert_eq!(false_src, (0, 0));
+    fn refine_unsigned_narrows_unsigned_family_only() {
+        // JLE 10 refines umax; the sync propagates the narrowing into the
+        // signed range too (kernel reg_bounds_sync), so both families agree
+        let dst = ScalarBounds::from_signed(0, 100);
+        let ((taken, _), (fall, _)) = refine_cmp(CondOp::Ule, dst, ScalarBounds::constant(10));
+        assert_eq!(taken.unsigned(), (0, 10));
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(fall.unsigned(), (11, 100));
+        assert_eq!(fall.signed(), (11, 100));
+        // and JSLE 10 refines the signed family first, then syncs
+        let ((taken, _), _) = refine_cmp(CondOp::Sle, dst, ScalarBounds::constant(10));
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(taken.unsigned(), (0, 10));
+    }
+
+    #[test]
+    fn refine_signed_negative_constant_keeps_both_interpretations() {
+        // r1 = -1: signed -1..-1, unsigned u64::MAX..u64::MAX; JSGT 0 can
+        // never be taken, so the taken side narrows to the empty range
+        let r1 = ScalarBounds::constant(-1);
+        let ((true_dst, _), _) = refine_cmp(CondOp::Sgt, r1, ScalarBounds::constant(0));
+        assert!(true_dst.smin > true_dst.smax);
+        // JGT 0 (unsigned) is always taken: the fall side is empty
+        let (_, (false_dst, _)) = refine_cmp(CondOp::Ugt, r1, ScalarBounds::constant(0));
+        assert!(false_dst.umin > false_dst.umax);
     }
 
     #[test]
     fn refine_gt_both_ranges() {
         // dst = [0, 100], src = [20, 200]: on the true branch both operands
         // narrow (dst >= src.min + 1, src <= dst.max - 1)
-        let ((true_dst, true_src), (false_dst, false_src)) =
-            refine_cmp(CondOp::Sgt, (0, 100), (20, 200));
-        assert_eq!(true_dst, (21, 100));
-        assert_eq!(true_src, (20, 99));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(20, 200),
+        );
+        assert_eq!(true_dst.signed(), (21, 100));
+        assert_eq!(true_src.signed(), (20, 99));
         // the false branch adds no constraint here (dst <= 200, src >= 0
         // are already implied by the ranges)
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (20, 200));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (20, 200));
     }
 
     #[test]
     fn refine_gt_self() {
         // r1 > r1 with r1 = [0, 100]: both sides of the comparison are
         // refined, so the true branch narrows to the empty range
-        let ((true_dst, true_src), (false_dst, false_src)) =
-            refine_cmp(CondOp::Sgt, (0, 100), (0, 100));
-        assert_eq!(true_dst, (1, 100));
-        assert_eq!(true_src, (0, 99));
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (0, 100));
+        let r = ScalarBounds::from_signed(0, 100);
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_cmp(CondOp::Sgt, r, r);
+        assert_eq!(true_dst.signed(), (1, 100));
+        assert_eq!(true_src.signed(), (0, 99));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (0, 100));
     }
 
     #[test]
     fn refine_gt_infeasible_true_branch() {
         // dst = [0, 100] vs src = [100, 100]: dst > 100 is impossible,
         // so the true branch narrows to an empty range (min > max)
-        let ((true_dst, _), _) = refine_cmp(CondOp::Sgt, (0, 100), (100, 100));
-        assert!(true_dst.0 > true_dst.1);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(100),
+        );
+        assert!(true_dst.smin > true_dst.smax);
     }
 
     #[test]
     fn refine_eq_intersection() {
         // dst = [0, 100], src = [40, 60]: equality means both must be in [40, 60]
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_eq((0, 100), (40, 60));
-        assert_eq!(true_dst, (40, 60));
-        assert_eq!(true_src, (40, 60));
+        let ((true_dst, true_src), (false_dst, false_src)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(40, 60),
+        );
+        assert_eq!(true_dst.signed(), (40, 60));
+        assert_eq!(true_src.signed(), (40, 60));
         // false branch keeps both ranges (no safe single-interval narrowing)
-        assert_eq!(false_dst, (0, 100));
-        assert_eq!(false_src, (40, 60));
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (40, 60));
     }
 
     #[test]
     fn refine_eq_disjoint() {
         // disjoint ranges: equality is impossible → true branch is empty
-        let ((true_dst, true_src), _) = refine_eq((0, 10), (20, 30));
-        assert!(true_dst.0 > true_dst.1);
-        assert!(true_src.0 > true_src.1);
+        let ((true_dst, true_src), _) = refine_eq(
+            ScalarBounds::from_signed(0, 10),
+            ScalarBounds::from_signed(20, 30),
+        );
+        assert!(true_dst.smin > true_dst.smax);
+        assert!(true_src.smin > true_src.smax);
     }
 
     #[test]
     fn refine_eq_constants() {
         // two constants: r1 = 5, r2 = 5 → true branch keeps 5..5
-        let ((true_dst, _), _) = refine_eq((5, 5), (5, 5));
-        assert_eq!(true_dst, (5, 5));
+        let ((true_dst, _), _) = refine_eq(ScalarBounds::constant(5), ScalarBounds::constant(5));
+        assert_eq!(true_dst.signed(), (5, 5));
     }
 
     #[test]
     fn refine_gt_extremes() {
         // wrapping at i64 extremes stays sound (never panics)
-        let ((true_dst, true_src), _) = refine_cmp(CondOp::Sgt, (i64::MIN, i64::MAX), (0, 0));
-        assert_eq!(true_dst, (1, i64::MAX));
+        let ((true_dst, true_src), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::unknown(),
+            ScalarBounds::constant(0),
+        );
+        assert_eq!(true_dst.signed(), (1, i64::MAX));
         // src.max = 0 is already below dst.max - 1, so src stays [0, 0]
-        assert_eq!(true_src, (0, 0));
+        assert_eq!(true_src.signed(), (0, 0));
         // src.min + 1 wraps to i64::MIN; dst is kept soundly (the branch is
         // actually infeasible, but over-approximation is allowed)
-        let ((true_dst, _), _) = refine_cmp(CondOp::Sgt, (0, i64::MAX), (i64::MAX, i64::MAX));
-        assert_eq!(true_dst.0, 0);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::from_signed(0, i64::MAX),
+            ScalarBounds::constant(i64::MAX),
+        );
+        assert_eq!(true_dst.smin, 0);
         // dst.max - 1 wraps when dst.max = i64::MIN; dst stays [MIN, MIN] so
         // the true branch narrows to an empty range (dst > src is impossible)
-        let ((true_dst, _), _) =
-            refine_cmp(CondOp::Sgt, (i64::MIN, i64::MIN), (i64::MIN, i64::MIN));
-        assert!(true_dst.0 > true_dst.1);
+        let ((true_dst, _), _) = refine_cmp(
+            CondOp::Sgt,
+            ScalarBounds::constant(i64::MIN),
+            ScalarBounds::constant(i64::MIN),
+        );
+        assert!(true_dst.smin > true_dst.smax);
     }
 
     #[test]
     fn refine_ne_issue_example() {
         // r1 = 5, r2 = 5: r1 != r2 is impossible → taken branch is empty;
         // the fall-through keeps the intersection
-        let ((true_dst, true_src), (false_dst, false_src)) = refine_ne((5, 5), (5, 5));
-        assert!(true_dst.0 > true_dst.1);
-        assert!(true_src.0 > true_src.1);
-        assert_eq!(false_dst, (5, 5));
-        assert_eq!(false_src, (5, 5));
+        let ((true_dst, true_src), (false_dst, false_src)) =
+            refine_ne(ScalarBounds::constant(5), ScalarBounds::constant(5));
+        assert!(true_dst.smin > true_dst.smax);
+        assert!(true_src.smin > true_src.smax);
+        assert_eq!(false_dst.signed(), (5, 5));
+        assert_eq!(false_src.signed(), (5, 5));
     }
 
     #[test]
     fn refine_ne_excludes_endpoint_constant() {
         // r1 = [0, 100] != 42: the complement is two intervals, so no
         // narrowing; r1 = [0, 42] != 42 → taken side excludes 42
-        let ((true_dst, _), _) = refine_ne((0, 100), (42, 42));
-        assert_eq!(true_dst, (0, 100));
-        let ((true_dst, _), _) = refine_ne((0, 42), (42, 42));
-        assert_eq!(true_dst, (0, 41));
-        let ((true_dst, _), _) = refine_ne((42, 100), (42, 42));
-        assert_eq!(true_dst, (43, 100));
+        let ((true_dst, _), _) = refine_ne(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(true_dst.signed(), (0, 100));
+        let ((true_dst, _), _) =
+            refine_ne(ScalarBounds::from_signed(0, 42), ScalarBounds::constant(42));
+        assert_eq!(true_dst.signed(), (0, 41));
+        let ((true_dst, _), _) = refine_ne(
+            ScalarBounds::from_signed(42, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(true_dst.signed(), (43, 100));
         // a range that covers the whole operand range → infeasible
-        let ((true_dst, _), _) = refine_ne((5, 5), (0, 100));
-        assert!(true_dst.0 > true_dst.1);
+        let ((true_dst, _), _) =
+            refine_ne(ScalarBounds::constant(5), ScalarBounds::from_signed(0, 100));
+        assert!(true_dst.smin > true_dst.smax);
     }
 
     #[test]
     fn refine_signed_variants() {
         // dst = [0, 100], src = [40, 60]: the true branch of each comparison
-        let ((sgt_true, _), _) = refine_cmp(CondOp::Sgt, (0, 100), (40, 60));
-        assert_eq!(sgt_true, (41, 100));
-        let ((sge_true, _), _) = refine_cmp(CondOp::Sge, (0, 100), (40, 60));
-        assert_eq!(sge_true, (40, 100));
-        let ((slt_true, _), _) = refine_cmp(CondOp::Slt, (0, 100), (40, 60));
-        assert_eq!(slt_true, (0, 59));
-        let ((sle_true, _), _) = refine_cmp(CondOp::Sle, (0, 100), (40, 60));
-        assert_eq!(sle_true, (0, 60));
+        let dst = ScalarBounds::from_signed(0, 100);
+        let src = ScalarBounds::from_signed(40, 60);
+        let ((sgt_true, _), _) = refine_cmp(CondOp::Sgt, dst, src);
+        assert_eq!(sgt_true.signed(), (41, 100));
+        let ((sge_true, _), _) = refine_cmp(CondOp::Sge, dst, src);
+        assert_eq!(sge_true.signed(), (40, 100));
+        let ((slt_true, _), _) = refine_cmp(CondOp::Slt, dst, src);
+        assert_eq!(slt_true.signed(), (0, 59));
+        let ((sle_true, _), _) = refine_cmp(CondOp::Sle, dst, src);
+        assert_eq!(sle_true.signed(), (0, 60));
         // and the false branches are the exact complements
-        let (_, (sgt_false, _)) = refine_cmp(CondOp::Sgt, (0, 100), (40, 60));
-        assert_eq!(sgt_false, (0, 60));
-        let (_, (sge_false, _)) = refine_cmp(CondOp::Sge, (0, 100), (40, 60));
-        assert_eq!(sge_false, (0, 39));
-        let (_, (slt_false, _)) = refine_cmp(CondOp::Slt, (0, 100), (40, 60));
-        assert_eq!(slt_false, (40, 100));
-        let (_, (sle_false, _)) = refine_cmp(CondOp::Sle, (0, 100), (40, 60));
-        assert_eq!(sle_false, (41, 100));
+        let (_, (sgt_false, _)) = refine_cmp(CondOp::Sgt, dst, src);
+        assert_eq!(sgt_false.signed(), (0, 60));
+        let (_, (sge_false, _)) = refine_cmp(CondOp::Sge, dst, src);
+        assert_eq!(sge_false.signed(), (0, 39));
+        let (_, (slt_false, _)) = refine_cmp(CondOp::Slt, dst, src);
+        assert_eq!(slt_false.signed(), (40, 100));
+        let (_, (sle_false, _)) = refine_cmp(CondOp::Sle, dst, src);
+        assert_eq!(sle_false.signed(), (41, 100));
     }
 
-    // ── add_subprog / register_subprog ───────────────────────────────────────
+    #[test]
+    fn refine_unsigned_variants_u64_view() {
+        // r1 = -1 (u64::MAX): unsigned compares see the u64 view
+        let r1 = ScalarBounds::constant(-1);
+        let ((true_dst, _), _) = refine_cmp(CondOp::Ugt, r1, ScalarBounds::constant(0));
+        // u64::MAX > 0: no narrowing, the range is unchanged
+        assert_eq!(true_dst.unsigned(), (u64::MAX, u64::MAX));
+        // JLE 0 (unsigned): r1 <= 0 is false (MAX > 0) → taken side is empty
+        let ((true_dst, _), _) = refine_cmp(CondOp::Ule, r1, ScalarBounds::constant(0));
+        assert!(true_dst.umin > true_dst.umax);
+        // JSLT 0 (signed): -1 < 0 always → taken side is unchanged
+        let ((true_dst, _), _) = refine_cmp(CondOp::Slt, r1, ScalarBounds::constant(0));
+        assert_eq!(true_dst.signed(), (-1, -1));
+    }
+
+    #[test]
+    fn refine_sync_keeps_interpretations_consistent() {
+        // after a signed-only refinement the unsigned range is synced:
+        // JSLE 10 on [0, 100] narrows smax to 10 and umax to 10 too
+        let ((taken, _), _) = refine_cmp(
+            CondOp::Sle,
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(10),
+        );
+        assert_eq!(taken.signed(), (0, 10));
+        assert_eq!(taken.unsigned(), (0, 10));
+        // a refinement that pushes smin >= 0 syncs umax down to smax
+        let r = ScalarBounds::from_signed(-5, 100);
+        let ((taken, _), _) = refine_cmp(CondOp::Sge, r, ScalarBounds::constant(0));
+        assert_eq!(taken.signed(), (0, 100));
+        assert_eq!(taken.unsigned(), (0, 100));
+    }
 
     #[test]
     fn successors_jgt_refines_issue_example() {
         // issue #16 example wired through the driver: R1 = [0, 100]; if R1 > 50
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
 
         let nexts = successors(
             0,
@@ -1899,11 +2062,17 @@ mod tests {
         // taken: pc = 0 + 1 + 1 = 2, R1 = [51, 100]
         let (taken_pc, taken) = &nexts[0];
         assert_eq!(*taken_pc, 2);
-        assert_eq!(taken.regs[1], RegState::Scalar { min: 51, max: 100 });
+        assert_eq!(
+            taken.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(51, 100))
+        );
         // fall: pc = 1, R1 = [0, 50]
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
-        assert_eq!(fall.regs[1], RegState::Scalar { min: 0, max: 50 });
+        assert_eq!(
+            fall.regs[1],
+            RegState::Scalar(ScalarBounds::from_signed(0, 50))
+        );
     }
 
     #[test]
@@ -1980,22 +2149,38 @@ mod tests {
     fn is_branch_taken_gt() {
         // always true: dst.min > src.max
         assert!(matches!(
-            is_branch_taken(CondOp::Sgt, (30, 40), (10, 20)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(30, 40),
+                ScalarBounds::from_signed(10, 20)
+            ),
             BranchVerdict::AlwaysTaken
         ));
         // always false: dst.max <= src.min (boundary included)
         assert!(matches!(
-            is_branch_taken(CondOp::Sgt, (10, 20), (20, 30)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(10, 20),
+                ScalarBounds::from_signed(20, 30)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         // overlapping ranges → unknown
         assert!(matches!(
-            is_branch_taken(CondOp::Sgt, (0, 100), (50, 50)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::constant(50)
+            ),
             BranchVerdict::Unknown
         ));
         // the unsigned family behaves identically on non-negative ranges
         assert!(matches!(
-            is_branch_taken(CondOp::Ugt, (30, 40), (10, 20)),
+            is_branch_taken(
+                CondOp::Ugt,
+                ScalarBounds::from_signed(30, 40),
+                ScalarBounds::from_signed(10, 20)
+            ),
             BranchVerdict::AlwaysTaken
         ));
     }
@@ -2005,30 +2190,38 @@ mod tests {
         // r1 = -1: signed says -1 > 0 is false (never taken),
         // unsigned says u64::MAX > 0 is true (always taken)
         assert!(matches!(
-            is_branch_taken(CondOp::Sgt, (-1, -1), (0, 0)),
+            is_branch_taken(
+                CondOp::Sgt,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         assert!(matches!(
-            is_branch_taken(CondOp::Ugt, (-1, -1), (0, 0)),
+            is_branch_taken(
+                CondOp::Ugt,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
             BranchVerdict::AlwaysTaken
         ));
-        // with a range that straddles zero the unsigned view wraps:
-        // no static verdict is possible (sound over-approximation)
+        // a straddling signed range keeps a full unsigned view: JGT 0 is
+        // still always taken there
+        let straddle = ScalarBounds::from_signed(-10, 10);
         assert!(matches!(
-            is_branch_taken(CondOp::Ugt, (-10, 10), (0, 0)),
-            BranchVerdict::Unknown
-        ));
-        // JSGT on the straddling range is still decidable
-        assert!(matches!(
-            is_branch_taken(CondOp::Sgt, (-10, 10), (0, 0)),
+            is_branch_taken(CondOp::Ugt, straddle, ScalarBounds::constant(0)),
             BranchVerdict::Unknown
         ));
         assert!(matches!(
-            is_branch_taken(CondOp::Slt, (-10, 10), (0, 0)),
+            is_branch_taken(CondOp::Slt, straddle, ScalarBounds::constant(0)),
             BranchVerdict::Unknown
         ));
         assert!(matches!(
-            is_branch_taken(CondOp::Sle, (-10, -1), (0, 0)),
+            is_branch_taken(
+                CondOp::Sle,
+                ScalarBounds::from_signed(-10, -1),
+                ScalarBounds::constant(0)
+            ),
             BranchVerdict::AlwaysTaken
         ));
     }
@@ -2037,17 +2230,29 @@ mod tests {
     fn is_branch_taken_ne() {
         // both the same constant → never taken
         assert!(matches!(
-            is_branch_taken(CondOp::Ne, (5, 5), (5, 5)),
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::constant(5),
+                ScalarBounds::constant(5)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         // disjoint ranges → always taken
         assert!(matches!(
-            is_branch_taken(CondOp::Ne, (0, 10), (20, 30)),
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::from_signed(0, 10),
+                ScalarBounds::from_signed(20, 30)
+            ),
             BranchVerdict::AlwaysTaken
         ));
         // overlapping ranges → unknown
         assert!(matches!(
-            is_branch_taken(CondOp::Ne, (0, 100), (40, 60)),
+            is_branch_taken(
+                CondOp::Ne,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::from_signed(40, 60)
+            ),
             BranchVerdict::Unknown
         ));
     }
@@ -2058,7 +2263,11 @@ mod tests {
         for op in [CondOp::Sgt, CondOp::Ugt, CondOp::Sge, CondOp::Uge] {
             assert!(
                 matches!(
-                    is_branch_taken(op, (30, 40), (10, 20)),
+                    is_branch_taken(
+                        op,
+                        ScalarBounds::from_signed(30, 40),
+                        ScalarBounds::from_signed(10, 20)
+                    ),
                     BranchVerdict::AlwaysTaken
                 ),
                 "{:?}",
@@ -2068,7 +2277,11 @@ mod tests {
         for op in [CondOp::Slt, CondOp::Ult, CondOp::Sle, CondOp::Ule] {
             assert!(
                 matches!(
-                    is_branch_taken(op, (30, 40), (10, 20)),
+                    is_branch_taken(
+                        op,
+                        ScalarBounds::from_signed(30, 40),
+                        ScalarBounds::from_signed(10, 20)
+                    ),
                     BranchVerdict::AlwaysNotTaken
                 ),
                 "{:?}",
@@ -2081,23 +2294,63 @@ mod tests {
     fn is_branch_taken_eq() {
         // both the same constant → always taken
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (5, 5), (5, 5)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::constant(5),
+                ScalarBounds::constant(5)
+            ),
             BranchVerdict::AlwaysTaken
         ));
-        // disjoint ranges → never taken
+        // disjoint ranges (in either family) → never taken
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (0, 10), (20, 30)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(0, 10),
+                ScalarBounds::from_signed(20, 30)
+            ),
             BranchVerdict::AlwaysNotTaken
         ));
         // overlapping ranges → unknown
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (0, 100), (40, 60)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(0, 100),
+                ScalarBounds::from_signed(40, 60)
+            ),
             BranchVerdict::Unknown
         ));
         // a non-constant range is never 'always taken'
         assert!(matches!(
-            is_branch_taken(CondOp::Eq, (5, 7), (5, 5)),
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::from_signed(5, 7),
+                ScalarBounds::constant(5)
+            ),
             BranchVerdict::Unknown
+        ));
+    }
+
+    #[test]
+    fn is_branch_taken_eq_disjoint_unsigned_family() {
+        // signed ranges overlap but the unsigned views are disjoint
+        // (e.g. -1 vs 0): equality can never hold → pruned
+        assert!(matches!(
+            is_branch_taken(
+                CondOp::Eq,
+                ScalarBounds::constant(-1),
+                ScalarBounds::constant(0)
+            ),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        // and vice versa: a state refined only in the signed family may
+        // still be decided by the unsigned family
+        let mut dst = ScalarBounds::from_signed(0, 100);
+        dst.umin = 50; // unsigned [50, 100]
+        let mut src = ScalarBounds::from_signed(0, 100);
+        src.umax = 49; // unsigned [0, 49]
+        assert!(matches!(
+            is_branch_taken(CondOp::Eq, dst, src),
+            BranchVerdict::AlwaysNotTaken
         ));
     }
 
@@ -2105,8 +2358,8 @@ mod tests {
     fn successors_jgt_always_taken() {
         // dst = [30, 40] > src = [10, 20] is always true → only taken
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 30, max: 40 };
-        state.regs[2] = RegState::Scalar { min: 10, max: 20 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(30, 40));
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {
@@ -2125,8 +2378,8 @@ mod tests {
     fn successors_jgt_never_taken() {
         // dst = [10, 20] > src = [30, 40] is always false → only fall-through
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 10, max: 20 };
-        state.regs[2] = RegState::Scalar { min: 30, max: 40 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(30, 40));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {
@@ -2145,8 +2398,8 @@ mod tests {
     fn successors_jeq_always_taken() {
         // r1 == r2 with both constant 5 → only the taken successor
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 5, max: 5 };
-        state.regs[2] = RegState::Scalar { min: 5, max: 5 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(5));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(5));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -2166,7 +2419,7 @@ mod tests {
         // issue example: r0 = PtrToMapValueOrNull; if r0 == 0 (via r1 = 0)
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
 
         let nexts = successors(
             0,
@@ -2183,7 +2436,7 @@ mod tests {
         // taken (r0 == 0): the pointer becomes the constant 0 (kernel style)
         let (taken_pc, taken) = &nexts[0];
         assert_eq!(*taken_pc, 2);
-        assert_eq!(taken.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(taken.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
         // fall (r0 != 0): refined to a valid map value pointer
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
@@ -2195,7 +2448,7 @@ mod tests {
         // the constant 0 may also be the dst register: if r1 == r0 with r1 = 0
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -2207,7 +2460,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nexts.len(), 2);
-        assert_eq!(nexts[0].1.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(
+            nexts[0].1.regs[0],
+            RegState::Scalar(ScalarBounds::constant(0))
+        );
         assert_eq!(nexts[1].1.regs[0], RegState::PtrToMapValue);
     }
 
@@ -2217,7 +2473,7 @@ mod tests {
         // different-types rejection
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull;
-        state.regs[1] = RegState::Scalar { min: 8, max: 8 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(8));
         let err = successors(
             0,
             &BpfInsn::Jeq {
@@ -2236,7 +2492,7 @@ mod tests {
         // a non-null map value pointer compared to 0 keeps both branches
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValue;
-        state.regs[1] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -2321,13 +2577,7 @@ mod tests {
         // no arguments → R0 becomes an unknown scalar (full range)
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::Call { imm: -7 }).unwrap();
-        assert_eq!(
-            next.regs[0],
-            RegState::Scalar {
-                min: i64::MIN,
-                max: i64::MAX
-            }
-        );
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::unknown()));
     }
 
     #[test]
@@ -2338,9 +2588,9 @@ mod tests {
         state.regs[1] = RegState::PtrToMap;
         state.regs[2] = RegState::PtrToStack { offset: -8 };
         state.regs[3] = RegState::PtrToStack { offset: -16 };
-        state.regs[4] = RegState::Scalar { min: 0, max: 0 };
+        state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
         let next = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap();
-        assert_eq!(next.regs[0], RegState::Scalar { min: 0, max: 0 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
     }
 
     #[test]
@@ -2384,13 +2634,13 @@ mod tests {
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
         state.regs[2] = RegState::PtrToStack { offset: -8 };
-        state.regs[3] = RegState::Scalar { min: 1, max: 1 };
-        state.regs[4] = RegState::Scalar { min: 2, max: 2 };
-        state.regs[5] = RegState::Scalar { min: 3, max: 3 };
-        state.regs[6] = RegState::Scalar { min: 10, max: 10 };
-        state.regs[7] = RegState::Scalar { min: 11, max: 11 };
-        state.regs[8] = RegState::Scalar { min: 12, max: 12 };
-        state.regs[9] = RegState::Scalar { min: 13, max: 13 };
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(1));
+        state.regs[4] = RegState::Scalar(ScalarBounds::constant(2));
+        state.regs[5] = RegState::Scalar(ScalarBounds::constant(3));
+        state.regs[6] = RegState::Scalar(ScalarBounds::constant(10));
+        state.regs[7] = RegState::Scalar(ScalarBounds::constant(11));
+        state.regs[8] = RegState::Scalar(ScalarBounds::constant(12));
+        state.regs[9] = RegState::Scalar(ScalarBounds::constant(13));
 
         let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
         // R0 = return type, R1..R5 invalidated
@@ -2402,7 +2652,7 @@ mod tests {
         for (reg, val) in [(6, 10), (7, 11), (8, 12), (9, 13)] {
             assert_eq!(
                 next.regs[reg],
-                RegState::Scalar { min: val, max: val },
+                RegState::Scalar(ScalarBounds::constant(val)),
                 "r{}",
                 reg
             );

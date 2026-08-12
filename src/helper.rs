@@ -1,7 +1,7 @@
 // ── Helper function prototypes (v0.3 Mini) ──────────────────────────────────
 
 use crate::error::VerificationFailure;
-use crate::state::{RegState, VerifierState, read_reg};
+use crate::state::{RegState, ScalarBounds, VerifierState, read_reg};
 
 /// Expected type of one helper argument (R1..R5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,15 +39,22 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 ArgType::PtrToStack,
                 ArgType::Scalar,
             ],
-            return_type: RegState::Scalar { min: 0, max: 0 },
+            return_type: RegState::Scalar(ScalarBounds {
+                smin: 0,
+                smax: 0,
+                umin: 0,
+                umax: 0,
+            }),
         }),
         // BPF_FUNC_get_prandom_u32: no arguments, unknown scalar
         7 => Some(&HelperPrototype {
             args: &[],
-            return_type: RegState::Scalar {
-                min: i64::MIN,
-                max: i64::MAX,
-            },
+            return_type: RegState::Scalar(ScalarBounds {
+                smin: i64::MIN,
+                smax: i64::MAX,
+                umin: 0,
+                umax: u64::MAX,
+            }),
         }),
         _ => None,
     }
@@ -59,7 +66,7 @@ fn arg_matches(expected: ArgType, actual: RegState) -> bool {
         (expected, actual),
         (ArgType::PtrToMap, RegState::PtrToMap)
             | (ArgType::PtrToStack, RegState::PtrToStack { .. })
-            | (ArgType::Scalar, RegState::Scalar { .. })
+            | (ArgType::Scalar, RegState::Scalar(_))
     )
 }
 

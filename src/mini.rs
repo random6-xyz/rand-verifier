@@ -20,20 +20,17 @@ pub(crate) fn subsumes(old: &VerifierState, new: &VerifierState) -> bool {
         && old.stack == new.stack
 }
 
-/// Per-register part of `subsumes`: the old range must contain the new one.
+/// Per-register part of `subsumes`: the old bounds must contain the new
+/// ones in both interpretations (#40).
 pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
     match (old, new) {
         (RegState::Uninit, RegState::Uninit) => true,
-        (
-            RegState::Scalar {
-                min: old_min,
-                max: old_max,
-            },
-            RegState::Scalar {
-                min: new_min,
-                max: new_max,
-            },
-        ) => old_min <= new_min && old_max >= new_max,
+        (RegState::Scalar(old), RegState::Scalar(new)) => {
+            old.smin <= new.smin
+                && old.smax >= new.smax
+                && old.umin <= new.umin
+                && old.umax >= new.umax
+        }
         (
             RegState::PtrToStack { offset: old_offset },
             RegState::PtrToStack { offset: new_offset },
@@ -448,12 +445,41 @@ mod tests {
     // ── Subsumption (v0.3) ──────────────────────────────────────────────────
 
     #[test]
+    fn subsumes_dual_ranges() {
+        // subsumption requires containment in both interpretations (#40)
+        let mut old = VerifierState::initial();
+        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        let mut new = VerifierState::initial();
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
+        assert!(subsumes(&old, &new));
+        // the signed range contains the new one but the unsigned range
+        // does not → not subsumed
+        let mut wider_unsigned = new;
+        wider_unsigned.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: 10,
+            smax: 20,
+            umin: 0,
+            umax: 1000,
+        });
+        assert!(!subsumes(&old, &wider_unsigned));
+        // and vice versa
+        let mut wider_signed = new;
+        wider_signed.regs[1] = RegState::Scalar(ScalarBounds {
+            smin: -100,
+            smax: 20,
+            umin: 10,
+            umax: 20,
+        });
+        assert!(!subsumes(&old, &wider_signed));
+    }
+
+    #[test]
     fn subsumes_issue_example() {
         // issue example: old R1 = [0, 100] subsumes new R1 = [10, 20]
         let mut old = VerifierState::initial();
-        old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
         assert!(subsumes(&old, &new));
     }
 
@@ -461,18 +487,18 @@ mod tests {
     fn subsumes_scalar_ranges() {
         let old = VerifierState::initial();
         let mut old = old;
-        old.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 10, max: 20 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
 
         // subsumption is reflexive: a state subsumes itself
         assert!(subsumes(&old, &old));
         assert!(subsumes(&new, &new));
         // a wider new range is not subsumed
-        new.regs[1] = RegState::Scalar { min: -50, max: 200 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-50, 200));
         assert!(!subsumes(&old, &new));
         // equal ranges subsume each other
-        new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         assert!(subsumes(&old, &new));
         assert!(subsumes(&new, &old));
     }
@@ -482,7 +508,7 @@ mod tests {
         // different types are never comparable
         let old = VerifierState::initial();
         let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar { min: 0, max: 100 };
+        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
         assert!(!subsumes(&old, &new)); // Uninit vs Scalar
         assert!(!subsumes(&new, &old));
 
@@ -496,7 +522,7 @@ mod tests {
     #[test]
     fn subsumes_stack_mismatch() {
         let mut old = VerifierState::initial();
-        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar { min: 1, max: 1 });
+        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
         let new = VerifierState::initial();
         // stack states differ → not subsumed even though the registers match
         assert!(!subsumes(&old, &new));
@@ -508,8 +534,8 @@ mod tests {
         // the refined branches of [0, 100] > 50 (R1 = [51, 100] / [0, 50])
         // are both subsumed by the original R1 = [0, 100]
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar { min: 0, max: 100 };
-        state.regs[2] = RegState::Scalar { min: 50, max: 50 };
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
         let nexts = successors(
             0,
             &BpfInsn::Jgt {

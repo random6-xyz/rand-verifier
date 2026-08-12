@@ -5,13 +5,131 @@ use crate::error::VerificationFailure;
 /// Number of eBPF registers: R0..R10.
 pub(crate) const NUM_REGS: usize = 11;
 
+/// The range bounds of a scalar register: the signed and the unsigned
+/// interpretation tracked side by side (cf. the kernel's `smin`/`smax`
+/// and `umin`/`umax` in `struct bpf_reg_state`, Meso #40).
+///
+/// Invariant: `smin <= smax` and `umin <= umax` — a scalar range is
+/// never empty. Overflow handling (#43) falls back to the full range
+/// instead of letting a range wrap into `min > max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScalarBounds {
+    pub(crate) smin: i64,
+    pub(crate) smax: i64,
+    pub(crate) umin: u64,
+    pub(crate) umax: u64,
+}
+
+impl ScalarBounds {
+    /// A constant: both interpretations carry the same bits.
+    pub(crate) const fn constant(value: i64) -> Self {
+        Self {
+            smin: value,
+            smax: value,
+            umin: value as u64,
+            umax: value as u64,
+        }
+    }
+
+    /// Bounds for a range known in the signed interpretation. The
+    /// unsigned range is derived when a single u64 interval exists
+    /// (fully non-negative or fully negative — the bit range is the
+    /// same in both interpretations), otherwise it is the full range —
+    /// a sound over-approximation.
+    #[allow(dead_code)] // used by tests and by #45 (pointer offsets)
+    pub(crate) fn from_signed(min: i64, max: i64) -> Self {
+        if min < 0 && max >= 0 {
+            // straddles zero: no single u64 interval exists
+            Self {
+                smin: min,
+                smax: max,
+                umin: 0,
+                umax: u64::MAX,
+            }
+        } else {
+            // both interpretations are the same bit range
+            Self {
+                smin: min,
+                smax: max,
+                umin: min as u64,
+                umax: max as u64,
+            }
+        }
+    }
+
+    /// Whether every bit of the value is known in both interpretations.
+    pub(crate) fn is_constant(&self) -> bool {
+        self.smin == self.smax && self.umin == self.umax
+    }
+
+    /// The signed interval.
+    pub(crate) fn signed(&self) -> (i64, i64) {
+        (self.smin, self.smax)
+    }
+
+    /// The unsigned interval.
+    pub(crate) fn unsigned(&self) -> (u64, u64) {
+        (self.umin, self.umax)
+    }
+
+    /// The full range (a completely unknown value).
+    #[allow(dead_code)] // used by tests; helper returns construct it inline
+    pub(crate) fn unknown() -> Self {
+        Self {
+            smin: i64::MIN,
+            smax: i64::MAX,
+            umin: 0,
+            umax: u64::MAX,
+        }
+    }
+
+    /// Whether the scalar is provably zero.
+    pub(crate) fn is_zero(&self) -> bool {
+        self.smin == 0 && self.smax == 0 && self.umin == 0 && self.umax == 0
+    }
+
+    /// Kernel `reg_bounds_sync` / `__reg64_deduce_bounds` (simplified):
+    /// when the signed interval does not cross zero, both interpretations
+    /// are the same bit range and are combined; otherwise the unsigned
+    /// range bounds the signed one where a single interval exists.
+    /// Called after every ALU operation and branch refinement so the two
+    /// interpretations stay consistent — this keeps branch pruning
+    /// precise (#40).
+    pub(crate) fn synced(mut self) -> Self {
+        // an empty range (min > max) marks an infeasible branch: it must
+        // never be healed into a non-empty state by the sync
+        if self.smin > self.smax || self.umin > self.umax {
+            return self;
+        }
+        if self.smin >= 0 || self.smax < 0 {
+            // the signed interval does not cross zero: signed and
+            // unsigned bounds are the same bit range — combine
+            let lo = (self.smin as u64).max(self.umin);
+            let hi = (self.smax as u64).min(self.umax);
+            self.smin = lo as i64;
+            self.smax = hi as i64;
+            self.umin = lo;
+            self.umax = hi;
+        } else if self.umax < (1 << 63) {
+            // the unsigned range is non-negative: it bounds smax
+            self.smin = self.umin as i64;
+            self.smax = self.smax.min(self.umax as i64);
+        } else if self.umin >= (1 << 63) {
+            // the unsigned range is negative: it bounds smin
+            self.smin = self.smin.max(self.umin as i64);
+            self.smax = self.umax as i64;
+        }
+        self
+    }
+}
+
 /// Abstract state of a single register during symbolic execution.
 ///
 /// Instead of tracking concrete u64 values, the verifier tracks an abstract
 /// value per register (cf. kernel verifier docs):
 ///
 /// - `Uninit` — the register has never been written
-/// - `Scalar` — a scalar in `[min, max]` (`min == max` means a constant)
+/// - `Scalar` — a scalar with signed and unsigned ranges ([#40])
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
 /// - `PtrToCtx` — pointer to the program context
 /// - `PtrToMap` — a fixed map pointer (kernel's CONST_PTR_TO_MAP)
@@ -21,10 +139,7 @@ pub(crate) const NUM_REGS: usize = 11;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegState {
     Uninit,
-    Scalar {
-        min: i64,
-        max: i64,
-    },
+    Scalar(ScalarBounds),
     PtrToStack {
         offset: i32,
     },
@@ -41,7 +156,11 @@ impl std::fmt::Display for RegState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RegState::Uninit => write!(f, "UNINIT"),
-            RegState::Scalar { min, max } => write!(f, "SCALAR({}..{})", min, max),
+            RegState::Scalar(s) => write!(
+                f,
+                "SCALAR(s:{}..{},u:{:#x}..{:#x})",
+                s.smin, s.smax, s.umin, s.umax
+            ),
             RegState::PtrToStack { offset } => write!(f, "PTR_STACK({})", offset),
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
             RegState::PtrToMap => write!(f, "PTR_MAP"),
@@ -205,7 +324,7 @@ pub(crate) fn read_reg(
     }
 }
 
-/// Read a register as a scalar (min, max) value.
+/// Read a register as a scalar value.
 ///
 /// ALU operations only accept scalars: uninitialized registers are
 /// rejected by `read_reg` (#14), and pointers are rejected because
@@ -215,9 +334,9 @@ pub(crate) fn read_scalar(
     pc: u32,
     state: &VerifierState,
     reg: u8,
-) -> Result<(i64, i64), VerificationFailure> {
+) -> Result<ScalarBounds, VerificationFailure> {
     match read_reg(pc, state, reg)? {
-        RegState::Scalar { min, max } => Ok((min, max)),
+        RegState::Scalar(bounds) => Ok(bounds),
         RegState::PtrToStack { .. }
         | RegState::PtrToCtx
         | RegState::PtrToMap
@@ -263,9 +382,9 @@ mod tests {
 
     #[test]
     fn reg_state_scalar_equality() {
-        let c = RegState::Scalar { min: 10, max: 10 };
-        assert_eq!(c, RegState::Scalar { min: 10, max: 10 });
-        assert_ne!(c, RegState::Scalar { min: 10, max: 11 });
+        let c = RegState::Scalar(ScalarBounds::constant(10));
+        assert_eq!(c, RegState::Scalar(ScalarBounds::constant(10)));
+        assert_ne!(c, RegState::Scalar(ScalarBounds::from_signed(10, 11)));
         assert_ne!(c, RegState::Uninit);
     }
 
@@ -273,8 +392,12 @@ mod tests {
     fn reg_state_display() {
         assert_eq!(RegState::Uninit.to_string(), "UNINIT");
         assert_eq!(
-            RegState::Scalar { min: 0, max: 100 }.to_string(),
-            "SCALAR(0..100)"
+            RegState::Scalar(ScalarBounds::from_signed(0, 100)).to_string(),
+            "SCALAR(s:0..100,u:0x0..0x64)"
+        );
+        assert_eq!(
+            RegState::Scalar(ScalarBounds::constant(-1)).to_string(),
+            "SCALAR(s:-1..-1,u:0xffffffffffffffff..0xffffffffffffffff)"
         );
         assert_eq!(
             RegState::PtrToStack { offset: -8 }.to_string(),
@@ -321,6 +444,63 @@ mod tests {
         assert_eq!(state.regs[10], RegState::PtrToStack { offset: 0 });
     }
 
+    // ── ScalarBounds (Meso #40) ──────────────────────────────────────────────
+
+    #[test]
+    fn scalar_bounds_constant_both_interpretations() {
+        // -1 is -1 signed and u64::MAX unsigned
+        let c = ScalarBounds::constant(-1);
+        assert_eq!(c.signed(), (-1, -1));
+        assert_eq!(c.unsigned(), (u64::MAX, u64::MAX));
+        assert!(c.is_constant());
+        assert!(!ScalarBounds::unknown().is_constant());
+        assert!(ScalarBounds::constant(0).is_zero());
+        assert!(!c.is_zero());
+    }
+
+    #[test]
+    fn scalar_bounds_from_signed_derives_unsigned() {
+        // fully non-negative: the unsigned range matches
+        assert_eq!(ScalarBounds::from_signed(0, 100).unsigned(), (0, 100));
+        // fully negative: the unsigned range is the u64 view
+        assert_eq!(
+            ScalarBounds::from_signed(-10, -1).unsigned(),
+            (u64::MAX - 9, u64::MAX)
+        );
+        // straddling zero: no single u64 interval → full range
+        assert_eq!(ScalarBounds::from_signed(-10, 10).unsigned(), (0, u64::MAX));
+    }
+
+    #[test]
+    fn scalar_bounds_sync_issue_example() {
+        // the issue example: 0xffffffffffffffff is -1 signed and u64::MAX
+        // unsigned, and both interpretations survive refinement correctly
+        let r1 = ScalarBounds::constant(-1).synced();
+        assert_eq!(r1.signed(), (-1, -1));
+        assert_eq!(r1.unsigned(), (u64::MAX, u64::MAX));
+        // a signed refinement narrows smax; the combine rule propagates it
+        // to umax (both interpretations are the same bit range)
+        let narrowed = ScalarBounds {
+            smin: i64::MIN,
+            smax: -5,
+            umin: 0,
+            umax: u64::MAX,
+        }
+        .synced();
+        assert_eq!(narrowed.signed(), (i64::MIN, -5));
+        assert_eq!(narrowed.unsigned(), (1 << 63, u64::MAX - 4));
+        // an unsigned refinement narrows umax; the sync propagates it to smax
+        let narrowed = ScalarBounds {
+            smin: i64::MIN,
+            smax: i64::MAX,
+            umin: 0,
+            umax: 100,
+        }
+        .synced();
+        assert_eq!(narrowed.signed(), (0, 100));
+        assert_eq!(narrowed.unsigned(), (0, 100));
+    }
+
     // ── StackState (v0.2) ────────────────────────────────────────────────────
 
     #[test]
@@ -351,7 +531,7 @@ mod tests {
     fn stack_state_equality() {
         let a = StackState::new();
         let mut b = StackState::new();
-        b.slots[0] = StackSlot::Spilled(RegState::Scalar { min: 1, max: 1 });
+        b.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
         assert_ne!(a, b);
     }
 
@@ -365,10 +545,10 @@ mod tests {
         // the full scalar range is spilled, not just an initialized marker
         assert_eq!(
             next.stack.slots[0],
-            StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+            StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(10)))
         );
         // the source register is unchanged
-        assert_eq!(next.regs[2], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -387,7 +567,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             next.stack.slots[63],
-            StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+            StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(10)))
         );
         assert_eq!(next.stack.slots[0], StackSlot::Uninit);
     }
@@ -435,7 +615,7 @@ mod tests {
         let state = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
         let next = step(0, &state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap();
         // the spilled range is restored exactly (#30)
-        assert_eq!(next.regs[0], RegState::Scalar { min: 10, max: 10 });
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(10)));
     }
 
     #[test]
@@ -508,7 +688,7 @@ mod tests {
             let idx = stack_slot_index(0, offset as i32).unwrap();
             assert_eq!(
                 next.stack.slots[idx],
-                StackSlot::Spilled(RegState::Scalar { min: 10, max: 10 })
+                StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(10)))
             );
         }
         // one byte beyond each edge is rejected
