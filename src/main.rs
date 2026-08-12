@@ -1062,7 +1062,6 @@ impl Default for VerifierLimits {
 ///   `limits` (#32)
 ///
 /// Returns the number of distinct (pc, state) pairs analyzed.
-#[allow(dead_code)] // consumed by the mini corpus runner (#33)
 fn verify_mini(program: &[BpfInsn]) -> Result<usize, VerificationFailure> {
     verify_mini_with_limits(program, &VerifierLimits::default())
 }
@@ -1428,6 +1427,10 @@ impl BpfVerifierEnv {
 
     /// Run verification. A verification failure is not an error —
     /// it is returned as Ok(Verdict::Unsafe(...)).
+    /// Run the full verification pipeline: structural checks (nano),
+    /// then path-sensitive exploration (mini — the most advanced pass,
+    /// which includes the micro abstract execution). A verification
+    /// failure is not an error — it is returned as Ok(Verdict::Unsafe).
     fn verify(&mut self) -> Result<Verdict> {
         let subprogs = match add_subprog(&self.prog.insns) {
             Ok(subprogs) => subprogs,
@@ -1436,7 +1439,12 @@ impl BpfVerifierEnv {
         self.prog.subprogs = subprogs;
 
         match check_cfg(&self.prog.insns, &self.prog.subprogs) {
-            Ok(()) => Ok(Verdict::Safe),
+            Ok(()) => {}
+            Err(failure) => return Ok(Verdict::Unsafe(failure)),
+        }
+
+        match verify_mini(&self.prog.insns) {
+            Ok(_) => Ok(Verdict::Safe),
             Err(failure) => Ok(Verdict::Unsafe(failure)),
         }
     }
