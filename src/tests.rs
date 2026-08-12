@@ -1957,12 +1957,15 @@ fn step_add_imm_map_value_ptr_rejected() {
 #[test]
 fn step_call_map_lookup_ok() {
     // R1 = map pointer, R2 = key pointer → after the call R0 is the
-    // nullable map value pointer (#27's producer)
+    // nullable map value pointer (#27's producer) and the argument
+    // registers are clobbered (#29)
     let mut state = VerifierState::initial();
     state.regs[1] = RegState::PtrToMap;
     state.regs[2] = RegState::PtrToStack { offset: -8 };
     let next = step(&state, &BpfInsn::Call { imm: 1 }).unwrap();
     assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
+    assert_eq!(next.regs[1], RegState::Uninit);
+    assert_eq!(next.regs[2], RegState::Uninit);
 }
 
 #[test]
@@ -2048,6 +2051,69 @@ fn verify_mini_prandom_branch() {
         BpfInsn::Exit,
     ];
     // both branches reach exit with R0 set (scalar in both cases)
+    assert!(verify_mini(&program).is_ok());
+}
+
+#[test]
+fn step_call_clobbers_r1_to_r5_preserves_r6_to_r9() {
+    // the eBPF calling convention: R1..R5 are scratch, R6..R9 callee-saved
+    let mut state = VerifierState::initial();
+    state.regs[1] = RegState::PtrToMap;
+    state.regs[2] = RegState::PtrToStack { offset: -8 };
+    state.regs[3] = RegState::Scalar { min: 1, max: 1 };
+    state.regs[4] = RegState::Scalar { min: 2, max: 2 };
+    state.regs[5] = RegState::Scalar { min: 3, max: 3 };
+    state.regs[6] = RegState::Scalar { min: 10, max: 10 };
+    state.regs[7] = RegState::Scalar { min: 11, max: 11 };
+    state.regs[8] = RegState::Scalar { min: 12, max: 12 };
+    state.regs[9] = RegState::Scalar { min: 13, max: 13 };
+
+    let next = step(&state, &BpfInsn::Call { imm: 1 }).unwrap();
+    // R0 = return type, R1..R5 invalidated
+    assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
+    for reg in 1..=5 {
+        assert_eq!(next.regs[reg], RegState::Uninit, "r{}", reg);
+    }
+    // R6..R9 and the frame pointer are preserved
+    for (reg, val) in [(6, 10), (7, 11), (8, 12), (9, 13)] {
+        assert_eq!(
+            next.regs[reg],
+            RegState::Scalar { min: val, max: val },
+            "r{}",
+            reg
+        );
+    }
+    assert_eq!(next.regs[10], RegState::PtrToStack { offset: 0 });
+}
+
+#[test]
+fn verify_mini_helper_clobber_detected() {
+    // reusing an argument register after a call is a #14 error:
+    // 0: call 7   → R1..R5 invalidated
+    // 1: r0 = r1  → R1 is uninitialized → REJECT
+    // 2: exit
+    let program = vec![
+        BpfInsn::Call { imm: 7 },
+        BpfInsn::MovReg { dst: 0, src: 1 },
+        BpfInsn::Exit,
+    ];
+    let err = verify_mini(&program).unwrap_err();
+    assert!(err.message.contains("r1 is uninitialized"));
+}
+
+#[test]
+fn verify_mini_helper_preserves_callee_saved() {
+    // a callee-saved register survives the call:
+    // 0: r6 = 5
+    // 1: call 7
+    // 2: r0 = r6  → preserved → OK
+    // 3: exit
+    let program = vec![
+        BpfInsn::MovImm { dst: 6, imm: 5 },
+        BpfInsn::Call { imm: 7 },
+        BpfInsn::MovReg { dst: 0, src: 6 },
+        BpfInsn::Exit,
+    ];
     assert!(verify_mini(&program).is_ok());
 }
 

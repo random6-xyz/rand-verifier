@@ -454,14 +454,20 @@ fn step(state: &VerifierState, insn: &BpfInsn) -> Result<VerifierState, Verifica
                 "control flow is not executed by step() (see the worklist driver #23)",
             ))
         }
-        // helper call: validate R1..R5 against the helper prototype and
-        // place the return type in R0 (#28); R1..R5 invalidation is #29
+        // helper call: validate R1..R5 against the helper prototype, then
+        // apply the eBPF calling convention (#28/#29): R1..R5 are
+        // clobbered by the call (kernel's check_helper_call resets them
+        // to NOT_INIT), R6..R9 are preserved, and R0 gets the return type
         BpfInsn::Call { imm } => {
             let helper = helper_prototype(*imm).ok_or_else(|| {
                 VerificationFailure::new(NO_PC, format!("unknown helper {}", imm))
             })?;
             check_helper_args(helper, state)?;
             let mut next = *state;
+            // argument registers are scratch — invalidated by the call
+            for reg in 1..=5 {
+                next.regs[reg] = RegState::Uninit;
+            }
             next.regs[0] = helper.return_type;
             Ok(next)
         }
