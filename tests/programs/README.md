@@ -71,6 +71,8 @@ result into the 64-bit register; `w` notation is used for the destination.
 | alu32_zero_extend        | `r2 = -2147483648; w2 += 0; r2 += 1; r0 = r2; exit`               | ALU32 zero-extension of sign bit |
 | tnum_precise_branch       | `call -7; r0 &= 1; r1 = 0; jeq r0, r1, +1; exit; exit`          | tnum-precise equality refinement  |
 | overflow_full_range        | `call -7; r0 += 1000000000; r1 = 0; jeq r0, r1, +1; exit; exit` | sound overflow over-approximation |
+| unsigned_then_signed_refine | `call -7; r1 = 100; jle r0, r1, +1; exit; r2 = -1; jsgt r0, r2, +1; exit; exit` | unsigned refine then signed prune    |
+| jeq_fall_exclusion          | `call -7; r3 = 42; jle r0, r3, +1; exit; r4 = 42; jeq r0, r4, +1; exit; exit` | equality fall-through exclusion     |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
@@ -101,3 +103,4 @@ result into the 64-bit register; `w` notation is used for the destination.
 | sub_on_pointer                | `r10 -= 8; exit`                                    | SUB on a stack pointer              |
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
 | alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |
+| jsgt_must_be_signed            | `r1 = -1; r2 = 0; jsgt r1, r2, +1; exit; r0 = 1; exit`          | signed compare must prune the taken path |

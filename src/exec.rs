@@ -848,7 +848,16 @@ pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         tnum: dst.tnum.intersect(src.tnum),
     }
     .synced();
-    ((inter, inter), (dst, src))
+    // the fall-through (dst != src) excludes the other operand's values
+    // where a single interval still represents the complement — e.g.
+    // r1 = [0, 42] == 42 → fall r1 = [0, 41] (#44)
+    (
+        (inter, inter),
+        (
+            exclude_bounds(dst, src).synced(),
+            exclude_bounds(src, dst).synced(),
+        ),
+    )
 }
 
 /// Narrow `a` by excluding `b`'s values, when the complement is still a
@@ -872,9 +881,16 @@ fn exclude_interval<T: WrapInt>(a: (T, T), b: (T, T)) -> Option<(T, T)> {
 
 /// Narrow every interval family of `a` by excluding `b`'s values where
 /// a single interval still represents the complement.
+///
+/// This is only sound when `b` is a constant: with a non-constant
+/// operand, for every value of `a` there exists a differing value of
+/// `b` (the inequality constraint never forces `a` to a smaller set).
 fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
-    let s = exclude_interval(a.signed(), b.signed()).unwrap_or(a.signed());
-    let u = exclude_interval(a.unsigned(), b.unsigned()).unwrap_or(a.unsigned());
+    if !b.is_constant() {
+        return a;
+    }
+    let s = exclude_interval(a.signed(), (b.smin, b.smin)).unwrap_or(a.signed());
+    let u = exclude_interval(a.unsigned(), (b.umin, b.umin)).unwrap_or(a.unsigned());
     ScalarBounds {
         smin: s.0,
         smax: s.1,
@@ -2686,10 +2702,13 @@ mod tests {
             ScalarBounds::constant(42),
         );
         assert_eq!(true_dst.signed(), (43, 100));
-        // a range that covers the whole operand range → infeasible
-        let ((true_dst, _), _) =
+        // with a non-constant operand the inequality never narrows: for
+        // every value of dst there is a differing src value (only a
+        // constant operand can be excluded — #44)
+        let ((true_dst, true_src), _) =
             refine_ne(ScalarBounds::constant(5), ScalarBounds::from_signed(0, 100));
-        assert!(true_dst.smin > true_dst.smax);
+        assert_eq!(true_dst.signed(), (5, 5));
+        assert_eq!(true_src.signed(), (0, 100));
     }
 
     #[test]
@@ -2729,6 +2748,98 @@ mod tests {
         // JSLT 0 (signed): -1 < 0 always → taken side is unchanged
         let ((true_dst, _), _) = refine_cmp(CondOp::Slt, r1, ScalarBounds::constant(0));
         assert_eq!(true_dst.signed(), (-1, -1));
+    }
+
+    #[test]
+    fn refine_mirrors_kernel_equations() {
+        // the kernel's reg_set_min_max equations on a fixed example set
+        // (dst vs a constant val), kernel/bpf/verifier.c (#44):
+        //   JGT:   false umax = min(umax, val);      true umin = max(umin, val + 1)
+        //   JSGT:  false smax = min(smax, val);      true smin = max(smin, val + 1)
+        //   JGE:   false umax = min(umax, val - 1);  true umin = max(umin, val)
+        //   JSGE:  false smax = min(smax, val - 1);  true smin = max(smin, val)
+        //   JLT:   false umin = max(umin, val);      true umax = min(umax, val - 1)
+        //   JSLT:  false smin = max(smin, val);      true smax = min(smax, val - 1)
+        //   JLE:   false umin = max(umin, val + 1);  true umax = min(umax, val)
+        //   JSLE:  false smin = max(smin, val + 1);  true smax = min(smax, val)
+        let dst = ScalarBounds::from_signed(0, 100);
+        let val = ScalarBounds::constant(42);
+        let (t, f) = refine_cmp(CondOp::Ugt, dst, val);
+        assert_eq!(t.0.signed(), (43, 100)); // true umin = max(0, 42+1)
+        assert_eq!(f.0.signed(), (0, 42)); // false umax = min(100, 42)
+        let (t, f) = refine_cmp(CondOp::Sgt, dst, val);
+        assert_eq!(t.0.signed(), (43, 100));
+        assert_eq!(f.0.signed(), (0, 42));
+        let (t, f) = refine_cmp(CondOp::Uge, dst, val);
+        assert_eq!(t.0.signed(), (42, 100)); // true umin = max(0, 42)
+        assert_eq!(f.0.signed(), (0, 41)); // false umax = min(100, 42-1)
+        let (t, f) = refine_cmp(CondOp::Sge, dst, val);
+        assert_eq!(t.0.signed(), (42, 100));
+        assert_eq!(f.0.signed(), (0, 41));
+        let (t, f) = refine_cmp(CondOp::Ult, dst, val);
+        assert_eq!(t.0.signed(), (0, 41)); // true umax = min(100, 42-1)
+        assert_eq!(f.0.signed(), (42, 100)); // false umin = max(0, 42)
+        let (t, f) = refine_cmp(CondOp::Slt, dst, val);
+        assert_eq!(t.0.signed(), (0, 41));
+        assert_eq!(f.0.signed(), (42, 100));
+        let (t, f) = refine_cmp(CondOp::Ule, dst, val);
+        assert_eq!(t.0.signed(), (0, 42)); // true umax = min(100, 42)
+        assert_eq!(f.0.signed(), (43, 100)); // false umin = max(0, 42+1)
+        let (t, f) = refine_cmp(CondOp::Sle, dst, val);
+        assert_eq!(t.0.signed(), (0, 42));
+        assert_eq!(f.0.signed(), (43, 100));
+    }
+
+    #[test]
+    fn refine_eq_fall_excludes_constant() {
+        // r1 = [0, 42] == 42: the taken side is the constant, the
+        // fall-through excludes it where a single interval allows it
+        let ((true_dst, _), (false_dst, _)) =
+            refine_eq(ScalarBounds::from_signed(0, 42), ScalarBounds::constant(42));
+        assert_eq!(true_dst.signed(), (42, 42));
+        assert_eq!(false_dst.signed(), (0, 41));
+        // the complement of a mid-range constant is not representable
+        let ((_, _), (false_dst, _)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::constant(42),
+        );
+        assert_eq!(false_dst.signed(), (0, 100));
+        // a non-constant operand is never excluded
+        let ((_, _), (false_dst, false_src)) = refine_eq(
+            ScalarBounds::from_signed(0, 100),
+            ScalarBounds::from_signed(40, 60),
+        );
+        assert_eq!(false_dst.signed(), (0, 100));
+        assert_eq!(false_src.signed(), (40, 60));
+    }
+
+    #[test]
+    fn is_branch_taken_unsigned_pruning() {
+        // infeasible-branch pruning works for unsigned comparisons (#44):
+        // r1 = -1 (u64::MAX) vs 0
+        let r1 = ScalarBounds::constant(-1);
+        let zero = ScalarBounds::constant(0);
+        // JGT: MAX > 0 always → the fall-through is pruned
+        assert!(matches!(
+            is_branch_taken(CondOp::Ugt, r1, zero),
+            BranchVerdict::AlwaysTaken
+        ));
+        // JLE: MAX <= 0 never → the taken branch is pruned
+        assert!(matches!(
+            is_branch_taken(CondOp::Ule, r1, zero),
+            BranchVerdict::AlwaysNotTaken
+        ));
+        // JGE on a negative range: [-10, -1] as u64 is [MAX-9, MAX] ≥ 0
+        let neg = ScalarBounds::from_signed(-10, -1);
+        assert!(matches!(
+            is_branch_taken(CondOp::Uge, neg, zero),
+            BranchVerdict::AlwaysTaken
+        ));
+        // and the signed family prunes the mirror image
+        assert!(matches!(
+            is_branch_taken(CondOp::Slt, neg, zero),
+            BranchVerdict::AlwaysTaken
+        ));
     }
 
     #[test]
