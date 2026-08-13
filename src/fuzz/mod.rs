@@ -7,3 +7,6 @@ pub mod mutator;
 pub mod oracle;
 pub(crate) mod prng;
 pub mod triage;
+
+#[cfg(test)]
+mod regression;
