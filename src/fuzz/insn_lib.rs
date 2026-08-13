@@ -249,6 +249,19 @@ pub const OFFSETS: &[i16] = &[
 /// the truncation/extension dimension instead.
 pub const IMMEDIATES: &[i32] = &[0, 1, 4, 8, 16, -1, -4, -16, i32::MIN, i32::MAX];
 
+/// Large immediates that force 32/64-bit overflow on ADD/SUB — the
+/// stress values for the overflow idiom (#67).
+pub const LARGE_IMMEDIATES: &[i32] = &[
+    1_000_000_000,
+    -1_000_000_000,
+    2_000_000_000,
+    -2_000_000_000,
+    i32::MAX,
+    i32::MIN,
+    0x7FFF_FFFF,
+    -0x4000_0000,
+];
+
 /// Every register index R0..R10.
 pub const REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 

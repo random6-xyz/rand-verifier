@@ -27,6 +27,7 @@ impl std::fmt::Display for VerificationFailure {
 }
 
 /// The overall result of running the verification pipeline on a program.
+#[derive(Debug)]
 pub enum Verdict {
     Safe,
     Unsafe(VerificationFailure),

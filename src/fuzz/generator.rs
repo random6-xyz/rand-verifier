@@ -99,6 +99,19 @@ impl Generator {
             .collect()
     }
 
+    /// Generate a framed program whose body is one idiom template
+    /// (#67). The template is complete (sets r0, reaches an EXIT), so
+    /// the wrapper only adds the leading r0 init and appends an EXIT
+    /// when the body does not end with one.
+    pub fn gen_idiom_program(&mut self, idiom: crate::fuzz::idiom::Idiom) -> Vec<BpfInsn> {
+        let mut insns = vec![insn_lib::mov_imm(0, 0)];
+        insns.extend(crate::fuzz::idiom::gen_idiom_body(idiom, &mut self.rng));
+        if !matches!(insns.last(), Some(BpfInsn::Exit)) {
+            insns.push(insn_lib::exit());
+        }
+        insns
+    }
+
     /// One body instruction (never the unconditional jump — see the
     /// module docs). `pc` is the body index, `body_len` the body
     /// length; the exit sits at index `body_len`.
