@@ -75,7 +75,17 @@ pub(crate) fn visit_insn(
         | BpfInsn::Jsgt { offset, .. }
         | BpfInsn::Jsge { offset, .. }
         | BpfInsn::Jslt { offset, .. }
-        | BpfInsn::Jsle { offset, .. } => {
+        | BpfInsn::Jsle { offset, .. }
+        | BpfInsn::JeqImm { offset, .. }
+        | BpfInsn::JneImm { offset, .. }
+        | BpfInsn::JgtImm { offset, .. }
+        | BpfInsn::JgeImm { offset, .. }
+        | BpfInsn::JltImm { offset, .. }
+        | BpfInsn::JleImm { offset, .. }
+        | BpfInsn::JsgtImm { offset, .. }
+        | BpfInsn::JsgeImm { offset, .. }
+        | BpfInsn::JsltImm { offset, .. }
+        | BpfInsn::JsleImm { offset, .. } => {
             // BPF branch target is PC-relative to the next insn: idx + 1 + offset
             let target = (idx as i32 + 1 + *offset as i32) as u32;
             if target < start || target >= end {

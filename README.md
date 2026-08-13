@@ -113,7 +113,7 @@ same bytes clang and the kernel selftests emit (issue #56):
 | `0xc4`/`0xcc` | `ARSH32` | `wX s>>= imm` / `wX s>>= rY` |
 | `0x79` | `LD_STACK` | `rX = [r10 + off]` (8-byte, `src_reg = 10`) |
 | `0x7b` | `ST_STACK` | `[r10 + off] = rX` (8-byte, `dst_reg = 10`) |
-| `0x1d`…`0xdd` | compares | `if rX op rY goto +off` — `JEQ`/`JNE`/`JGT`/`JGE`/`JLT`/`JLE` (unsigned) and `JSGT`/`JSGE`/`JSLT`/`JSLE` (signed), register forms (`BPF_J*_X`) |
+| `0x1d`…`0xdd` | compares | `if rX op rY goto +off` and `if rX op imm goto +off` — `JEQ`/`JNE`/`JGT`/`JGE`/`JLT`/`JLE` (unsigned) and `JSGT`/`JSGE`/`JSLT`/`JSLE` (signed), register (`BPF_J*_X`) and immediate (`BPF_J*_K`) forms |
 | `0x05` | `JMP` | `goto +off` (`BPF_JA`) |
 | `0x85` | `CALL` | helper call — `imm` is the helper id (kernel convention) |
 | `0x95` | `EXIT` | terminate path |

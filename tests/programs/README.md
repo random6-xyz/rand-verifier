@@ -48,8 +48,10 @@ ALU32 is the separate `BPF_ALU` class: `0x04`/`0x0c` = `wX += imm` / `wX += rY`,
 `0x14`/`0x1c` = `wX -= imm` / `wX -= rY`, … `0xcc` = `wX s>>= rY` (ARSH32).
 A 32-bit operation truncates its operands to 32 bits and zero-extends the
 result into the 64-bit register; `w` notation is used for the destination.
-Compares are the register-register (BPF_X) forms only — the immediate
-(BPF_K) forms are not supported yet (issue #57).
+Every compare also has the immediate (BPF_K) form with the source bit
+cleared: `0x15` = `if rX == imm goto +off`, `0x55` (JNE), `0x25` (JGT),
+`0x35` (JGE), `0xa5` (JLT), `0xb5` (JLE), `0x65` (JSGT), `0x75` (JSGE),
+`0xc5` (JSLT), `0xd5` (JSLE) — issue #57.
 
 ## Concrete execution (v0.5)
 
@@ -108,6 +110,7 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
+| immediate_compare        | `r0 = 1; r1 = 42; jeq r1, 42, +1; exit; exit`                  | immediate compare always-taken prune (#57) |
 
 ## reject/ — must fail verification (concrete cross-check)
 
@@ -142,3 +145,4 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | alu32_uninit                   | `w2 += 5; exit`                                     | ALU32 read of an uninitialized register   |
 | loop_no_exit                   | `jmp -1`                                           | loop whose subprogram does not end with exit |
 | overflowed_range_out_of_frame   | `r6 = r10; r6 += -32; call 7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | overflowed range cannot be in-frame       |
+| immediate_compare_uninit | `jeq r2, 5, +2; r0 = 1; exit; r0 = 0; exit`                     | immediate compare reads an uninitialized register (#57) |

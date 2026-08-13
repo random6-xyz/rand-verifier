@@ -53,19 +53,29 @@ pub(crate) mod opcode {
     pub const LD_STACK: u8 = 0x79; // BPF_LDX | BPF_MEM | BPF_DW, src_reg = R10
     pub const ST_STACK: u8 = 0x7b; // BPF_STX | BPF_MEM | BPF_DW, dst_reg = R10
 
-    // jumps (class 0x05). Compares are the register-register (BPF_X)
-    // forms; the immediate (BPF_K) forms are tracked in issue #57.
+    // jumps (class 0x05): every compare exists in the register-register
+    // (BPF_X) and the immediate (BPF_K) form (#57)
     pub const JMP: u8 = 0x05; // BPF_JA
     pub const JEQ: u8 = 0x1d; // BPF_JMP | BPF_JEQ | BPF_X
+    pub const JEQ_IMM: u8 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
     pub const JNE: u8 = 0x5d; // BPF_JMP | BPF_JNE | BPF_X
+    pub const JNE_IMM: u8 = 0x55; // BPF_JMP | BPF_JNE | BPF_K
     pub const JGT: u8 = 0x2d; // BPF_JMP | BPF_JGT | BPF_X (unsigned)
+    pub const JGT_IMM: u8 = 0x25; // BPF_JMP | BPF_JGT | BPF_K (unsigned)
     pub const JGE: u8 = 0x3d; // BPF_JMP | BPF_JGE | BPF_X (unsigned)
+    pub const JGE_IMM: u8 = 0x35; // BPF_JMP | BPF_JGE | BPF_K (unsigned)
     pub const JLT: u8 = 0xad; // BPF_JMP | BPF_JLT | BPF_X (unsigned)
+    pub const JLT_IMM: u8 = 0xa5; // BPF_JMP | BPF_JLT | BPF_K (unsigned)
     pub const JLE: u8 = 0xbd; // BPF_JMP | BPF_JLE | BPF_X (unsigned)
+    pub const JLE_IMM: u8 = 0xb5; // BPF_JMP | BPF_JLE | BPF_K (unsigned)
     pub const JSGT: u8 = 0x6d; // BPF_JMP | BPF_JSGT | BPF_X (signed)
+    pub const JSGT_IMM: u8 = 0x65; // BPF_JMP | BPF_JSGT | BPF_K (signed)
     pub const JSGE: u8 = 0x7d; // BPF_JMP | BPF_JSGE | BPF_X (signed)
+    pub const JSGE_IMM: u8 = 0x75; // BPF_JMP | BPF_JSGE | BPF_K (signed)
     pub const JSLT: u8 = 0xcd; // BPF_JMP | BPF_JSLT | BPF_X (signed)
+    pub const JSLT_IMM: u8 = 0xc5; // BPF_JMP | BPF_JSLT | BPF_K (signed)
     pub const JSLE: u8 = 0xdd; // BPF_JMP | BPF_JSLE | BPF_X (signed)
+    pub const JSLE_IMM: u8 = 0xd5; // BPF_JMP | BPF_JSLE | BPF_K (signed)
     pub const CALL: u8 = 0x85; // BPF_JMP | BPF_CALL — imm is the helper id
     pub const EXIT: u8 = 0x95; // BPF_JMP | BPF_EXIT
 }
@@ -122,6 +132,17 @@ pub(crate) enum BpfInsn {
     Jsge { dst: u8, src: u8, offset: i16 },
     Jslt { dst: u8, src: u8, offset: i16 },
     Jsle { dst: u8, src: u8, offset: i16 },
+    // immediate forms of every compare (BPF_J*_K, #57)
+    JeqImm { dst: u8, imm: i32, offset: i16 },
+    JneImm { dst: u8, imm: i32, offset: i16 },
+    JgtImm { dst: u8, imm: i32, offset: i16 },
+    JgeImm { dst: u8, imm: i32, offset: i16 },
+    JltImm { dst: u8, imm: i32, offset: i16 },
+    JleImm { dst: u8, imm: i32, offset: i16 },
+    JsgtImm { dst: u8, imm: i32, offset: i16 },
+    JsgeImm { dst: u8, imm: i32, offset: i16 },
+    JsltImm { dst: u8, imm: i32, offset: i16 },
+    JsleImm { dst: u8, imm: i32, offset: i16 },
     Jmp { offset: i16 },
     Call { imm: i32 },
     Exit,
@@ -129,7 +150,8 @@ pub(crate) enum BpfInsn {
 
 impl BpfInsn {
     /// Whether this instruction forks into a taken branch and a
-    /// fall-through successor (all compare opcodes).
+    /// fall-through successor (all compare opcodes, register and
+    /// immediate forms).
     pub(crate) fn is_conditional_branch(&self) -> bool {
         matches!(
             self,
@@ -143,6 +165,16 @@ impl BpfInsn {
                 | BpfInsn::Jsge { .. }
                 | BpfInsn::Jslt { .. }
                 | BpfInsn::Jsle { .. }
+                | BpfInsn::JeqImm { .. }
+                | BpfInsn::JneImm { .. }
+                | BpfInsn::JgtImm { .. }
+                | BpfInsn::JgeImm { .. }
+                | BpfInsn::JltImm { .. }
+                | BpfInsn::JleImm { .. }
+                | BpfInsn::JsgtImm { .. }
+                | BpfInsn::JsgeImm { .. }
+                | BpfInsn::JsltImm { .. }
+                | BpfInsn::JsleImm { .. }
         )
     }
 
@@ -248,10 +280,6 @@ fn unsupported_reason(op: u8) -> Option<&'static str> {
         },
         // BPF_JMP
         0x05 => match op {
-            // immediate-form compares (BPF_J*_K) — tracked in issue #57
-            0x15 | 0x55 | 0x25 | 0x35 | 0xa5 | 0xb5 | 0x65 | 0x75 | 0xc5 | 0xd5 => {
-                Some("immediate-form compares (BPF_J*_K) are not implemented yet")
-            }
             0x45 | 0x4d => Some("BPF_JSET is not implemented"),
             0x0d => Some("indirect jumps (BPF_JA|BPF_X) are not implemented"),
             _ => None,
@@ -339,7 +367,8 @@ pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 _ => unreachable!("is_supported_alu covered the opcode"),
             })
         }
-        // conditional compares — BPF_J*_X: imm is reserved (check_jmp_fields)
+        // conditional compares — BPF_J*_X (imm reserved) and BPF_J*_K
+        // (src_reg reserved, #57): mirrors check_jmp_fields
         opcode::JEQ
         | opcode::JNE
         | opcode::JGT
@@ -349,8 +378,19 @@ pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
         | opcode::JSGT
         | opcode::JSGE
         | opcode::JSLT
-        | opcode::JSLE => {
-            if imm != 0 {
+        | opcode::JSLE
+        | opcode::JEQ_IMM
+        | opcode::JNE_IMM
+        | opcode::JGT_IMM
+        | opcode::JGE_IMM
+        | opcode::JLT_IMM
+        | opcode::JLE_IMM
+        | opcode::JSGT_IMM
+        | opcode::JSGE_IMM
+        | opcode::JSLT_IMM
+        | opcode::JSLE_IMM => {
+            let is_x = op & 0x08 != 0; // the kernel's BPF_SRC bit
+            if (is_x && imm != 0) || (!is_x && src != 0) {
                 return Err(DecodeError::ReservedFields {
                     message: "BPF_JMP uses reserved fields",
                 });
@@ -366,6 +406,16 @@ pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 opcode::JSGE => BpfInsn::Jsge { dst, src, offset },
                 opcode::JSLT => BpfInsn::Jslt { dst, src, offset },
                 opcode::JSLE => BpfInsn::Jsle { dst, src, offset },
+                opcode::JEQ_IMM => BpfInsn::JeqImm { dst, imm, offset },
+                opcode::JNE_IMM => BpfInsn::JneImm { dst, imm, offset },
+                opcode::JGT_IMM => BpfInsn::JgtImm { dst, imm, offset },
+                opcode::JGE_IMM => BpfInsn::JgeImm { dst, imm, offset },
+                opcode::JLT_IMM => BpfInsn::JltImm { dst, imm, offset },
+                opcode::JLE_IMM => BpfInsn::JleImm { dst, imm, offset },
+                opcode::JSGT_IMM => BpfInsn::JsgtImm { dst, imm, offset },
+                opcode::JSGE_IMM => BpfInsn::JsgeImm { dst, imm, offset },
+                opcode::JSLT_IMM => BpfInsn::JsltImm { dst, imm, offset },
+                opcode::JSLE_IMM => BpfInsn::JsleImm { dst, imm, offset },
                 _ => unreachable!("compare opcode matched above"),
             })
         }
@@ -522,6 +572,37 @@ pub(crate) fn disassemble(insn: &BpfInsn) -> String {
         }
         BpfInsn::Jsle { dst, src, offset } => {
             format!("if r{} s<= r{} goto {:+}", dst, src, offset)
+        }
+        // immediate forms (#57): the kernel's `if rX == imm` notation
+        BpfInsn::JeqImm { dst, imm, offset } => {
+            format!("if r{} == {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JneImm { dst, imm, offset } => {
+            format!("if r{} != {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JgtImm { dst, imm, offset } => {
+            format!("if r{} > {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JgeImm { dst, imm, offset } => {
+            format!("if r{} >= {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JltImm { dst, imm, offset } => {
+            format!("if r{} < {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JleImm { dst, imm, offset } => {
+            format!("if r{} <= {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JsgtImm { dst, imm, offset } => {
+            format!("if r{} s> {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JsgeImm { dst, imm, offset } => {
+            format!("if r{} s>= {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JsltImm { dst, imm, offset } => {
+            format!("if r{} s< {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::JsleImm { dst, imm, offset } => {
+            format!("if r{} s<= {} goto {:+}", dst, imm, offset)
         }
         BpfInsn::Jmp { offset } => format!("goto {:+}", offset),
         BpfInsn::Call { imm } => format!("call {}", imm),
@@ -954,8 +1035,6 @@ mod tests {
             (0xb4, "MOV"),
             // BPF_JMP|BPF_JSET|BPF_K
             (0x45, "BPF_JSET"),
-            // BPF_JMP|BPF_JEQ|BPF_K (immediate compare — issue #57)
-            (0x15, "BPF_J*_K"),
             // BPF_LDX|BPF_MEM|BPF_W
             (0x61, "loads"),
             // BPF_STX|BPF_ATOMIC|BPF_DW
@@ -978,6 +1057,104 @@ mod tests {
                 needle
             );
         }
+    }
+
+    #[test]
+    fn parse_insn_compare_imm_forms() {
+        // the BPF_J*_K forms decode to the immediate compare variants
+        // (#57); the immediate is the compare operand
+        assert!(matches!(
+            parse(opcode::JEQ_IMM, 1, 0, 2, 42),
+            BpfInsn::JeqImm {
+                dst: 1,
+                imm: 42,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JNE_IMM, 1, 0, 2, -1),
+            BpfInsn::JneImm {
+                dst: 1,
+                imm: -1,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JGT_IMM, 1, 0, 2, 5),
+            BpfInsn::JgtImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JGE_IMM, 1, 0, 2, 5),
+            BpfInsn::JgeImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JLT_IMM, 1, 0, 2, 5),
+            BpfInsn::JltImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JLE_IMM, 1, 0, 2, 5),
+            BpfInsn::JleImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JSGT_IMM, 1, 0, 2, -7),
+            BpfInsn::JsgtImm {
+                dst: 1,
+                imm: -7,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JSGE_IMM, 1, 0, 2, -7),
+            BpfInsn::JsgeImm {
+                dst: 1,
+                imm: -7,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JSLT_IMM, 1, 0, 2, -7),
+            BpfInsn::JsltImm {
+                dst: 1,
+                imm: -7,
+                offset: 2
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::JSLE_IMM, 1, 0, 2, -7),
+            BpfInsn::JsleImm {
+                dst: 1,
+                imm: -7,
+                offset: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_insn_compare_imm_reserved_src() {
+        // the BPF_J*_K form reserves src_reg (check_jmp_fields)
+        let err = parse_insn(&insn_bytes(opcode::JEQ_IMM, 1, 2, 1, 5)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_JMP uses reserved fields"
+            }
+        );
     }
 
     #[test]
@@ -1167,6 +1344,90 @@ mod tests {
                 offset: 1
             }),
             "if r1 s<= r2 goto +1"
+        );
+    }
+
+    #[test]
+    fn disassemble_compare_imm_forms() {
+        assert_eq!(
+            disassemble(&BpfInsn::JeqImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 == 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JneImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 != 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JgtImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 > 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JgeImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 >= 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JltImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 < 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JleImm {
+                dst: 1,
+                imm: 5,
+                offset: 2
+            }),
+            "if r1 <= 5 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JsgtImm {
+                dst: 1,
+                imm: -1,
+                offset: 2
+            }),
+            "if r1 s> -1 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JsgeImm {
+                dst: 1,
+                imm: -1,
+                offset: 2
+            }),
+            "if r1 s>= -1 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JsltImm {
+                dst: 1,
+                imm: -1,
+                offset: 2
+            }),
+            "if r1 s< -1 goto +2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::JsleImm {
+                dst: 1,
+                imm: -1,
+                offset: 2
+            }),
+            "if r1 s<= -1 goto +2"
         );
     }
 }

@@ -77,7 +77,17 @@ pub(crate) fn step(
         | BpfInsn::Jsgt { .. }
         | BpfInsn::Jsge { .. }
         | BpfInsn::Jslt { .. }
-        | BpfInsn::Jsle { .. } => {
+        | BpfInsn::Jsle { .. }
+        | BpfInsn::JeqImm { .. }
+        | BpfInsn::JneImm { .. }
+        | BpfInsn::JgtImm { .. }
+        | BpfInsn::JgeImm { .. }
+        | BpfInsn::JltImm { .. }
+        | BpfInsn::JleImm { .. }
+        | BpfInsn::JsgtImm { .. }
+        | BpfInsn::JsgeImm { .. }
+        | BpfInsn::JsltImm { .. }
+        | BpfInsn::JsleImm { .. } => {
             unreachable!("exit and control flow are expanded by successors(), not step()")
         }
         // ALU64: rX += imm (pointer + immediate stays the only pointer
@@ -1272,6 +1282,36 @@ pub(crate) fn successors(
         BpfInsn::Jsle { dst, src, offset } => {
             cond_branch(pc, *dst, *src, *offset, CondOp::Sle, state)
         }
+        BpfInsn::JeqImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Eq, state)
+        }
+        BpfInsn::JneImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Ne, state)
+        }
+        BpfInsn::JgtImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Ugt, state)
+        }
+        BpfInsn::JgeImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Uge, state)
+        }
+        BpfInsn::JltImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Ult, state)
+        }
+        BpfInsn::JleImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Ule, state)
+        }
+        BpfInsn::JsgtImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Sgt, state)
+        }
+        BpfInsn::JsgeImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Sge, state)
+        }
+        BpfInsn::JsltImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Slt, state)
+        }
+        BpfInsn::JsleImm { dst, imm, offset } => {
+            cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Sle, state)
+        }
         // everything else falls through via step() (this includes
         // helper calls, which step() validates — #28)
         _ => {
@@ -1300,10 +1340,60 @@ pub(crate) fn cond_branch(
     op: CondOp,
     state: &VerifierState,
 ) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
-    let dst_state = read_reg(pc, state, dst)?;
     let src_state = read_reg(pc, state, src)?;
+    cond_branch_impl(pc, dst, Some(src), src_state, offset, op, state)
+}
+
+/// Immediate-form conditional branch (`BPF_J*_K`, #57). The kernel
+/// folds the immediate into a constant source register
+/// (check_cond_jmp_op), so the imm is materialized as a sign-extended
+/// constant scalar (imm32 → 64-bit, like the kernel) and the shared
+/// refinement path is reused — the constant-only exclusion (#44), the
+/// static verdicts and the NULL check (`imm == 0`) apply automatically.
+pub(crate) fn cond_branch_imm(
+    pc: u32,
+    dst: u8,
+    imm: i32,
+    offset: i16,
+    op: CondOp,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    let src_state = RegState::Scalar(ScalarBounds::constant(imm as i64));
+    cond_branch_impl(pc, dst, None, src_state, offset, op, state)
+}
+
+/// The shared refinement for both compare forms: fork the branch into
+/// taken and fall-through successors.
+///
+/// Scalar operands are refined on both sides via #16 (like the kernel's
+/// check_cond_jmp_op / regs_refine_cond_op); a branch that the static
+/// verdict (#24) rules out is not explored at all, mirroring the
+/// kernel's is_branch_taken(). A nullable pointer compared to the
+/// constant 0 is a NULL check (#27): the taken branch turns it into the
+/// scalar 0 (kernel style) and the fall-through refines it to a valid
+/// map value pointer (mark_ptr_not_null_reg). Pointers of the same type
+/// may be compared for equality without refinement; `>` on pointers and
+/// mixed-type comparisons are rejected, mirroring the kernel.
+///
+/// `src_reg` names the register holding the source operand — `None` for
+/// the immediate form, where the refined source value has no register
+/// to be written to.
+fn cond_branch_impl(
+    pc: u32,
+    dst: u8,
+    src_reg: Option<u8>,
+    src_state: RegState,
+    offset: i16,
+    op: CondOp,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    let dst_state = read_reg(pc, state, dst)?;
     let taken_pc = branch_target(pc, offset);
     let fall_pc = pc + 1;
+    let src_name = match src_reg {
+        Some(r) => format!("r{}", r),
+        None => "imm".to_string(),
+    };
 
     let out = match (dst_state, src_state) {
         (RegState::Scalar(d), RegState::Scalar(s)) => {
@@ -1314,13 +1404,17 @@ pub(crate) fn cond_branch(
             if !matches!(verdict, BranchVerdict::AlwaysNotTaken) {
                 let mut taken = *state;
                 taken.regs[dst as usize] = RegState::Scalar(t_dst);
-                taken.regs[src as usize] = RegState::Scalar(t_src);
+                if let Some(src_reg) = src_reg {
+                    taken.regs[src_reg as usize] = RegState::Scalar(t_src);
+                }
                 out.push((taken_pc, taken));
             }
             if !matches!(verdict, BranchVerdict::AlwaysTaken) {
                 let mut fall = *state;
                 fall.regs[dst as usize] = RegState::Scalar(f_dst);
-                fall.regs[src as usize] = RegState::Scalar(f_src);
+                if let Some(src_reg) = src_reg {
+                    fall.regs[src_reg as usize] = RegState::Scalar(f_src);
+                }
                 out.push((fall_pc, fall));
             }
             out
@@ -1337,7 +1431,10 @@ pub(crate) fn cond_branch(
                     let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
                         dst
                     } else {
-                        src
+                        // only the reg-reg form can have the pointer in
+                        // the source position — an immediate is never a
+                        // pointer
+                        src_reg.expect("a nullable pointer is never an immediate")
                     };
                     let (null_side, valid_side) = match op {
                         // == 0: taken is NULL, fall is the valid pointer
@@ -1356,8 +1453,8 @@ pub(crate) fn cond_branch(
                     return Err(VerificationFailure::new(
                         pc,
                         format!(
-                            "invalid comparison of r{} with r{} (different types)",
-                            dst, src
+                            "invalid comparison of r{} with {} (different types)",
+                            dst, src_name
                         ),
                     ));
                 }
@@ -1376,8 +1473,8 @@ pub(crate) fn cond_branch(
                     return Err(VerificationFailure::new(
                         pc,
                         format!(
-                            "invalid comparison of r{} with r{} (different types)",
-                            dst, src
+                            "invalid comparison of r{} with {} (different types)",
+                            dst, src_name
                         ),
                     ));
                 }
@@ -1395,10 +1492,10 @@ pub(crate) fn cond_branch(
                 return Err(VerificationFailure::new(
                     pc,
                     format!(
-                        "comparing pointers r{} {} r{} is not allowed",
+                        "comparing pointers r{} {} {} is not allowed",
                         dst,
                         op.symbol(),
-                        src
+                        src_name
                     ),
                 ));
             }
@@ -1412,8 +1509,8 @@ pub(crate) fn cond_branch(
             return Err(VerificationFailure::new(
                 pc,
                 format!(
-                    "invalid comparison of r{} with r{} (different types)",
-                    dst, src
+                    "invalid comparison of r{} with {} (different types)",
+                    dst, src_name
                 ),
             ));
         }
@@ -3523,6 +3620,145 @@ mod tests {
         .unwrap();
         assert_eq!(nexts.len(), 1);
         assert_eq!(nexts[0].0, 2);
+    }
+
+    // ── Immediate compares (BPF_J*_K, #57) ───────────────────────────────────
+
+    #[test]
+    fn successors_jeq_imm_always_taken() {
+        // the immediate form materializes the constant: r1 == 42 with
+        // r1 = 42 → only the taken successor is explored
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::constant(42));
+        let nexts = successors(
+            0,
+            &BpfInsn::JeqImm {
+                dst: 1,
+                imm: 42,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 2);
+        // only the register operand is refined — there is no source
+        // register for the immediate to write back to
+        assert_eq!(
+            nexts[0].1.regs[1],
+            RegState::Scalar(ScalarBounds::constant(42))
+        );
+    }
+
+    #[test]
+    fn successors_jeq_imm_refines_like_reg_form() {
+        // `jeq r1, 7` must refine r1 exactly like `r2 = 7; jeq r1, r2`
+        // (the kernel folds BPF_K into a constant source register)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
+
+        // reg form with a constant source register
+        let mut reg_state = state;
+        reg_state.regs[2] = RegState::Scalar(ScalarBounds::constant(7));
+        let reg_nexts = successors(
+            0,
+            &BpfInsn::Jeq {
+                dst: 1,
+                src: 2,
+                offset: 1,
+            },
+            &reg_state,
+        )
+        .unwrap();
+
+        // imm form
+        let imm_nexts = successors(
+            0,
+            &BpfInsn::JeqImm {
+                dst: 1,
+                imm: 7,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+
+        // the same successors with the same refinement of r1 (the reg
+        // form additionally keeps the constant in r2 on both branches)
+        assert_eq!(imm_nexts.len(), reg_nexts.len());
+        for (imm_succ, reg_succ) in imm_nexts.iter().zip(reg_nexts.iter()) {
+            assert_eq!(imm_succ.0, reg_succ.0);
+            assert_eq!(imm_succ.1.regs[1], reg_succ.1.regs[1]);
+            assert_eq!(
+                reg_succ.1.regs[2],
+                RegState::Scalar(ScalarBounds::constant(7))
+            );
+        }
+    }
+
+    #[test]
+    fn successors_null_check_imm_zero() {
+        // `if r0 == 0` with r0 = PtrToMapValueOrNull — the clang idiom
+        // for the #27 NULL check in its immediate form: the taken
+        // branch becomes the scalar 0, the fall-through a valid map
+        // value pointer
+        let mut state = VerifierState::initial();
+        state.regs[0] = RegState::PtrToMapValueOrNull;
+        let nexts = successors(
+            0,
+            &BpfInsn::JeqImm {
+                dst: 0,
+                imm: 0,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        let (taken_pc, taken) = &nexts[0];
+        assert_eq!(*taken_pc, 2);
+        assert_eq!(taken.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
+        let (fall_pc, fall) = &nexts[1];
+        assert_eq!(*fall_pc, 1);
+        assert_eq!(fall.regs[0], RegState::PtrToMapValue);
+    }
+
+    #[test]
+    fn successors_jsgt_imm_negative_sign_extends() {
+        // the imm is sign-extended like the kernel's imm32:
+        // jsgt r1, -1 with r1 in [0, 10] is always taken (0 > -1)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 10));
+        let nexts = successors(
+            0,
+            &BpfInsn::JsgtImm {
+                dst: 1,
+                imm: -1,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        assert_eq!(nexts.len(), 1);
+        assert_eq!(nexts[0].0, 2);
+    }
+
+    #[test]
+    fn successors_imm_pointer_compare_rejected() {
+        // a pointer compared to an immediate is rejected like the
+        // reg-form mixed-type comparison (r1 = PtrToCtx at entry)
+        let state = VerifierState::initial();
+        let err = successors(
+            0,
+            &BpfInsn::JeqImm {
+                dst: 1,
+                imm: 0,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("different types"), "{}", err.message);
     }
 
     #[test]

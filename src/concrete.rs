@@ -102,6 +102,9 @@ pub(crate) enum ConcreteFailure {
     /// A comparison the abstract rejects: pointer ordering or mixed
     /// pointer/scalar types (mirrors `cond_branch`).
     InvalidComparison { pc: u32, dst: u8, src: u8 },
+    /// An immediate-form comparison the abstract rejects: a pointer
+    /// compared to an immediate (mirrors `cond_branch_imm`).
+    InvalidComparisonImm { pc: u32, dst: u8 },
     /// A helper whose abstract return type has no concrete counterpart
     /// yet (pointer returns). Unreachable for the current corpus —
     /// map_lookup fixtures fail at argument validation.
@@ -157,6 +160,13 @@ impl std::fmt::Display for ConcreteFailure {
                     f,
                     "at insn {}: invalid comparison of r{} and r{}",
                     pc, dst, src
+                )
+            }
+            Self::InvalidComparisonImm { pc, dst } => {
+                write!(
+                    f,
+                    "at insn {}: invalid comparison of r{} with an immediate",
+                    pc, dst
                 )
             }
             Self::UnsupportedHelperReturn { pc, imm } => {
@@ -468,6 +478,16 @@ pub(crate) fn concrete_step(
         | BpfInsn::Jsge { .. }
         | BpfInsn::Jslt { .. }
         | BpfInsn::Jsle { .. }
+        | BpfInsn::JeqImm { .. }
+        | BpfInsn::JneImm { .. }
+        | BpfInsn::JgtImm { .. }
+        | BpfInsn::JgeImm { .. }
+        | BpfInsn::JltImm { .. }
+        | BpfInsn::JleImm { .. }
+        | BpfInsn::JsgtImm { .. }
+        | BpfInsn::JsgeImm { .. }
+        | BpfInsn::JsltImm { .. }
+        | BpfInsn::JsleImm { .. }
         | BpfInsn::Call { .. } => {
             unreachable!(
                 "exit, control flow and calls are expanded by the explorer (#51), not concrete_step()"
@@ -790,6 +810,36 @@ fn concrete_successors(
         BpfInsn::Jsle { dst, src, offset } => {
             concrete_cond(pc, *dst, *src, *offset, CondOp::Sle, state)
         }
+        BpfInsn::JeqImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Eq, state)
+        }
+        BpfInsn::JneImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Ne, state)
+        }
+        BpfInsn::JgtImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Ugt, state)
+        }
+        BpfInsn::JgeImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Uge, state)
+        }
+        BpfInsn::JltImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Ult, state)
+        }
+        BpfInsn::JleImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Ule, state)
+        }
+        BpfInsn::JsgtImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Sgt, state)
+        }
+        BpfInsn::JsgeImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Sge, state)
+        }
+        BpfInsn::JsltImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Slt, state)
+        }
+        BpfInsn::JsleImm { dst, imm, offset } => {
+            concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Sle, state)
+        }
         BpfInsn::Call { imm } => concrete_call(pc, *imm, state),
         // everything else falls through via concrete_step()
         _ => Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)]),
@@ -834,6 +884,45 @@ fn concrete_cond(
         },
         // mixed pointer/scalar types are never comparable
         _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
+    };
+    let next_pc = if taken {
+        branch_target(pc, offset)
+    } else {
+        pc + 1
+    };
+    Ok(vec![(next_pc, *state)])
+}
+
+/// Evaluate an immediate-form conditional branch (`BPF_J*_K`, #57) on
+/// the exact concrete values: deterministic, exactly one successor.
+/// The immediate is sign-extended to 64 bits, like the kernel's imm32
+/// materialization of the constant source register.
+fn concrete_cond_imm(
+    pc: u32,
+    dst: u8,
+    imm: i32,
+    offset: i16,
+    op: CondOp,
+    state: &ConcreteState,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    let dst_value = read_concrete_reg(pc, state, dst)?;
+    let s = imm as i64 as u64;
+    let taken = match dst_value {
+        ConcreteValue::Scalar(d) => match op {
+            CondOp::Eq => d == s,
+            CondOp::Ne => d != s,
+            CondOp::Ugt => d > s,
+            CondOp::Uge => d >= s,
+            CondOp::Ult => d < s,
+            CondOp::Ule => d <= s,
+            CondOp::Sgt => (d as i64) > (imm as i64),
+            CondOp::Sge => (d as i64) >= (imm as i64),
+            CondOp::Slt => (d as i64) < (imm as i64),
+            CondOp::Sle => (d as i64) <= (imm as i64),
+        },
+        // a pointer compared to an immediate is never comparable
+        // (mirror of the abstract cond_branch_impl)
+        _ => return Err(ConcreteFailure::InvalidComparisonImm { pc, dst }),
     };
     let next_pc = if taken {
         branch_target(pc, offset)
@@ -1988,6 +2077,69 @@ mod tests {
         let program = vec![BpfInsn::Call { imm: 1 }];
         let err = run_concrete(&program, &[]).unwrap_err();
         assert_eq!(err, ConcreteFailure::HelperArgMismatch { pc: 0, arg: 1 });
+    }
+
+    // ── Immediate compares (BPF_J*_K, #57) ───────────────────────────────────
+
+    #[test]
+    fn run_imm_compare_deterministic() {
+        // a concrete immediate compare takes exactly one successor:
+        // r1 = 5; jeq r1, 5, +1 → taken (the fall-through is never
+        // explored)
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::MovImm { dst: 1, imm: 5 },
+            BpfInsn::JeqImm {
+                dst: 1,
+                imm: 5,
+                offset: 1,
+            },
+            BpfInsn::Exit, // fall-through (never reached)
+            BpfInsn::Exit, // taken target
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert!(!run.inconclusive);
+        assert!(
+            run.visited.iter().all(|(pc, _)| *pc != 3),
+            "the fall-through must not be explored"
+        );
+        assert_eq!(run.outcomes.len(), 1);
+    }
+
+    #[test]
+    fn run_jsgt_imm_negative_sign_extends() {
+        // the imm sign-extends to 64 bits like the kernel:
+        // r1 = 0; jsgt r1, -1 → 0 > -1 signed → taken
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::JsgtImm {
+                dst: 1,
+                imm: -1,
+                offset: 1,
+            },
+            BpfInsn::Exit,
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete(&program, &[]).unwrap();
+        assert!(!run.inconclusive);
+        assert!(
+            run.visited.iter().all(|(pc, _)| *pc != 3),
+            "the fall-through must not be explored"
+        );
+    }
+
+    #[test]
+    fn run_imm_compare_pointer_rejected() {
+        // a pointer compared to an immediate fails concretely too
+        // (r1 = CtxPtr at entry, mirror of the abstract rejection)
+        let program = vec![BpfInsn::JeqImm {
+            dst: 1,
+            imm: 0,
+            offset: 1,
+        }];
+        let err = run_concrete(&program, &[]).unwrap_err();
+        assert_eq!(err, ConcreteFailure::InvalidComparisonImm { pc: 0, dst: 1 });
     }
 
     #[test]
