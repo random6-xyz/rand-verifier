@@ -8,8 +8,10 @@
 //! and operand passes (#79/#80), driven by a fixpoint driver (#81) and
 //! a CLI (#82).
 
+pub mod fixup;
 pub mod replay;
 
+pub use fixup::delete_insns;
 pub use replay::{
     Baseline, FindingSpec, Invariant, ReduceError, Sides, evaluate_bytes, invariant_for,
     is_kernel_dependent, load_and_replay, load_finding, replay_check,
