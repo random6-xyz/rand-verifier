@@ -127,8 +127,8 @@ BPF-to-BPF/kfunc calls, …) are rejected as unsupported.
 
 Raw bytecode fixtures live in `tests/programs/`:
 
-- `tests/programs/accept/` — 28 programs that must pass
-- `tests/programs/reject/` — 29 programs that must fail
+- `tests/programs/accept/` — 29 programs that must pass
+- `tests/programs/reject/` — 30 programs that must fail
 
 Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list.
 
