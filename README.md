@@ -174,6 +174,28 @@ host-dependent and recorded separately). Triage groups are the Phase 6 analysis
 entry points — they flow into the failure reducer (v0.8) and the kernel patch
 work (v1.0).
 
+### Failure reducer (Phase 5, v0.8)
+
+Automatically minimize fuzzer findings down to a human-analyzable minimal
+reproducer (500 instructions → 50 → 10 → minimal; design: issue #75). The
+reduction invariant is the v0.7 oracle itself: a candidate must re-classify
+to the same finding (`oracle::classify`, including the kernel reason category
+for kernel-reject-based findings; verdict flips must keep the recorded flip
+direction), and the final re-check is mandatory — a reduced program that no
+longer reproduces the finding is a reducer bug and fails the run loudly.
+
+```sh
+cargo run --bin reduce -- <finding-dir|group-dir> [--kernel] [--strict] [--budget N]
+```
+
+Kernel-dependent findings (precision/soundness candidates, rv gaps) need the
+privileged kernel column (`--kernel`; the tool refuses without it);
+rv-soundness bugs and verdict flips reduce unprivileged with mini + concrete.
+Passes run in the order slice → ddmin → operand minimization to a fixpoint,
+with a shared hash cache and an oracle-check budget. Reduced artifacts land in
+`--out-dir/reduced/<finding>/` (`prog.bin` + `prog.dump` + `reduce.json` with
+the per-pass size timeline) and are the v0.9 analysis entry points.
+
 Whitelist policy: on top of the v0.6 name-based diff whitelist, the first
 kernel-backed campaigns added one **category-based** entry — a mini reject with
 a `stack slot ... is uninitialized` reason plus kernel ACCEPT is the privileged
@@ -260,7 +282,7 @@ The project is a research framework in progress. The next phases:
 2. **Concrete execution engine** — an interpreter that checks the abstract state always covers the concrete results.
 3. **Linux differential verifier** — run the same program through rand-verifier, the concrete interpreter, and the real Linux verifier.
 4. **Verifier fuzzer** — generate eBPF programs to search for `Linux verifier: REJECT` vs `Concrete execution: SAFE` discrepancies.
-5. **Failure reducer** — automatically minimize discovered testcases down to a minimal reproducer.
+5. **Failure reducer** — automatically minimize discovered testcases down to a minimal reproducer (v0.8, see the section above).
 6. **Linux verifier analysis** — trace comparisons and precision-loss analysis on the minimal reproducer.
 7. **Kernel patch** — a soundness-preserving fix for `kernel/bpf/verifier.c` plus a BPF selftest.
 8. **Upstream** — submit `[PATCH bpf-next] bpf: verifier: ...` and land it.
