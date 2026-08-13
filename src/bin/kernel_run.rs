@@ -23,7 +23,7 @@ use std::process;
 use rand_verifier::insn::{disassemble, parse_insn};
 use rand_verifier::klog::ReasonCategory;
 use rand_verifier::krun::{
-    KernelOutcome, drop_cap_perfmon, load_with_kernel_debug, load_with_kernel_verbose,
+    KernelOutcome, drop_privileged_caps, load_with_kernel_debug, load_with_kernel_verbose,
 };
 
 /// Print the disassembly of a program (decode errors are shown inline —
@@ -146,7 +146,7 @@ fn main() {
     let dump_log = rest.contains(&"--log");
     let debug_log = rest.contains(&"--log2");
     if strict {
-        match drop_cap_perfmon() {
+        match drop_privileged_caps() {
             Ok(msg) => eprintln!("strict mode: {}", msg),
             Err(e) => eprintln!("strict mode: {}", e),
         }

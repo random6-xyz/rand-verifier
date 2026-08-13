@@ -9,11 +9,13 @@ pub const LOG_BUF_SIZE: usize = 1 << 20;
 
 /// `_LINUX_CAPABILITY_VERSION_3` (linux/capability.h).
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-/// CAP_PERFMON (linux/capability.h): the capability that makes the
-/// kernel verifier lenient — `allow_uninit_stack` and `allow_ptr_leaks`
-/// are both `bpf_token_capable(token, CAP_PERFMON)`
-/// (include/linux/bpf.h).
-const CAP_PERFMON: u32 = 38;
+/// CAP_BPF (linux/capability.h): enough for BPF_PROG_LOAD —
+/// `bpf_cap = bpf_token_capable(token, CAP_BPF)` passes the
+/// `unprivileged_bpf_disabled` gate (kernel/bpf/syscall.c).
+const CAP_BPF: u32 = 39;
+/// CAP_NET_ADMIN: kept alongside CAP_BPF for net-namespace checks
+/// (bpf_net_capable). It does not trigger any verifier leniency.
+const CAP_NET_ADMIN: u32 = 12;
 
 /// The outcome of loading a program into the real kernel verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,15 +93,20 @@ fn log_text(log_buf: &[u8]) -> String {
     String::from_utf8_lossy(&log_buf[..end]).into_owned()
 }
 
-/// Drop CAP_PERFMON from the process so the kernel verifier applies its
-/// strict rules: `allow_uninit_stack` and `allow_ptr_leaks` are false
-/// for loaders without CAP_PERFMON (bpf_allow_uninit_stack /
-/// bpf_allow_ptr_leaks in include/linux/bpf.h). Loading keeps working —
-/// bpf_net_capable() needs only CAP_NET_ADMIN or CAP_SYS_ADMIN.
+/// Drop every capability except CAP_BPF and CAP_NET_ADMIN so the kernel
+/// verifier applies its strict rules.
 ///
-/// Returns a diagnostic message, or an error when the capability could
-/// not be dropped.
-pub fn drop_cap_perfmon() -> Result<String, String> {
+/// The privileged leniencies are gated by `bpf_token_capable(token,
+/// CAP_PERFMON)` (`allow_uninit_stack`, `allow_ptr_leaks`, spec-bypass
+/// — include/linux/bpf.h), and `bpf_ns_capable` treats **CAP_SYS_ADMIN
+/// as a superset of every BPF capability** (kernel/bpf/token.c), so
+/// dropping CAP_PERFMON alone is not enough — CAP_SYS_ADMIN must go
+/// too. CAP_BPF is kept so `bpf_cap` still passes the
+/// `unprivileged_bpf_disabled` gate and loads keep working.
+///
+/// Returns a diagnostic message, or an error when the capabilities
+/// could not be dropped.
+pub fn drop_privileged_caps() -> Result<String, String> {
     #[repr(C)]
     #[derive(Default)]
     struct CapHeader {
@@ -131,12 +138,14 @@ pub fn drop_cap_perfmon() -> Result<String, String> {
             std::io::Error::last_os_error()
         ));
     }
-    let idx = (CAP_PERFMON / 32) as usize;
-    let bit = 1u32 << (CAP_PERFMON % 32);
-    let had_effective = data[idx].effective & bit != 0;
-    let had_permitted = data[idx].permitted & bit != 0;
-    data[idx].effective &= !bit;
-    data[idx].permitted &= !bit;
+    // keep only CAP_BPF and CAP_NET_ADMIN (both in the first u32)
+    let keep = (1u32 << (CAP_BPF % 32)) | (1u32 << (CAP_NET_ADMIN % 32));
+    data[0].effective = keep;
+    data[0].permitted = keep;
+    data[0].inheritable = 0;
+    data[1].effective = 0;
+    data[1].permitted = 0;
+    data[1].inheritable = 0;
     let ret = unsafe {
         libc::syscall(
             libc::SYS_capset,
@@ -159,13 +168,10 @@ pub fn drop_cap_perfmon() -> Result<String, String> {
             after.as_mut_ptr() as *mut libc::c_void,
         )
     };
-    let gone = ret == 0 && after[idx].effective & bit == 0;
-    if had_effective && !gone {
-        Err("CAP_PERFMON still present after capset".to_string())
-    } else if !had_effective && !had_permitted {
-        Ok("CAP_PERFMON was not present in the process caps".to_string())
+    if ret != 0 || after[0].effective != keep || after[1].effective != 0 {
+        Err("capset did not take effect (CAP_SYS_ADMIN/CAP_PERFMON still present)".to_string())
     } else {
-        Ok("CAP_PERFMON dropped".to_string())
+        Ok("only CAP_BPF+CAP_NET_ADMIN kept — privileged verifier rules disabled".to_string())
     }
 }
 

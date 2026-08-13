@@ -19,7 +19,7 @@ use std::process;
 use rand_verifier::diff::{DiffClass, SideVerdict, categorize_mini_reason, classify, whitelisted};
 use rand_verifier::env::BpfVerifierEnv;
 use rand_verifier::error::Verdict;
-use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel};
+use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel};
 
 /// One compared program: the two verdicts plus the classification.
 struct DiffEntry {
@@ -110,7 +110,7 @@ fn main() {
     // — a like-for-like comparison with the rand-verifier side. Loading
     // still works with CAP_NET_ADMIN/CAP_SYS_ADMIN only.
     if unsafe { libc::geteuid() } == 0 {
-        match drop_cap_perfmon() {
+        match drop_privileged_caps() {
             Ok(msg) => eprintln!("strict mode: {}", msg),
             Err(e) => eprintln!("strict mode: {}", e),
         }
