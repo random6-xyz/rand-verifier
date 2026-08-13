@@ -127,8 +127,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let strict = args.iter().any(|a| a == "--strict");
     if strict {
-        drop_cap_perfmon();
-        eprintln!("strict mode: CAP_PERFMON dropped");
+        match drop_cap_perfmon() {
+            Ok(()) => eprintln!("strict mode: CAP_PERFMON dropped"),
+            Err(e) => eprintln!("strict mode: {}", e),
+        }
     }
     match args.iter().find(|a| *a != "--strict").map(String::as_str) {
         Some("--all") => {

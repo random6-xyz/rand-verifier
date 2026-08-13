@@ -110,8 +110,12 @@ fn main() {
     // — a like-for-like comparison with the rand-verifier side. Loading
     // still works with CAP_NET_ADMIN/CAP_SYS_ADMIN only.
     if unsafe { libc::geteuid() } == 0 {
-        drop_cap_perfmon();
-        eprintln!("strict mode: CAP_PERFMON dropped — uninit-stack / ptr-leak leniency disabled");
+        match drop_cap_perfmon() {
+            Ok(()) => eprintln!(
+                "strict mode: CAP_PERFMON dropped — uninit-stack / ptr-leak leniency disabled"
+            ),
+            Err(e) => eprintln!("strict mode: {}", e),
+        }
     }
 
     let mut entries = Vec::new();

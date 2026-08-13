@@ -97,9 +97,9 @@ fn log_text(log_buf: &[u8]) -> String {
 /// bpf_allow_ptr_leaks in include/linux/bpf.h). Loading keeps working —
 /// bpf_net_capable() needs only CAP_NET_ADMIN or CAP_SYS_ADMIN.
 ///
-/// Best effort: fails silently when the process cannot change its
-/// capabilities (unprivileged — the load will fail with EPERM anyway).
-pub fn drop_cap_perfmon() {
+/// Returns an error (with diagnostics) when the capability could not
+/// be dropped.
+pub fn drop_cap_perfmon() -> Result<(), String> {
     #[repr(C)]
     #[derive(Default)]
     struct CapHeader {
@@ -126,18 +126,42 @@ pub fn drop_cap_perfmon() {
         )
     };
     if ret != 0 {
-        return;
+        return Err(format!(
+            "capget failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let set = &mut data[(CAP_PERFMON / 32) as usize];
     let bit = 1u32 << (CAP_PERFMON % 32);
+    let had = set.effective & bit != 0;
     set.effective &= !bit;
     set.permitted &= !bit;
-    unsafe {
+    let ret = unsafe {
         libc::syscall(
             libc::SYS_capset,
             &hdr as *const CapHeader as *const libc::c_void,
             data.as_ptr() as *const libc::c_void,
-        );
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "capset failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // verify the drop took effect
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut hdr as *mut CapHeader as *mut libc::c_void,
+            data.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    let gone = ret == 0 && data[(CAP_PERFMON / 32) as usize].effective & bit == 0;
+    if had && !gone {
+        Err("CAP_PERFMON still present after capset".to_string())
+    } else {
+        Ok(())
     }
 }
 
