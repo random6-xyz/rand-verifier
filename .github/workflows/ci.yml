@@ -60,3 +60,44 @@ jobs:
           name: diff-report
           path: /tmp/diff.json
           if-no-files-found: error
+
+      - name: Run a short kernel-backed fuzz campaign
+        # same exit contract as the diff harness: a non-whitelisted
+        # finding (precision/soundness candidate, rv gap/bug) fails CI
+        # so a discovered candidate never goes unnoticed (#73)
+        run: sudo ./target/debug/fuzz --seed 7 --iters 50 --kernel --out-dir /tmp/fuzz-kernel
+
+      - name: Upload the kernel campaign artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-kernel
+          path: /tmp/fuzz-kernel/
+          if-no-files-found: error
+
+  fuzz:
+    name: Fuzzer smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the fuzz binary
+        run: cargo build --bin fuzz
+
+      - name: Run the fuzzer regression suite
+        # fixed-seed determinism, classification invariants, opcode
+        # coverage, finding replay — all without a bpf() syscall (#72)
+        run: cargo test fuzz:: --lib
+
+      - name: Run an unprivileged smoke campaign
+        # kernel columns are skipped without privileges; exits 1 only
+        # on a non-whitelisted finding (e.g. a rand-verifier model bug)
+        run: ./target/debug/fuzz --seed 42 --iters 200 --out-dir /tmp/fuzz-out
+
+      - name: Upload the campaign summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-summary
+          path: /tmp/fuzz-out/summary.json
+          if-no-files-found: error
