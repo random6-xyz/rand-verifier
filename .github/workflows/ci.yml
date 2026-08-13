@@ -47,7 +47,7 @@ jobs:
       - name: Run the differential harness
         # verdict matrix + JSON report; exits 1 on non-whitelisted
         # kernel-accepts findings (see src/diff.rs, docs/DIFFERENTIAL_PLAN.md §10)
-        run: sudo -E cargo run --bin diff -- --json /tmp/diff.json
+        run: sudo env "PATH=$PATH" cargo run --bin diff -- --json /tmp/diff.json
 
       - name: Upload the diff report
         uses: actions/upload-artifact@v4
