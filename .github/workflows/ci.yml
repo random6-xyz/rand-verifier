@@ -31,3 +31,32 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  diff:
+    name: Kernel differential check
+    # hosted runners have passwordless sudo and run directly in a VM, so
+    # `sudo` provides the capabilities for the raw bpf() syscall. Do NOT
+    # switch this to a container: job — Docker's default seccomp profile
+    # blocks the bpf() syscall entirely.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the diff binary
+        run: cargo build --bin diff
+
+      - name: Run the differential harness
+        # build as the runner user, run only the binary as root —
+        # sudo resets PATH (secure_path) and HOME, which would hide
+        # cargo/rustup from root. Exits 1 on non-whitelisted
+        # kernel-accepts findings (src/diff.rs, docs/DIFFERENTIAL_PLAN.md §10)
+        run: sudo ./target/debug/diff -- --json /tmp/diff.json
+
+      - name: Upload the diff report
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-report
+          path: /tmp/diff.json
+          if-no-files-found: error
