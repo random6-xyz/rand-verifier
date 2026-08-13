@@ -17,8 +17,10 @@ The milestones completed so far:
 | **v0.5** | Concrete execution engine | An interpreter that checks the abstract state always covers the concrete results (soundness), plus a coverage checker |
 | **v0.6** | Linux differential verifier | Native eBPF input, kernel-runner via the raw `bpf()` syscall, verdict matrix vs the kernel, whitelisted design differences |
 | **v0.7** | Verifier fuzzer | Deterministic program generation + seed-based mutation, oracle classification matrix, triage/dedup, campaign runner |
+| **v0.8** | Failure reducer | Finding replay + reduction invariant, offset-fixed deletion, ddmin with cache/budget, CFG/operand passes, reduce CLI |
 
-The next milestone — the **failure reducer** (automatic testcase minimization) — is planned as described in the [Roadmap](#roadmap) section below.
+The next milestone — the **Linux verifier analysis** (v0.9) — starts from the
+minimal reproducers the reducer produces.
 
 ## Verification pipeline
 
@@ -196,6 +198,24 @@ with a shared hash cache and an oracle-check budget. Reduced artifacts land in
 `--out-dir/reduced/<finding>/` (`prog.bin` + `prog.dump` + `reduce.json` with
 the per-pass size timeline) and are the v0.9 analysis entry points.
 
+First empirical run (v0.8, 2026-08 — the v0.7 mutation campaign findings,
+unprivileged):
+
+| findings | original total | reduced total | final sizes | oracle checks |
+|----------|---------------|---------------|-------------|---------------|
+| 30 verdict flips | 178 insns | 33 insns | 27 × 1 insn, 3 × 2 insns | 133 (43 cache hits) |
+
+All 30 flips reduced with the classification preserved; every pass family
+fired (CFG 23×, ddmin 31×, operand 8×). Examples: `mseed-5-3` (8 insns) →
+`[exit]` — a minimal r0-uninit reject; `mseed-5-107` (8 insns) →
+`[call 7; exit]` — the helper-call shape that cannot shrink further under
+the flip invariant; `mseed-5-186` (7 insns) → `[r0 = 0; exit]`. A reduced
+verdict flip is the minimal program with the *flipped* verdict — the
+flip-boundary analysis itself is v0.9 material. The kernel-dependent
+`rv-precision-gap` group (mseed-5-99) is reduced by the privileged CI job
+(`tests/data/reduce/rv-precision-gap-mseed-5-99`, #83) and is the primary
+v0.9 entry point.
+
 Whitelist policy: on top of the v0.6 name-based diff whitelist, the first
 kernel-backed campaigns added one **category-based** entry — a mini reject with
 a `stack slot ... is uninitialized` reason plus kernel ACCEPT is the privileged
@@ -261,7 +281,7 @@ Raw bytecode fixtures live in `tests/programs/`:
 
 Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list.
 
-Run the test suite (161 unit tests, including the corpus):
+Run the test suite (453 tests — unit, corpus, and the reducer integration suite):
 
 ```sh
 cargo test
@@ -271,8 +291,8 @@ cargo test
 
 GitHub Actions runs `cargo check`, `cargo test`, `cargo fmt --check`, and `cargo clippy -D warnings` on every push/PR to `main`, plus:
 
-- a **fuzzer smoke job** (unprivileged) — the fixed-seed regression suite (#72) and a short generation campaign;
-- a **kernel differential job** (privileged runner) — the corpus diff plus a short kernel-backed fuzz campaign (#73), both failing on non-whitelisted findings.
+- a **fuzzer smoke job** (unprivileged) — the fixed-seed regression suite (#72), a short generation campaign, and the unprivileged reducer smoke (#83);
+- a **kernel differential job** (privileged runner) — the corpus diff, a short kernel-backed fuzz campaign (#73), and the kernel-backed reduction of the rv-precision-gap fixture (#83), all failing on non-whitelisted findings.
 
 ## Roadmap
 
@@ -282,8 +302,8 @@ The project is a research framework in progress. The next phases:
 2. **Concrete execution engine** — an interpreter that checks the abstract state always covers the concrete results.
 3. **Linux differential verifier** — run the same program through rand-verifier, the concrete interpreter, and the real Linux verifier.
 4. **Verifier fuzzer** — generate eBPF programs to search for `Linux verifier: REJECT` vs `Concrete execution: SAFE` discrepancies.
-5. **Failure reducer** — automatically minimize discovered testcases down to a minimal reproducer (v0.8, see the section above).
-6. **Linux verifier analysis** — trace comparisons and precision-loss analysis on the minimal reproducer.
+5. **Failure reducer** — automatically minimize discovered testcases down to a minimal reproducer (v0.8 ✅, see the section above).
+6. **Linux verifier analysis** — trace comparisons and precision-loss analysis on the reduced reproducers (v0.9, next — the mseed-5-99 minimal form from the CI kernel-backed job is the entry point).
 7. **Kernel patch** — a soundness-preserving fix for `kernel/bpf/verifier.c` plus a BPF selftest.
 8. **Upstream** — submit `[PATCH bpf-next] bpf: verifier: ...` and land it.
 
