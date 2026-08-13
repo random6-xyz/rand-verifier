@@ -3,6 +3,7 @@
 //! The crate is organized around the milestone structure of the project:
 //!
 //! - [`insn`] — instruction representation and decoding
+//! - [`klog`] — kernel verifier log parsing and reason categories (#59)
 //! - [`state`] — abstract register/stack state (micro pass)
 //! - [`exec`] — abstract instruction execution and branch expansion
 //! - [`cfg`] — control flow graph checks (nano pass)
@@ -21,6 +22,7 @@ pub mod error;
 pub mod exec;
 pub mod helper;
 pub mod insn;
+pub mod klog;
 pub mod mini;
 pub mod state;
 pub mod tnum;

@@ -80,9 +80,11 @@ pub(crate) mod opcode {
     pub const EXIT: u8 = 0x95; // BPF_JMP | BPF_EXIT
 }
 
+/// The supported eBPF subset, decoded from the kernel encoding (see
+/// [`opcode`]).
 #[derive(Debug, Clone)]
 // register fields (dst/src/imm/offset) are consumed by state tracking (v0.2)
-pub(crate) enum BpfInsn {
+pub enum BpfInsn {
     MovImm { dst: u8, imm: i32 },
     MovReg { dst: u8, src: u8 },
     // ALU64
@@ -189,7 +191,7 @@ impl BpfInsn {
 /// (`bpf_opcode_in_insntable` + `check_insn_fields` in verifier.c).
 /// Decode failures are program rejections — never internal errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DecodeError {
+pub enum DecodeError {
     /// The opcode is not in the kernel's instruction table.
     UnknownOpcode { op: u8 },
     /// A valid kernel opcode this verifier does not implement yet.
@@ -296,7 +298,7 @@ fn unsupported_reason(op: u8) -> Option<&'static str> {
 /// fields (check_insn_fields, "BPF_* uses reserved fields"). Valid
 /// kernel opcodes the verifier does not implement are rejected as
 /// unsupported.
-pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
+pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
     let op = bytes[0];
     let regs = bytes[1];
     let dst = regs & 0x0F;
@@ -502,7 +504,7 @@ pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
 }
 
 /// Render a single instruction in a readable eBPF-like syntax.
-pub(crate) fn disassemble(insn: &BpfInsn) -> String {
+pub fn disassemble(insn: &BpfInsn) -> String {
     match insn {
         BpfInsn::MovImm { dst, imm } => format!("r{} = {}", dst, imm),
         BpfInsn::MovReg { dst, src } => format!("r{} = r{}", dst, src),

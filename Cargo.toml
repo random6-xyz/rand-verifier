@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+# raw bpf() syscall for the kernel-runner binary (#59)
+libc = "0.2"
