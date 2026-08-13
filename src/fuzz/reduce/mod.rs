@@ -10,11 +10,13 @@
 
 pub mod ddmin;
 pub mod fixup;
+pub mod operand;
 pub mod passes;
 pub mod replay;
 
 pub use ddmin::{OracleCache, ddmin};
 pub use fixup::delete_insns;
+pub use operand::operand_candidates;
 pub use passes::{dead_code, failure_anchor, simplify_dead_side, slice_to_anchor};
 pub use replay::{
     Baseline, FindingSpec, Invariant, ReduceError, Sides, evaluate_bytes, invariant_for,
