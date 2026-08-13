@@ -97,9 +97,9 @@ fn log_text(log_buf: &[u8]) -> String {
 /// bpf_allow_ptr_leaks in include/linux/bpf.h). Loading keeps working —
 /// bpf_net_capable() needs only CAP_NET_ADMIN or CAP_SYS_ADMIN.
 ///
-/// Returns an error (with diagnostics) when the capability could not
-/// be dropped.
-pub fn drop_cap_perfmon() -> Result<(), String> {
+/// Returns a diagnostic message, or an error when the capability could
+/// not be dropped.
+pub fn drop_cap_perfmon() -> Result<String, String> {
     #[repr(C)]
     #[derive(Default)]
     struct CapHeader {
@@ -131,11 +131,12 @@ pub fn drop_cap_perfmon() -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
-    let set = &mut data[(CAP_PERFMON / 32) as usize];
+    let idx = (CAP_PERFMON / 32) as usize;
     let bit = 1u32 << (CAP_PERFMON % 32);
-    let had = set.effective & bit != 0;
-    set.effective &= !bit;
-    set.permitted &= !bit;
+    let had_effective = data[idx].effective & bit != 0;
+    let had_permitted = data[idx].permitted & bit != 0;
+    data[idx].effective &= !bit;
+    data[idx].permitted &= !bit;
     let ret = unsafe {
         libc::syscall(
             libc::SYS_capset,
@@ -150,18 +151,21 @@ pub fn drop_cap_perfmon() -> Result<(), String> {
         ));
     }
     // verify the drop took effect
+    let mut after = [CapData::default(); 2];
     let ret = unsafe {
         libc::syscall(
             libc::SYS_capget,
             &mut hdr as *mut CapHeader as *mut libc::c_void,
-            data.as_mut_ptr() as *mut libc::c_void,
+            after.as_mut_ptr() as *mut libc::c_void,
         )
     };
-    let gone = ret == 0 && data[(CAP_PERFMON / 32) as usize].effective & bit == 0;
-    if had && !gone {
+    let gone = ret == 0 && after[idx].effective & bit == 0;
+    if had_effective && !gone {
         Err("CAP_PERFMON still present after capset".to_string())
+    } else if !had_effective && !had_permitted {
+        Ok("CAP_PERFMON was not present in the process caps".to_string())
     } else {
-        Ok(())
+        Ok("CAP_PERFMON dropped".to_string())
     }
 }
 
@@ -172,11 +176,16 @@ pub fn drop_cap_perfmon() -> Result<(), String> {
 /// (`kernel.unprivileged_bpf_disabled = 2`): without root / CAP_BPF the
 /// outcome is [`KernelOutcome::Privilege`].
 pub fn load_with_kernel(insns: &[u8]) -> KernelOutcome {
+    load_with_kernel_verbose(insns).0
+}
+
+/// [`load_with_kernel`] plus the raw verifier log (diagnostics).
+pub fn load_with_kernel_verbose(insns: &[u8]) -> (KernelOutcome, String) {
     if insns.is_empty() || !insns.len().is_multiple_of(8) {
-        return KernelOutcome::InvalidProgram;
+        return (KernelOutcome::InvalidProgram, String::new());
     }
     let mut log_buf = vec![0u8; LOG_BUF_SIZE];
-    match bpf_prog_load(insns, &mut log_buf) {
+    let outcome = match bpf_prog_load(insns, &mut log_buf) {
         Ok(fd) => {
             // the fd is only a proof of acceptance — nothing to attach
             unsafe { libc::close(fd) };
@@ -184,19 +193,21 @@ pub fn load_with_kernel(insns: &[u8]) -> KernelOutcome {
         }
         Err(errno) => {
             if errno == libc::EPERM {
-                return KernelOutcome::Privilege;
-            }
-            let log = log_text(&log_buf);
-            match parse_verifier_log(&log) {
-                Some((insn_idx, message)) => KernelOutcome::Reject {
-                    insn_idx,
-                    category: categorize_reason(&message),
-                    message,
-                },
-                None => KernelOutcome::NoErrorLine { errno },
+                KernelOutcome::Privilege
+            } else {
+                let log = log_text(&log_buf);
+                match parse_verifier_log(&log) {
+                    Some((insn_idx, message)) => KernelOutcome::Reject {
+                        insn_idx,
+                        category: categorize_reason(&message),
+                        message,
+                    },
+                    None => KernelOutcome::NoErrorLine { errno },
+                }
             }
         }
-    }
+    };
+    (outcome, log_text(&log_buf))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────

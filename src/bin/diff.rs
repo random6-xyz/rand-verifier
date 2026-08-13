@@ -111,9 +111,7 @@ fn main() {
     // still works with CAP_NET_ADMIN/CAP_SYS_ADMIN only.
     if unsafe { libc::geteuid() } == 0 {
         match drop_cap_perfmon() {
-            Ok(()) => eprintln!(
-                "strict mode: CAP_PERFMON dropped — uninit-stack / ptr-leak leniency disabled"
-            ),
+            Ok(msg) => eprintln!("strict mode: {}", msg),
             Err(e) => eprintln!("strict mode: {}", e),
         }
     }

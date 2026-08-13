@@ -5,8 +5,10 @@
 //! Usage:
 //!
 //! ```sh
-//! kernel_run <program-file>   # verify one program
-//! kernel_run --all            # verify every tests/programs corpus program
+//! kernel_run <program-file>              # verify one program
+//! kernel_run --all                       # verify every corpus program
+//! kernel_run --strict <program-file>     # drop CAP_PERFMON first
+//! kernel_run --log <program-file>        # also dump the verifier log
 //! ```
 //!
 //! Loading is privileged on most systems
@@ -20,7 +22,7 @@ use std::process;
 
 use rand_verifier::insn::{disassemble, parse_insn};
 use rand_verifier::klog::ReasonCategory;
-use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel};
+use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel_verbose};
 
 /// Print the disassembly of a program (decode errors are shown inline —
 /// the kernel would reject them as "unknown opcode").
@@ -50,8 +52,10 @@ fn category_name(category: ReasonCategory) -> &'static str {
 }
 
 /// Load one program and print the outcome: ACCEPT / REJECT (+ reason
-/// category) / privileged-load failure.
-fn run_program(path: &Path, verbose: bool) {
+/// category) / privileged-load failure. With `dump_log` the raw
+/// verifier log is printed too (accepts included — it shows the whole
+/// trace).
+fn run_program(path: &Path, dump_log: bool) {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -60,11 +64,12 @@ fn run_program(path: &Path, verbose: bool) {
         }
     };
 
-    if verbose {
+    if dump_log {
         print_program(&data);
     }
 
-    match load_with_kernel(&data) {
+    let (outcome, log) = load_with_kernel_verbose(&data);
+    match &outcome {
         KernelOutcome::Accept => println!("{}: ACCEPT", path.display()),
         KernelOutcome::Reject {
             insn_idx,
@@ -76,7 +81,7 @@ fn run_program(path: &Path, verbose: bool) {
                 path.display(),
                 insn_idx,
                 message,
-                category_name(category)
+                category_name(*category)
             );
         }
         KernelOutcome::Privilege => println!(
@@ -92,6 +97,10 @@ fn run_program(path: &Path, verbose: bool) {
             "{}: not a valid program (empty or not a multiple of 8 bytes)",
             path.display()
         ),
+    }
+    if dump_log && !log.is_empty() {
+        println!("--- verifier log ---");
+        println!("{}", log);
     }
 }
 
@@ -114,31 +123,38 @@ fn corpus_programs() -> Vec<PathBuf> {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: kernel_run <program-file> | kernel_run --all | kernel_run --strict --all\n\
+        "Usage: kernel_run [--strict] [--log] <program-file> | --all\n\
          Loads an eBPF program into the kernel verifier via the raw bpf() syscall.\n\
          Requires root / CAP_BPF on systems with unprivileged BPF disabled.\n\
          --strict drops CAP_PERFMON so the verifier applies its strict rules\n\
-         (uninit-stack reads and pointer leaks are rejected)."
+         (uninit-stack reads and pointer leaks are rejected).\n\
+         --log dumps the full verifier log (accepts included)."
     );
     process::exit(2);
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let strict = args.iter().any(|a| a == "--strict");
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let strict = rest.contains(&"--strict");
+    let dump_log = rest.contains(&"--log");
     if strict {
         match drop_cap_perfmon() {
-            Ok(()) => eprintln!("strict mode: CAP_PERFMON dropped"),
+            Ok(msg) => eprintln!("strict mode: {}", msg),
             Err(e) => eprintln!("strict mode: {}", e),
         }
     }
-    match args.iter().find(|a| *a != "--strict").map(String::as_str) {
+    match rest
+        .iter()
+        .find(|a| **a != "--strict" && **a != "--log")
+        .copied()
+    {
         Some("--all") => {
             for path in corpus_programs() {
                 run_program(&path, false);
             }
         }
-        Some(path) => run_program(Path::new(path), true),
+        Some(path) => run_program(Path::new(path), dump_log),
         None => usage(),
     }
 }
