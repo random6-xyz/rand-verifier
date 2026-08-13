@@ -91,18 +91,40 @@ A verification failure is a normal result (`Ok(Verdict::Unsafe)`) — only I/O a
 Load a program into the real kernel verifier via the raw `bpf()` syscall (no libbpf):
 
 ```sh
-cargo run --bin kernel_run -- tests/programs/accept/minimal_exit   # one program
+cargo run --bin kernel_run -- tests/programs/accept/minimal_exit   # one program (disassembly + verdict)
 cargo run --bin kernel_run -- --all                                 # the whole corpus
+cargo run --bin kernel_run -- --strict -- <file>                    # drop all caps except CAP_BPF+CAP_NET_ADMIN
+cargo run --bin kernel_run -- --log2 -- <file>                      # log_level 2 (full state dumps, kept on accept)
 ```
 
 Compare rand-verifier vs the kernel on the whole corpus (verdict matrix, findings, JSON report):
 
 ```sh
-cargo run --bin diff            # table + summary; exit 1 on non-whitelisted findings
+cargo run --bin diff                       # table + summary; exit 1 on non-whitelisted findings
 cargo run --bin diff -- --json report.json
+cargo run --bin diff -- --strict           # unprivileged-equivalent comparison (drops caps)
 ```
 
-Both need root / CAP_BPF on systems with unprivileged BPF disabled (`kernel.unprivileged_bpf_disabled = 2`). The reason categories come from the exact kernel `verbose()` formats (see `src/klog.rs`); known semantic differences are whitelisted (see `src/diff.rs`, `docs/DIFFERENTIAL_PLAN.md` §6).
+The default diff runs **privileged** — the real-world baseline (root loads get the kernel's
+lenient rules). Loading needs root / CAP_BPF when `kernel.unprivileged_bpf_disabled = 2`;
+the runner reports EPERM with guidance. All five kernel-accepts cases found on the first
+privileged corpus run are whitelisted after verifying each against the kernel source
+(`docs/DIFFERENTIAL_PLAN.md` §10):
+
+- `complexity_limit` — mini's 1024-state budget vs the kernel's limits (intentional)
+- `computed_offset_*` — the kernel validates pointer alignment/bounds at access time only
+- `pointer_reg_arith` — `scalar += pointer` is legal, and socket filter has no exit-R0 type check
+- `stack_write_before_read` — privileged loads allow uninit stack reads by design
+  (`allow_uninit_stack`; `bpf_ns_capable` treats CAP_SYS_ADMIN as a superset of every BPF cap)
+
+Reason categories come from the exact kernel `verbose()` formats (`src/klog.rs`); the
+`--strict` mode (unprivileged-equivalent) surfaces `!root` rules such as pointer-comparison
+prohibitions and the loop-convergence difference as `kernel-stricter` entries — Phase 6
+analysis material.
+
+GitHub Actions: hosted runners have passwordless `sudo` and run directly in a VM, so
+`sudo -E cargo run --bin diff` works in CI (do not use a `container:` job — Docker's
+default seccomp profile blocks the `bpf()` syscall).
 
 ## Instruction subset
 
