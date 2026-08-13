@@ -74,6 +74,7 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
     {
         ReasonCategory::ExitR0
     } else if msg.contains("pointer arithmetic")
+        || msg.contains("pointer comparison")
         || msg.contains("invalid mem access")
         || msg.contains("leaks addr")
         || msg.contains("leaking pointer")
@@ -82,6 +83,9 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
         || msg.contains("unbounded min value")
     {
         ReasonCategory::PointerArith
+    } else if msg.contains("variable stack access") {
+        // "... variable stack access prohibited for !root"
+        ReasonCategory::StackBounds
     } else if msg.contains("invalid func")
         || msg.contains("unknown func")
         || msg.contains("helper")

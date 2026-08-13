@@ -105,14 +105,18 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(String::as_str);
 
-    // strict mode: drop CAP_PERFMON so the kernel verifier applies its
-    // strict rules (allow_uninit_stack = false, no ptr-leak allowance)
-    // — a like-for-like comparison with the rand-verifier side. Loading
-    // still works with CAP_NET_ADMIN/CAP_SYS_ADMIN only.
+    // privileged mode (default): load with the full capabilities — the
+    // real-world baseline (root loads get the kernel's lenient rules:
+    // allow_uninit_stack etc.). --strict drops everything except
+    // CAP_BPF+CAP_NET_ADMIN for an unprivileged-equivalent comparison.
     if unsafe { libc::geteuid() } == 0 {
-        match drop_privileged_caps() {
-            Ok(msg) => eprintln!("strict mode: {}", msg),
-            Err(e) => eprintln!("strict mode: {}", e),
+        if args.iter().any(|a| a == "--strict") {
+            match drop_privileged_caps() {
+                Ok(msg) => eprintln!("strict mode: {}", msg),
+                Err(e) => eprintln!("strict mode: {}", e),
+            }
+        } else {
+            eprintln!("privileged mode: full capabilities (kernel lenient rules)");
         }
     }
 

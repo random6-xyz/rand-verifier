@@ -159,6 +159,14 @@ pub fn whitelisted(name: &str, mini: &SideVerdict, kernel: &SideVerdict) -> Opti
             "pointer_reg_arith" => Some(
                 "mini does not implement register-offset pointer arithmetic (#20); the kernel allows scalar += pointer by design",
             ),
+            // privileged load: allow_uninit_stack is
+            // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
+            // CAP_SYS_ADMIN as a superset of every BPF capability
+            // (kernel/bpf/token.c) — uninit stack reads are allowed for
+            // privileged loaders by design
+            "stack_write_before_read" => Some(
+                "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
+            ),
             _ => None,
         },
         _ => None,
@@ -314,9 +322,11 @@ mod tests {
         assert!(whitelisted("computed_offset_misaligned", &rej, &acc).is_some());
         assert!(whitelisted("computed_offset_out_of_frame", &rej, &acc).is_some());
         assert!(whitelisted("pointer_reg_arith", &rej, &acc).is_some());
+        // privileged loads allow uninit stack reads by design
+        // (allow_uninit_stack, CAP_SYS_ADMIN superset)
+        assert!(whitelisted("stack_write_before_read", &rej, &acc).is_some());
         // the same pair under another name is a finding
         assert!(whitelisted("bounded_loop", &rej, &acc).is_none());
-        assert!(whitelisted("stack_write_before_read", &rej, &acc).is_none());
         // and the whitelist never applies to other pairs
         assert!(whitelisted("complexity_limit", &acc, &rej).is_none());
     }
