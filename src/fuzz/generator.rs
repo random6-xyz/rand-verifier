@@ -112,6 +112,19 @@ impl Generator {
         insns
     }
 
+    /// Generate either a plain random program or an idiom-template
+    /// program — with `idiom_ratio_percent` probability, choosing the
+    /// idiom uniformly. The campaign runner's mixed mode (#69): idiom
+    /// templates keep the milestone's stress semantics in the mix.
+    pub fn gen_mixed_program(&mut self, cfg: &GenConfig, idiom_ratio_percent: u64) -> Vec<BpfInsn> {
+        if self.rng.below(100) < idiom_ratio_percent {
+            let idx = self.rng.below(crate::fuzz::idiom::ALL_IDIOMS.len() as u64) as usize;
+            self.gen_idiom_program(crate::fuzz::idiom::ALL_IDIOMS[idx])
+        } else {
+            self.gen_program(cfg)
+        }
+    }
+
     /// One body instruction (never the unconditional jump — see the
     /// module docs). `pc` is the body index, `body_len` the body
     /// length; the exit sits at index `body_len`.
@@ -272,70 +285,6 @@ mod tests {
         Generator::new(seed).gen_program(cfg)
     }
 
-    /// The opcode family of an instruction, for the distribution check.
-    fn family_of(insn: &BpfInsn) -> &'static str {
-        match insn {
-            BpfInsn::MovImm { .. }
-            | BpfInsn::MovReg { .. }
-            | BpfInsn::AddImm { .. }
-            | BpfInsn::AddReg { .. }
-            | BpfInsn::SubImm { .. }
-            | BpfInsn::SubReg { .. }
-            | BpfInsn::AndImm { .. }
-            | BpfInsn::AndReg { .. }
-            | BpfInsn::OrImm { .. }
-            | BpfInsn::OrReg { .. }
-            | BpfInsn::XorImm { .. }
-            | BpfInsn::XorReg { .. }
-            | BpfInsn::LshImm { .. }
-            | BpfInsn::LshReg { .. }
-            | BpfInsn::RshImm { .. }
-            | BpfInsn::RshReg { .. }
-            | BpfInsn::ArshImm { .. }
-            | BpfInsn::ArshReg { .. } => "alu64",
-            BpfInsn::Add32Imm { .. }
-            | BpfInsn::Add32Reg { .. }
-            | BpfInsn::Sub32Imm { .. }
-            | BpfInsn::Sub32Reg { .. }
-            | BpfInsn::And32Imm { .. }
-            | BpfInsn::And32Reg { .. }
-            | BpfInsn::Or32Imm { .. }
-            | BpfInsn::Or32Reg { .. }
-            | BpfInsn::Xor32Imm { .. }
-            | BpfInsn::Xor32Reg { .. }
-            | BpfInsn::Lsh32Imm { .. }
-            | BpfInsn::Lsh32Reg { .. }
-            | BpfInsn::Rsh32Imm { .. }
-            | BpfInsn::Rsh32Reg { .. }
-            | BpfInsn::Arsh32Imm { .. }
-            | BpfInsn::Arsh32Reg { .. } => "alu32",
-            BpfInsn::Jgt { .. }
-            | BpfInsn::JgtImm { .. }
-            | BpfInsn::Jge { .. }
-            | BpfInsn::JgeImm { .. }
-            | BpfInsn::Jlt { .. }
-            | BpfInsn::JltImm { .. }
-            | BpfInsn::Jle { .. }
-            | BpfInsn::JleImm { .. } => "cmp_unsigned",
-            BpfInsn::Jsgt { .. }
-            | BpfInsn::JsgtImm { .. }
-            | BpfInsn::Jsge { .. }
-            | BpfInsn::JsgeImm { .. }
-            | BpfInsn::Jslt { .. }
-            | BpfInsn::JsltImm { .. }
-            | BpfInsn::Jsle { .. }
-            | BpfInsn::JsleImm { .. } => "cmp_signed",
-            BpfInsn::Jeq { .. }
-            | BpfInsn::JeqImm { .. }
-            | BpfInsn::Jne { .. }
-            | BpfInsn::JneImm { .. } => "cmp_eq",
-            BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => "stack",
-            BpfInsn::Call { .. } => "helper",
-            BpfInsn::Jmp { .. } => "jmp",
-            BpfInsn::Exit => "exit",
-        }
-    }
-
     /// Same seed → byte-identical output; different seeds → the output
     /// differs (checked over 100 programs).
     #[test]
@@ -377,7 +326,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for seed in 0..500 {
             for insn in gen_prog(seed, &cfg) {
-                seen.insert(family_of(&insn));
+                seen.insert(insn_lib::opcode_family(&insn));
             }
         }
         for family in [

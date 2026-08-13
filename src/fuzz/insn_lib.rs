@@ -269,6 +269,72 @@ pub const REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 /// pointer (the kernel rejects arithmetic on it), so it is excluded.
 pub const ALU_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
+/// The opcode family of an instruction, coarser than the individual
+/// variants — used for coverage statistics in the campaign runner
+/// (#69). The families match the milestone's target dimensions.
+pub fn opcode_family(insn: &BpfInsn) -> &'static str {
+    match insn {
+        BpfInsn::MovImm { .. }
+        | BpfInsn::MovReg { .. }
+        | BpfInsn::AddImm { .. }
+        | BpfInsn::AddReg { .. }
+        | BpfInsn::SubImm { .. }
+        | BpfInsn::SubReg { .. }
+        | BpfInsn::AndImm { .. }
+        | BpfInsn::AndReg { .. }
+        | BpfInsn::OrImm { .. }
+        | BpfInsn::OrReg { .. }
+        | BpfInsn::XorImm { .. }
+        | BpfInsn::XorReg { .. }
+        | BpfInsn::LshImm { .. }
+        | BpfInsn::LshReg { .. }
+        | BpfInsn::RshImm { .. }
+        | BpfInsn::RshReg { .. }
+        | BpfInsn::ArshImm { .. }
+        | BpfInsn::ArshReg { .. } => "alu64",
+        BpfInsn::Add32Imm { .. }
+        | BpfInsn::Add32Reg { .. }
+        | BpfInsn::Sub32Imm { .. }
+        | BpfInsn::Sub32Reg { .. }
+        | BpfInsn::And32Imm { .. }
+        | BpfInsn::And32Reg { .. }
+        | BpfInsn::Or32Imm { .. }
+        | BpfInsn::Or32Reg { .. }
+        | BpfInsn::Xor32Imm { .. }
+        | BpfInsn::Xor32Reg { .. }
+        | BpfInsn::Lsh32Imm { .. }
+        | BpfInsn::Lsh32Reg { .. }
+        | BpfInsn::Rsh32Imm { .. }
+        | BpfInsn::Rsh32Reg { .. }
+        | BpfInsn::Arsh32Imm { .. }
+        | BpfInsn::Arsh32Reg { .. } => "alu32",
+        BpfInsn::Jeq { .. }
+        | BpfInsn::JeqImm { .. }
+        | BpfInsn::Jne { .. }
+        | BpfInsn::JneImm { .. } => "cmp_eq",
+        BpfInsn::Jgt { .. }
+        | BpfInsn::JgtImm { .. }
+        | BpfInsn::Jge { .. }
+        | BpfInsn::JgeImm { .. }
+        | BpfInsn::Jlt { .. }
+        | BpfInsn::JltImm { .. }
+        | BpfInsn::Jle { .. }
+        | BpfInsn::JleImm { .. } => "cmp_unsigned",
+        BpfInsn::Jsgt { .. }
+        | BpfInsn::JsgtImm { .. }
+        | BpfInsn::Jsge { .. }
+        | BpfInsn::JsgeImm { .. }
+        | BpfInsn::Jslt { .. }
+        | BpfInsn::JsltImm { .. }
+        | BpfInsn::Jsle { .. }
+        | BpfInsn::JsleImm { .. } => "cmp_signed",
+        BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => "stack",
+        BpfInsn::Call { .. } => "helper",
+        BpfInsn::Jmp { .. } => "jmp",
+        BpfInsn::Exit => "exit",
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

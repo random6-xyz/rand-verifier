@@ -8,6 +8,7 @@
 
 use crate::concrete::{ConcreteReport, ConcreteVerdict};
 use crate::diff::{SideVerdict, whitelisted};
+use crate::env::BpfVerifierEnv;
 use crate::klog::ReasonCategory;
 
 /// The concrete side of one program — the oracle's truth axis.
@@ -22,11 +23,7 @@ pub enum ConcreteSide {
     Inconclusive,
 }
 
-/// Read the concrete side from a verification report. Only the tests
-/// use it so far — the campaign runner (#69) will call it through the
-/// env-facing oracle wrapper once `ConcreteReport` becomes reachable
-/// from the binary.
-#[allow(dead_code)]
+/// Read the concrete side from a verification report.
 pub(crate) fn concrete_side(report: &ConcreteReport) -> ConcreteSide {
     match report.verdict {
         ConcreteVerdict::Safe => ConcreteSide::Safe,
@@ -174,6 +171,33 @@ pub fn classify(input: &OracleInput) -> Finding {
             }
         },
     }
+}
+
+/// Classify a verified program from its environment — the binary-
+/// facing wrapper for the campaign runner (#69): reads the concrete
+/// report produced by the last [`BpfVerifierEnv::verify`] call. A
+/// program that failed at decode time has no concrete report — it is
+/// treated as Inconclusive (a non-finding; both sides reject decode
+/// errors anyway).
+pub fn classify_env(
+    env: &BpfVerifierEnv,
+    name: &str,
+    mini: &SideVerdict,
+    kernel: &SideVerdict,
+    strict: bool,
+) -> Finding {
+    let concrete = env
+        .concrete_report
+        .as_ref()
+        .map(concrete_side)
+        .unwrap_or(ConcreteSide::Inconclusive);
+    classify(&OracleInput {
+        name,
+        mini,
+        concrete,
+        kernel,
+        strict,
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -465,5 +489,50 @@ mod tests {
         env.setup_prog_bytes(&bytes).unwrap();
         let verdict = env.verify().unwrap();
         (verdict, env)
+    }
+
+    /// The env-facing wrapper reads the pipeline's concrete report and
+    /// classifies — the campaign runner's entry point (#69).
+    #[test]
+    fn classify_env_wrapper() {
+        // clean accept + kernel skipped (unprivileged run)
+        let insns = [insn_bytes(0xb7, 0, 0, 0, 42), insn_bytes(0x95, 0, 0, 0, 0)];
+        let (verdict, env) = verify_bytes(&insns);
+        assert!(matches!(verdict, Verdict::Safe));
+        let finding = classify_env(&env, "seed-0-0", &acc(), &skip(), false);
+        assert_eq!(finding, Finding::Skipped);
+
+        // reject-that-executes + kernel reject with a different reason
+        // → precision candidate (the v0.7 target path)
+        let insns = [
+            insn_bytes(0xb7, 0, 0, 0, 1),
+            insn_bytes(0x05, 0, 0, 1, 0), // jmp +1
+            insn_bytes(0xb7, 0, 0, 0, 0),
+            insn_bytes(0x95, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_bytes(&insns);
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let mini = rej(ReasonCategory::Unreachable);
+        let kernel = rej(ReasonCategory::UninitRead);
+        let finding = classify_env(&env, "seed-0-1", &mini, &kernel, false);
+        assert_eq!(finding, Finding::PrecisionCandidate);
+
+        // decode-error program: no concrete report → inconclusive
+        // (non-finding; both sides reject decode errors anyway)
+        let insns = [
+            insn_bytes(0xb7, 0, 0, 0, 1),
+            insn_bytes(0xef, 0, 0, 0, 0), // unknown opcode
+            insn_bytes(0x95, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_bytes(&insns);
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let finding = classify_env(
+            &env,
+            "seed-0-2",
+            &rej(ReasonCategory::Other),
+            &rej(ReasonCategory::Other),
+            false,
+        );
+        assert_eq!(finding, Finding::Inconclusive);
     }
 }
