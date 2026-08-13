@@ -3,4 +3,5 @@
 pub mod generator;
 pub mod idiom;
 pub mod insn_lib;
+pub mod oracle;
 pub(crate) mod prng;

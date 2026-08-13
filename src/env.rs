@@ -5,7 +5,9 @@ use std::fs;
 use anyhow::Result;
 
 use crate::cfg::{add_subprog, check_cfg};
-use crate::concrete::{ConcreteReport, check_coverage, render_coverage_report, run_concrete};
+use crate::concrete::{
+    ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report, run_concrete,
+};
 use crate::error::{Verdict, VerificationFailure};
 use crate::insn::{BpfInsn, parse_insn};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
@@ -140,10 +142,20 @@ impl BpfVerifierEnv {
                 // be covered by an abstract state at the same pc)
                 let mut report = ConcreteReport::default();
                 match run_concrete(&self.prog.insns, &loop_heads) {
-                    Err(failure) => report.unexpected_failure = Some(failure),
+                    Err(failure) => {
+                        report.unexpected_failure = Some(failure);
+                        report.verdict = ConcreteVerdict::Unsafe;
+                    }
                     Ok(run) => {
                         report.inconclusive = run.inconclusive;
                         report.violations = check_coverage(&abstract_states, &run);
+                        report.verdict = if run.inconclusive {
+                            ConcreteVerdict::Inconclusive
+                        } else if !report.violations.is_empty() {
+                            ConcreteVerdict::Unsafe
+                        } else {
+                            ConcreteVerdict::Safe
+                        };
                     }
                 }
                 self.concrete_report = Some(report);
@@ -170,6 +182,7 @@ impl BpfVerifierEnv {
                     "concrete cross-check: also fails {}",
                     concrete_failure
                 ));
+                report.verdict = ConcreteVerdict::Unsafe;
             }
             Ok(run) if run.inconclusive => {
                 // keep the structured flag in sync with the note
@@ -178,12 +191,14 @@ impl BpfVerifierEnv {
                     "concrete cross-check: inconclusive (non-terminating loop candidate)"
                         .to_string(),
                 );
+                report.verdict = ConcreteVerdict::Inconclusive;
             }
             Ok(_) => {
                 report.reject_note = Some(
                     "concrete cross-check: the program executes concretely — precision candidate"
                         .to_string(),
                 );
+                report.verdict = ConcreteVerdict::Safe;
             }
         }
         self.concrete_report = Some(report);
