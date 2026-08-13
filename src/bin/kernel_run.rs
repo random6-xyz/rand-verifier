@@ -146,7 +146,7 @@ fn main() {
     }
     match rest
         .iter()
-        .find(|a| **a != "--strict" && **a != "--log")
+        .find(|a| **a != "--strict" && **a != "--log" && **a != "--")
         .copied()
     {
         Some("--all") => {
