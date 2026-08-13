@@ -9,3 +9,5 @@
 
 # Editor / OS junk
 .DS_Store
+
+/fuzz-out

@@ -1,0 +1,8 @@
+   0: MovImm { dst: 1, imm: 5 }
+   1: MovImm { dst: 2, imm: 7 }
+   2: Jne { dst: 1, src: 2, offset: 2 }
+   3: MovImm { dst: 0, imm: 0 }
+   4: Exit
+   5: SubReg { dst: 4, src: 0 }
+   6: MovImm { dst: 0, imm: 1 }
+   7: Exit
