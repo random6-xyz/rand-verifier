@@ -20,7 +20,7 @@ use std::process;
 
 use rand_verifier::insn::{disassemble, parse_insn};
 use rand_verifier::klog::ReasonCategory;
-use rand_verifier::krun::{KernelOutcome, load_with_kernel};
+use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel};
 
 /// Print the disassembly of a program (decode errors are shown inline —
 /// the kernel would reject them as "unknown opcode").
@@ -114,16 +114,23 @@ fn corpus_programs() -> Vec<PathBuf> {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: kernel_run <program-file> | kernel_run --all\n\
+        "Usage: kernel_run <program-file> | kernel_run --all | kernel_run --strict --all\n\
          Loads an eBPF program into the kernel verifier via the raw bpf() syscall.\n\
-         Requires root / CAP_BPF on systems with unprivileged BPF disabled."
+         Requires root / CAP_BPF on systems with unprivileged BPF disabled.\n\
+         --strict drops CAP_PERFMON so the verifier applies its strict rules\n\
+         (uninit-stack reads and pointer leaks are rejected)."
     );
     process::exit(2);
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    match args.get(1).map(String::as_str) {
+    let strict = args.iter().any(|a| a == "--strict");
+    if strict {
+        drop_cap_perfmon();
+        eprintln!("strict mode: CAP_PERFMON dropped");
+    }
+    match args.iter().find(|a| *a != "--strict").map(String::as_str) {
         Some("--all") => {
             for path in corpus_programs() {
                 run_program(&path, false);

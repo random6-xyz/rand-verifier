@@ -20,13 +20,9 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         || msg.contains("pc out of program range")
     {
         ReasonCategory::CfgJump
-    } else if msg.contains("back-edge") {
-        ReasonCategory::Loop
-    } else if msg.contains("at exit") {
-        // "r0 is uninitialized at exit"
-        ReasonCategory::ExitR0
     } else if msg.contains("uninitialized") {
-        // "register rN is uninitialized", "stack slot ... is uninitialized"
+        // "register rN is uninitialized", "stack slot ... is uninitialized",
+        // "r0 is uninitialized at exit" — the kernel says "R0 !read_ok"
         ReasonCategory::UninitRead
     } else if msg.contains("aligned") {
         // "stack access ... is not 8-byte aligned",
@@ -43,7 +39,9 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         ReasonCategory::StackBounds
     } else if msg.contains("helper") || msg.contains("expected") {
         ReasonCategory::HelperArgs
-    } else if msg.contains("complexity limit") {
+    } else if msg.contains("back-edge") || msg.contains("complexity limit") {
+        // mini's loop budget is its complexity mechanism — the kernel
+        // rejects non-converging loops with "BPF program is too large"
         ReasonCategory::Complexity
     } else {
         // decode rejections ("unknown opcode", "reserved fields",
@@ -141,11 +139,28 @@ pub fn classify(mini: &SideVerdict, kernel: &SideVerdict) -> DiffClass {
 /// stem). Returns the reason when the pair is expected.
 pub fn whitelisted(name: &str, mini: &SideVerdict, kernel: &SideVerdict) -> Option<&'static str> {
     match (mini, kernel) {
-        // mini's state budget is 1024 vs the kernel's much larger
-        // limits — an intentional design limit, not a bug
-        (SideVerdict::Reject { .. }, SideVerdict::Accept) if name == "complexity_limit" => {
-            Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
-        }
+        (SideVerdict::Reject { .. }, SideVerdict::Accept) => match name {
+            // mini's state budget is 1024 vs the kernel's much larger
+            // limits — an intentional design limit, not a bug
+            "complexity_limit" => {
+                Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
+            }
+            // the kernel validates pointer alignment/bounds at access
+            // time only; these computed pointers are never dereferenced
+            "computed_offset_misaligned" => Some(
+                "mini requires provable 8-byte alignment at pointer arithmetic (#45); the kernel validates at access time — r6 is never dereferenced",
+            ),
+            "computed_offset_out_of_frame" => Some(
+                "mini requires in-frame offsets at pointer arithmetic (#45); the kernel validates at access time — r6 is never dereferenced",
+            ),
+            // the kernel explicitly allows scalar += pointer (dst
+            // inherits the pointer state); mini only implements
+            // immediate offsets (#20)
+            "pointer_reg_arith" => Some(
+                "mini does not implement register-offset pointer arithmetic (#20); the kernel allows scalar += pointer by design",
+            ),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -243,9 +258,9 @@ mod tests {
             ("unreachable instruction", ReasonCategory::Unreachable),
             (
                 "back-edge exceeds max loops (256) — the loop does not converge",
-                ReasonCategory::Loop,
+                ReasonCategory::Complexity,
             ),
-            ("r0 is uninitialized at exit", ReasonCategory::ExitR0),
+            ("r0 is uninitialized at exit", ReasonCategory::UninitRead),
             (
                 "verification complexity limit exceeded (max_states 1024)",
                 ReasonCategory::Complexity,
@@ -295,8 +310,13 @@ mod tests {
         let acc = SideVerdict::Accept;
         // the documented mini-limit difference is whitelisted
         assert!(whitelisted("complexity_limit", &rej, &acc).is_some());
+        // documented mini-precision gaps (empirical, v0.6 first run)
+        assert!(whitelisted("computed_offset_misaligned", &rej, &acc).is_some());
+        assert!(whitelisted("computed_offset_out_of_frame", &rej, &acc).is_some());
+        assert!(whitelisted("pointer_reg_arith", &rej, &acc).is_some());
         // the same pair under another name is a finding
         assert!(whitelisted("bounded_loop", &rej, &acc).is_none());
+        assert!(whitelisted("stack_write_before_read", &rej, &acc).is_none());
         // and the whitelist never applies to other pairs
         assert!(whitelisted("complexity_limit", &acc, &rej).is_none());
     }

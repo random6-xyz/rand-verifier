@@ -7,6 +7,14 @@ const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 /// 1 MiB verifier log buffer, like libbpf's default.
 pub const LOG_BUF_SIZE: usize = 1 << 20;
 
+/// `_LINUX_CAPABILITY_VERSION_3` (linux/capability.h).
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// CAP_PERFMON (linux/capability.h): the capability that makes the
+/// kernel verifier lenient — `allow_uninit_stack` and `allow_ptr_leaks`
+/// are both `bpf_token_capable(token, CAP_PERFMON)`
+/// (include/linux/bpf.h).
+const CAP_PERFMON: u32 = 38;
+
 /// The outcome of loading a program into the real kernel verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelOutcome {
@@ -81,6 +89,56 @@ fn log_text(log_buf: &[u8]) -> String {
         .position(|&b| b == 0)
         .unwrap_or(log_buf.len());
     String::from_utf8_lossy(&log_buf[..end]).into_owned()
+}
+
+/// Drop CAP_PERFMON from the process so the kernel verifier applies its
+/// strict rules: `allow_uninit_stack` and `allow_ptr_leaks` are false
+/// for loaders without CAP_PERFMON (bpf_allow_uninit_stack /
+/// bpf_allow_ptr_leaks in include/linux/bpf.h). Loading keeps working —
+/// bpf_net_capable() needs only CAP_NET_ADMIN or CAP_SYS_ADMIN.
+///
+/// Best effort: fails silently when the process cannot change its
+/// capabilities (unprivileged — the load will fail with EPERM anyway).
+pub fn drop_cap_perfmon() {
+    #[repr(C)]
+    #[derive(Default)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Default, Copy, Clone)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2]; // caps 0..31, 32..63
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut hdr as *mut CapHeader as *mut libc::c_void,
+            data.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if ret != 0 {
+        return;
+    }
+    let set = &mut data[(CAP_PERFMON / 32) as usize];
+    let bit = 1u32 << (CAP_PERFMON % 32);
+    set.effective &= !bit;
+    set.permitted &= !bit;
+    unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &hdr as *const CapHeader as *const libc::c_void,
+            data.as_ptr() as *const libc::c_void,
+        );
+    }
 }
 
 /// Load a raw eBPF program (kernel `struct bpf_insn` encoding) into the

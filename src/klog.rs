@@ -48,12 +48,14 @@ pub enum ReasonCategory {
 /// first.
 pub fn categorize_reason(message: &str) -> ReasonCategory {
     let msg = message.trim();
-    if msg.contains("!read_ok") || msg.contains("invalid read from stack") {
-        ReasonCategory::UninitRead
-    } else if msg.contains("misaligned") {
+    if msg.contains("misaligned") {
         ReasonCategory::StackAlign
     } else if msg.contains("stack") && msg.contains("off=") && msg.contains("invalid") {
+        // "invalid read/write to stack R10 off=N size=N" — out of bounds
         ReasonCategory::StackBounds
+    } else if msg.contains("!read_ok") || msg.contains("invalid read from stack") {
+        // "R2 !read_ok", "invalid read from stack R10 off -8+0 size 8"
+        ReasonCategory::UninitRead
     } else if msg.contains("unreachable insn") {
         ReasonCategory::Unreachable
     } else if msg.contains("jump out of range")
@@ -63,7 +65,7 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
         || msg.contains("call to invalid destination")
     {
         ReasonCategory::CfgJump
-    } else if msg.contains("back-edge") {
+    } else if msg.contains("back-edge") || msg.contains("infinite loop detected") {
         ReasonCategory::Loop
     } else if msg.contains("leaks addr as return")
         || msg.contains("R0 ") // "R0 not a scalar value", "R0 leaks addr ..."
@@ -76,6 +78,8 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
         || msg.contains("leaks addr")
         || msg.contains("leaking pointer")
         || msg.contains("subtraction from stack pointer")
+        || msg.contains("frame pointer is read only")
+        || msg.contains("unbounded min value")
     {
         ReasonCategory::PointerArith
     } else if msg.contains("invalid func")
@@ -114,25 +118,39 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
 /// summary; it can span several lines (e.g. the helper-argument
 /// message "R1 type=ctx expected=" + "map_ptr"). State transitions
 /// ("from X to Y: ...", log_level 2) are filtered out.
+///
+/// CFG-stage errors (jump out of range, unreachable insn, last insn is
+/// not an exit) are detected before any instruction is traced — the log
+/// holds only the error and the summary. In that case the whole log is
+/// the error block and the insn index is read from the "insn N" inside
+/// the message.
 pub fn parse_verifier_log(log: &str) -> Option<(u32, String)> {
     let lines: Vec<&str> = log.lines().collect();
-    // the last insn trace line ("N: (op) ...")
-    let last_trace = lines.iter().rposition(|l| {
-        let t = l.trim();
-        let (num, rest) = t.split_once(':').unwrap_or(("", ""));
+    let is_summary = |t: &str| {
+        t.is_empty()
+            || t.starts_with("processed ")
+            || t.starts_with("verification time ")
+            || t.starts_with("stack depth ")
+            || t.starts_with("insns processed ")
+    };
+    let is_trace = |t: &str| {
+        let (num, rest) = t.trim().split_once(':').unwrap_or(("", ""));
         rest.trim_start().starts_with('(') && num.parse::<u32>().is_ok()
-    })?;
-    // everything between the last trace and the summary is the error
-    let message: String = lines[last_trace + 1..]
+    };
+    // the last insn trace line ("N: (op) ...")
+    let last_trace = lines.iter().rposition(|l| is_trace(l.trim()));
+    // everything between the last trace and the summary is the error;
+    // without traces (CFG-stage errors) the whole log minus the summary
+    // is the error
+    let error_lines = match last_trace {
+        Some(pos) => &lines[pos + 1..],
+        None => &lines[..],
+    };
+    let message: String = error_lines
         .iter()
         .filter(|l| {
             let t = l.trim();
-            !t.is_empty()
-                && !t.starts_with("processed ")
-                && !t.starts_with("verification time ")
-                && !t.starts_with("stack depth ")
-                && !t.starts_with("insns processed ")
-                && !t.starts_with("from ") // state transitions (log_level 2)
+            !is_summary(t) && !is_trace(t) && !t.starts_with("from ")
         })
         .map(|l| l.trim())
         .collect::<Vec<_>>()
@@ -140,11 +158,20 @@ pub fn parse_verifier_log(log: &str) -> Option<(u32, String)> {
     if message.is_empty() {
         return None;
     }
-    let insn_idx = lines[last_trace]
-        .trim()
-        .split_once(':')
-        .and_then(|(num, _)| num.parse::<u32>().ok())
-        .unwrap_or(0);
+    let insn_idx = match last_trace {
+        Some(pos) => lines[pos]
+            .trim()
+            .split_once(':')
+            .and_then(|(num, _)| num.parse::<u32>().ok())
+            .unwrap_or(0),
+        // CFG-stage errors embed the insn index in the message
+        None => message
+            .split_whitespace()
+            .zip(message.split_whitespace().skip(1))
+            .find(|(w, _)| *w == "insn")
+            .and_then(|(_, next)| next.trim_end_matches(',').parse::<u32>().ok())
+            .unwrap_or(0),
+    };
     Some((insn_idx, message))
 }
 
@@ -185,12 +212,22 @@ mod tests {
             ReasonCategory::StackBounds
         );
         assert_eq!(
-            categorize_reason("invalid write to stack off=-8 size=8"),
+            categorize_reason("invalid write to stack R10 off=-520 size=8"),
             ReasonCategory::StackBounds
         );
         assert_eq!(
-            categorize_reason("misaligned stack access off (-4; -4)+0 size 8"),
+            categorize_reason("invalid read from stack R10 off=8 size=8"),
+            ReasonCategory::StackBounds
+        );
+        assert_eq!(
+            categorize_reason("misaligned stack access off 0+-4 size 8"),
             ReasonCategory::StackAlign
+        );
+        // the uninitialized-slot form carries the offset as "off -8+0"
+        // (no '='): bounds are fine, the slot was never written
+        assert_eq!(
+            categorize_reason("invalid read from stack R10 off -8+0 size 8"),
+            ReasonCategory::UninitRead
         );
     }
 
@@ -249,12 +286,37 @@ mod tests {
             ReasonCategory::Loop
         );
         assert_eq!(
+            categorize_reason(
+                "infinite loop detected at insn 0 cur state: R10=fp0 old state: R10=fp0"
+            ),
+            ReasonCategory::Loop
+        );
+        assert_eq!(
             categorize_reason("The sequence of 2049 jumps is too complex."),
             ReasonCategory::Complexity
         );
         assert_eq!(
-            categorize_reason("BPF program is too large. Processed 1000000 insn"),
+            categorize_reason("BPF program is too large. Processed 1000001 insn"),
             ReasonCategory::Complexity
+        );
+    }
+
+    #[test]
+    fn categorize_privileged_messages() {
+        // messages observed on privileged loads (bpf-next, 2026-08)
+        assert_eq!(
+            categorize_reason("frame pointer is read only"),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason(
+                "math between fp pointer and register with unbounded min value is not allowed"
+            ),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason("R1 32-bit pointer arithmetic prohibited"),
+            ReasonCategory::PointerArith
         );
     }
 
@@ -367,6 +429,34 @@ processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_stat
         assert!(message.contains("R1 type=ctx expected="), "{}", message);
         assert!(message.contains("map_ptr"), "{}", message);
         assert_eq!(categorize_reason(&message), ReasonCategory::HelperArgs);
+    }
+
+    #[test]
+    fn parse_cfg_stage_error_without_traces() {
+        // CFG-stage errors are detected before any instruction is
+        // traced — the log has no "N: (op) ..." lines at all
+        let log = "\
+unreachable insn 2
+processed 3 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+";
+        let (insn_idx, message) = parse_verifier_log(log).expect("error");
+        assert_eq!(insn_idx, 2);
+        assert_eq!(message, "unreachable insn 2");
+
+        let log = "\
+jump out of range from insn 1 to 101
+processed 2 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+";
+        let (insn_idx, message) = parse_verifier_log(log).expect("error");
+        assert_eq!(insn_idx, 1);
+        assert_eq!(categorize_reason(&message), ReasonCategory::CfgJump);
+
+        let log = "\
+last insn is not an exit or jmp
+processed 1 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+";
+        let (_, message) = parse_verifier_log(log).expect("error");
+        assert_eq!(categorize_reason(&message), ReasonCategory::CfgJump);
     }
 
     #[test]

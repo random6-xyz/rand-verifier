@@ -19,7 +19,7 @@ use std::process;
 use rand_verifier::diff::{DiffClass, SideVerdict, categorize_mini_reason, classify, whitelisted};
 use rand_verifier::env::BpfVerifierEnv;
 use rand_verifier::error::Verdict;
-use rand_verifier::krun::{KernelOutcome, load_with_kernel};
+use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel};
 
 /// One compared program: the two verdicts plus the classification.
 struct DiffEntry {
@@ -104,6 +104,15 @@ fn main() {
         .position(|a| a == "--json")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str);
+
+    // strict mode: drop CAP_PERFMON so the kernel verifier applies its
+    // strict rules (allow_uninit_stack = false, no ptr-leak allowance)
+    // — a like-for-like comparison with the rand-verifier side. Loading
+    // still works with CAP_NET_ADMIN/CAP_SYS_ADMIN only.
+    if unsafe { libc::geteuid() } == 0 {
+        drop_cap_perfmon();
+        eprintln!("strict mode: CAP_PERFMON dropped — uninit-stack / ptr-leak leniency disabled");
+    }
 
     let mut entries = Vec::new();
     for sub in ["accept", "reject"] {
