@@ -9,7 +9,7 @@ use crate::state::{
 };
 use crate::tnum::Tnum;
 
-/// ALU operations of the custom opcode space (Meso #39).
+/// ALU operations of the supported eBPF subset (Meso #39).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AluOp {
     Add,
@@ -155,9 +155,10 @@ pub(crate) fn step(
         // clobbered by the call (kernel's check_helper_call resets them
         // to NOT_INIT), R6..R9 are preserved, and R0 gets the return type
         BpfInsn::Call { imm } => {
-            // helper ids are encoded as negative immediates (kernel
-            // convention); positive immediates are BPF-to-BPF calls
-            let helper = helper_prototype(-*imm)
+            // the immediate is the helper id (kernel convention,
+            // BPF_JMP|BPF_CALL); BPF-to-BPF calls are rejected at
+            // decode time (issue #56)
+            let helper = helper_prototype(*imm)
                 .ok_or_else(|| VerificationFailure::new(pc, format!("unknown helper {}", imm)))?;
             check_helper_args(pc, helper, state)?;
             let mut next = *state;
@@ -3676,7 +3677,7 @@ mod tests {
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
         state.regs[2] = ptr_stack(-8);
-        let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
         assert_eq!(next.regs[1], RegState::Uninit);
         assert_eq!(next.regs[2], RegState::Uninit);
@@ -3686,7 +3687,7 @@ mod tests {
     fn step_call_prandom() {
         // no arguments → R0 becomes an unknown scalar (full range)
         let state = VerifierState::initial();
-        let next = step(0, &state, &BpfInsn::Call { imm: -7 }).unwrap();
+        let next = step(0, &state, &BpfInsn::Call { imm: 7 }).unwrap();
         assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::unknown()));
     }
 
@@ -3699,7 +3700,7 @@ mod tests {
         state.regs[2] = ptr_stack(-8);
         state.regs[3] = ptr_stack(-16);
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
-        let next = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap();
+        let next = step(0, &state, &BpfInsn::Call { imm: 2 }).unwrap();
         assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
     }
 
@@ -3709,7 +3710,7 @@ mod tests {
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
         state.regs[2] = ptr_stack(-8);
-        let err = step(0, &state, &BpfInsn::Call { imm: -2 }).unwrap_err();
+        let err = step(0, &state, &BpfInsn::Call { imm: 2 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
 
@@ -3717,7 +3718,7 @@ mod tests {
     fn step_call_arg_mismatch() {
         // R1 is the context pointer, not a map pointer → rejected
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap_err();
+        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("expected PtrToMap"));
         assert!(err.message.contains("r1 has type PTR_CTX"));
     }
@@ -3725,8 +3726,8 @@ mod tests {
     #[test]
     fn step_call_unknown_helper() {
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::Call { imm: -99 }).unwrap_err();
-        assert!(err.message.contains("unknown helper -99"));
+        let err = step(0, &state, &BpfInsn::Call { imm: 99 }).unwrap_err();
+        assert!(err.message.contains("unknown helper 99"));
     }
 
     #[test]
@@ -3734,7 +3735,7 @@ mod tests {
         // R2 (the key pointer) is uninitialized → #14 error
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap;
-        let err = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap_err();
+        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
 
@@ -3752,7 +3753,7 @@ mod tests {
         state.regs[8] = RegState::Scalar(ScalarBounds::constant(12));
         state.regs[9] = RegState::Scalar(ScalarBounds::constant(13));
 
-        let next = step(0, &state, &BpfInsn::Call { imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         // R0 = return type, R1..R5 invalidated
         assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
         for reg in 1..=5 {

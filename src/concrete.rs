@@ -851,8 +851,9 @@ fn concrete_call(
     imm: i32,
     state: &ConcreteState,
 ) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
-    // helper ids are encoded as negative immediates (kernel convention)
-    let helper = helper_prototype(-imm).ok_or(ConcreteFailure::UnknownHelper { pc, imm })?;
+    // the immediate is the helper id (kernel convention); BPF-to-BPF
+    // calls are rejected at decode time (issue #56)
+    let helper = helper_prototype(imm).ok_or(ConcreteFailure::UnknownHelper { pc, imm })?;
     check_concrete_helper_args(pc, helper, state)?;
     // argument registers are scratch — invalidated by the call (mirror
     // of the abstract step() Call)
@@ -1936,8 +1937,8 @@ mod tests {
 
     #[test]
     fn run_helper_seed_fork() {
-        // get_prandom_u32 (-7): unknown scalar → default seeds
-        let program = vec![BpfInsn::Call { imm: -7 }, BpfInsn::Exit];
+        // get_prandom_u32 (7): unknown scalar → default seeds
+        let program = vec![BpfInsn::Call { imm: 7 }, BpfInsn::Exit];
         let run = run_concrete(&program, &[]).unwrap();
         assert!(!run.inconclusive);
         let mut r0s: Vec<Option<ConcreteValue>> =
@@ -1956,7 +1957,7 @@ mod tests {
     fn run_helper_call_clobbers_args() {
         let program = vec![
             BpfInsn::MovImm { dst: 2, imm: 5 },
-            BpfInsn::Call { imm: -7 },
+            BpfInsn::Call { imm: 7 },
             BpfInsn::Exit,
         ];
         let run = run_concrete(&program, &[]).unwrap();
@@ -1975,16 +1976,16 @@ mod tests {
 
     #[test]
     fn run_unknown_helper() {
-        let program = vec![BpfInsn::Call { imm: -999 }];
+        let program = vec![BpfInsn::Call { imm: 999 }];
         let err = run_concrete(&program, &[]).unwrap_err();
-        assert_eq!(err, ConcreteFailure::UnknownHelper { pc: 0, imm: -999 });
+        assert_eq!(err, ConcreteFailure::UnknownHelper { pc: 0, imm: 999 });
     }
 
     #[test]
     fn run_helper_arg_mismatch() {
-        // map_lookup (-1) expects R1 = PtrToMap, but R1 is the context
+        // map_lookup (1) expects R1 = PtrToMap, but R1 is the context
         // pointer at entry (mirror of the invalid_helper_argument fixture)
-        let program = vec![BpfInsn::Call { imm: -1 }];
+        let program = vec![BpfInsn::Call { imm: 1 }];
         let err = run_concrete(&program, &[]).unwrap_err();
         assert_eq!(err, ConcreteFailure::HelperArgMismatch { pc: 0, arg: 1 });
     }
@@ -2130,7 +2131,7 @@ mod tests {
         // the concrete run must agree (no violations)
         let program = vec![
             BpfInsn::MovImm { dst: 0, imm: 0 },
-            BpfInsn::Call { imm: -7 }, // r0 = prandom (unknown scalar)
+            BpfInsn::Call { imm: 7 }, // r0 = prandom (unknown scalar)
             BpfInsn::MovImm { dst: 1, imm: 10 },
             BpfInsn::Jgt {
                 dst: 0,

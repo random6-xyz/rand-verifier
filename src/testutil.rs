@@ -28,6 +28,8 @@ pub(crate) fn prog_bytes(insns: &[[u8; 8]]) -> Vec<u8> {
 }
 
 /// Decode a single raw instruction (shorthand for parse_insn tests).
+/// Panics on decode errors — tests use `parse_insn` directly for the
+/// error cases.
 pub(crate) fn parse(op: u8, dst: u8, src: u8, offset: i16, imm: i32) -> BpfInsn {
-    parse_insn(&insn_bytes(op, dst, src, offset, imm))
+    parse_insn(&insn_bytes(op, dst, src, offset, imm)).expect("instruction decodes")
 }

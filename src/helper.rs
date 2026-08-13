@@ -22,9 +22,9 @@ pub(crate) struct HelperPrototype {
     pub(crate) return_type: RegState,
 }
 
-/// The helper table: id → prototype (#28). Calls encode the helper id
-/// as a negative immediate, like the kernel (positive immediates are
-/// BPF-to-BPF calls, handled by the nano pass).
+/// The helper table: id → prototype (#28). The immediate of a
+/// `BPF_JMP|BPF_CALL` instruction is the helper id (kernel convention);
+/// BPF-to-BPF calls are rejected at decode time.
 pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
     match id {
         // BPF_FUNC_map_lookup_elem: map_lookup(map, key)

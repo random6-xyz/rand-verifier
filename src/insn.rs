@@ -1,72 +1,73 @@
 // ── BPF instruction representation ──────────────────────────────────────────
 
-/// Opcodes of the mini subset (a simplified custom encoding, not the
-/// real eBPF opcode space).
+/// Opcodes of the supported eBPF subset, using the kernel's UAPI encoding
+/// (include/uapi/linux/bpf.h): `code = class | op | src` with the same
+/// field layout as `struct bpf_insn`. This is the encoding clang and the
+/// kernel selftests emit, so programs can be fed to the verifier as-is
+/// (issue #56).
 ///
-/// The Meso extension (#39) adds the ALU family (SUB/AND/OR/XOR/shifts),
-/// the ALU32 forms (base op | [`ALU32_FLAG`], cf. the kernel's BPF_ALU vs
-/// BPF_ALU64 class split) and the signed/unsigned compare variants.
+/// ALU32 is the separate BPF_ALU class (0x04) vs BPF_ALU64 (0x07), like
+/// the kernel; ALU32 results are truncated to 32 bits and zero-extended
+/// into the 64-bit register.
 pub(crate) mod opcode {
-    pub const MOV_IMM: u8 = 0x01;
-    pub const MOV_REG: u8 = 0x02;
-    pub const ADD_IMM: u8 = 0x03;
-    pub const ADD_REG: u8 = 0x04;
-    pub const LD_STACK: u8 = 0x05;
-    pub const ST_STACK: u8 = 0x06;
-    pub const JEQ: u8 = 0x07;
-    pub const JGT: u8 = 0x08; // unsigned greater-than (kernel BPF_JGT)
-    pub const JMP: u8 = 0x09;
-    pub const CALL: u8 = 0x0A;
-    pub const EXIT: u8 = 0x0B;
+    // ALU64 (class 0x07) — BPF_K (0x00) / BPF_X (0x08) source forms
+    pub const MOV_IMM: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
+    pub const MOV_REG: u8 = 0xbf; // BPF_ALU64 | BPF_MOV | BPF_X
+    pub const ADD_IMM: u8 = 0x07; // BPF_ALU64 | BPF_ADD | BPF_K
+    pub const ADD_REG: u8 = 0x0f; // BPF_ALU64 | BPF_ADD | BPF_X
+    pub const SUB_IMM: u8 = 0x17;
+    pub const SUB_REG: u8 = 0x1f;
+    pub const AND_IMM: u8 = 0x57;
+    pub const AND_REG: u8 = 0x5f;
+    pub const OR_IMM: u8 = 0x47;
+    pub const OR_REG: u8 = 0x4f;
+    pub const XOR_IMM: u8 = 0xa7;
+    pub const XOR_REG: u8 = 0xaf;
+    pub const LSH_IMM: u8 = 0x67;
+    pub const LSH_REG: u8 = 0x6f;
+    pub const RSH_IMM: u8 = 0x77;
+    pub const RSH_REG: u8 = 0x7f;
+    pub const ARSH_IMM: u8 = 0xc7;
+    pub const ARSH_REG: u8 = 0xcf;
 
-    // ALU64: SUB/AND/OR/XOR/shifts (imm and reg forms)
-    pub const SUB_IMM: u8 = 0x0C;
-    pub const SUB_REG: u8 = 0x0D;
-    pub const AND_IMM: u8 = 0x0E;
-    pub const AND_REG: u8 = 0x0F;
-    pub const OR_IMM: u8 = 0x10;
-    pub const OR_REG: u8 = 0x11;
-    pub const XOR_IMM: u8 = 0x12;
-    pub const XOR_REG: u8 = 0x13;
-    pub const LSH_IMM: u8 = 0x14;
-    pub const LSH_REG: u8 = 0x15;
-    pub const RSH_IMM: u8 = 0x16;
-    pub const RSH_REG: u8 = 0x17;
-    pub const ARSH_IMM: u8 = 0x18;
-    pub const ARSH_REG: u8 = 0x19;
+    // ALU32 (class 0x04)
+    pub const ADD32_IMM: u8 = 0x04;
+    pub const ADD32_REG: u8 = 0x0c;
+    pub const SUB32_IMM: u8 = 0x14;
+    pub const SUB32_REG: u8 = 0x1c;
+    pub const AND32_IMM: u8 = 0x54;
+    pub const AND32_REG: u8 = 0x5c;
+    pub const OR32_IMM: u8 = 0x44;
+    pub const OR32_REG: u8 = 0x4c;
+    pub const XOR32_IMM: u8 = 0xa4;
+    pub const XOR32_REG: u8 = 0xac;
+    pub const LSH32_IMM: u8 = 0x64;
+    pub const LSH32_REG: u8 = 0x6c;
+    pub const RSH32_IMM: u8 = 0x74;
+    pub const RSH32_REG: u8 = 0x7c;
+    pub const ARSH32_IMM: u8 = 0xc4;
+    pub const ARSH32_REG: u8 = 0xcc;
 
-    // compares: unsigned family (JGT exists above) and signed family
-    pub const JNE: u8 = 0x1A;
-    pub const JGE: u8 = 0x1B;
-    pub const JLT: u8 = 0x1C;
-    pub const JLE: u8 = 0x1D;
-    pub const JSGT: u8 = 0x1E;
-    pub const JSGE: u8 = 0x1F;
-    pub const JSLT: u8 = 0x20;
-    pub const JSLE: u8 = 0x21;
+    // loads/stores — only 8-byte (DW) accesses with the frame pointer
+    // as the base register are supported
+    pub const LD_STACK: u8 = 0x79; // BPF_LDX | BPF_MEM | BPF_DW, src_reg = R10
+    pub const ST_STACK: u8 = 0x7b; // BPF_STX | BPF_MEM | BPF_DW, dst_reg = R10
 
-    /// Flag bit that turns an ALU64 opcode into its ALU32 form, like the
-    /// kernel's BPF_ALU class vs BPF_ALU64 class split. ALU32 results are
-    /// truncated to 32 bits and zero-extended into the 64-bit register.
-    pub const ALU32_FLAG: u8 = 0x40;
-
-    // ALU32 forms of every ALU op (ADD included): base op | ALU32_FLAG
-    pub const ADD32_IMM: u8 = ADD_IMM | ALU32_FLAG;
-    pub const ADD32_REG: u8 = ADD_REG | ALU32_FLAG;
-    pub const SUB32_IMM: u8 = SUB_IMM | ALU32_FLAG;
-    pub const SUB32_REG: u8 = SUB_REG | ALU32_FLAG;
-    pub const AND32_IMM: u8 = AND_IMM | ALU32_FLAG;
-    pub const AND32_REG: u8 = AND_REG | ALU32_FLAG;
-    pub const OR32_IMM: u8 = OR_IMM | ALU32_FLAG;
-    pub const OR32_REG: u8 = OR_REG | ALU32_FLAG;
-    pub const XOR32_IMM: u8 = XOR_IMM | ALU32_FLAG;
-    pub const XOR32_REG: u8 = XOR_REG | ALU32_FLAG;
-    pub const LSH32_IMM: u8 = LSH_IMM | ALU32_FLAG;
-    pub const LSH32_REG: u8 = LSH_REG | ALU32_FLAG;
-    pub const RSH32_IMM: u8 = RSH_IMM | ALU32_FLAG;
-    pub const RSH32_REG: u8 = RSH_REG | ALU32_FLAG;
-    pub const ARSH32_IMM: u8 = ARSH_IMM | ALU32_FLAG;
-    pub const ARSH32_REG: u8 = ARSH_REG | ALU32_FLAG;
+    // jumps (class 0x05). Compares are the register-register (BPF_X)
+    // forms; the immediate (BPF_K) forms are tracked in issue #57.
+    pub const JMP: u8 = 0x05; // BPF_JA
+    pub const JEQ: u8 = 0x1d; // BPF_JMP | BPF_JEQ | BPF_X
+    pub const JNE: u8 = 0x5d; // BPF_JMP | BPF_JNE | BPF_X
+    pub const JGT: u8 = 0x2d; // BPF_JMP | BPF_JGT | BPF_X (unsigned)
+    pub const JGE: u8 = 0x3d; // BPF_JMP | BPF_JGE | BPF_X (unsigned)
+    pub const JLT: u8 = 0xad; // BPF_JMP | BPF_JLT | BPF_X (unsigned)
+    pub const JLE: u8 = 0xbd; // BPF_JMP | BPF_JLE | BPF_X (unsigned)
+    pub const JSGT: u8 = 0x6d; // BPF_JMP | BPF_JSGT | BPF_X (signed)
+    pub const JSGE: u8 = 0x7d; // BPF_JMP | BPF_JSGE | BPF_X (signed)
+    pub const JSLT: u8 = 0xcd; // BPF_JMP | BPF_JSLT | BPF_X (signed)
+    pub const JSLE: u8 = 0xdd; // BPF_JMP | BPF_JSLE | BPF_X (signed)
+    pub const CALL: u8 = 0x85; // BPF_JMP | BPF_CALL — imm is the helper id
+    pub const EXIT: u8 = 0x95; // BPF_JMP | BPF_EXIT
 }
 
 #[derive(Debug, Clone)]
@@ -152,8 +153,122 @@ impl BpfInsn {
     }
 }
 
-/// Decode one 8-byte instruction from raw bytecode.
-pub(crate) fn parse_insn(bytes: &[u8]) -> BpfInsn {
+/// A decode-level rejection, mirroring the kernel's instruction checks
+/// (`bpf_opcode_in_insntable` + `check_insn_fields` in verifier.c).
+/// Decode failures are program rejections — never internal errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecodeError {
+    /// The opcode is not in the kernel's instruction table.
+    UnknownOpcode { op: u8 },
+    /// A valid kernel opcode this verifier does not implement yet.
+    Unsupported { op: u8, reason: &'static str },
+    /// A register field names a register above R10 (kernel: "R%d is invalid").
+    InvalidRegister { reg: u8 },
+    /// Non-zero reserved fields (kernel's check_*_fields messages).
+    ReservedFields { message: &'static str },
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::UnknownOpcode { op } => write!(f, "unknown opcode {:#04x}", op),
+            DecodeError::Unsupported { op, reason } => {
+                write!(f, "unsupported instruction {:#04x}: {}", op, reason)
+            }
+            DecodeError::InvalidRegister { reg } => write!(f, "R{} is invalid", reg),
+            DecodeError::ReservedFields { message } => f.write_str(message),
+        }
+    }
+}
+
+/// Is `op` one of the supported ALU/ALU64/MOV opcodes (all BPF_ALU and
+/// BPF_ALU64 forms this verifier implements)?
+fn is_supported_alu(op: u8) -> bool {
+    matches!(
+        op,
+        opcode::MOV_IMM
+            | opcode::MOV_REG
+            | opcode::ADD_IMM
+            | opcode::ADD_REG
+            | opcode::SUB_IMM
+            | opcode::SUB_REG
+            | opcode::AND_IMM
+            | opcode::AND_REG
+            | opcode::OR_IMM
+            | opcode::OR_REG
+            | opcode::XOR_IMM
+            | opcode::XOR_REG
+            | opcode::LSH_IMM
+            | opcode::LSH_REG
+            | opcode::RSH_IMM
+            | opcode::RSH_REG
+            | opcode::ARSH_IMM
+            | opcode::ARSH_REG
+            | opcode::ADD32_IMM
+            | opcode::ADD32_REG
+            | opcode::SUB32_IMM
+            | opcode::SUB32_REG
+            | opcode::AND32_IMM
+            | opcode::AND32_REG
+            | opcode::OR32_IMM
+            | opcode::OR32_REG
+            | opcode::XOR32_IMM
+            | opcode::XOR32_REG
+            | opcode::LSH32_IMM
+            | opcode::LSH32_REG
+            | opcode::RSH32_IMM
+            | opcode::RSH32_REG
+            | opcode::ARSH32_IMM
+            | opcode::ARSH32_REG
+    )
+}
+
+/// Reason for rejecting a valid kernel opcode that this verifier does
+/// not implement yet. `None` means the opcode is not in the kernel's
+/// instruction table at all (`unknown opcode`).
+fn unsupported_reason(op: u8) -> Option<&'static str> {
+    match op & 0x07 {
+        // BPF_LD: 64-bit immediates (0x18) and the legacy loads
+        0x00 => Some("BPF_LD (ldimm64 and legacy absolute/indirect loads) is not implemented"),
+        // BPF_ST: store-immediate
+        0x02 => Some("BPF_ST (store-immediate) is not implemented"),
+        // BPF_JMP32: 32-bit compares
+        0x06 => Some("BPF_JMP32 (32-bit compares) is not implemented"),
+        // BPF_LDX / BPF_STX: only the DW MEM stack forms are implemented
+        // (0x79 / 0x7b are matched before this helper is consulted)
+        0x01 => Some("only 8-byte loads from the stack frame are implemented"),
+        0x03 => Some("only 8-byte stores to the stack frame are implemented"),
+        // BPF_ALU / BPF_ALU64
+        0x04 | 0x07 => match op & 0xf0 {
+            0x20 | 0x30 | 0x90 => Some("MUL/DIV/MOD are not implemented"),
+            0x80 => Some("BPF_NEG is not implemented"),
+            0xd0 => Some("BPF_END is not implemented"),
+            0xb0 => Some("32-bit MOV (BPF_ALU | BPF_MOV) is not implemented"),
+            _ => None,
+        },
+        // BPF_JMP
+        0x05 => match op {
+            // immediate-form compares (BPF_J*_K) — tracked in issue #57
+            0x15 | 0x55 | 0x25 | 0x35 | 0xa5 | 0xb5 | 0x65 | 0x75 | 0xc5 | 0xd5 => {
+                Some("immediate-form compares (BPF_J*_K) are not implemented yet")
+            }
+            0x45 | 0x4d => Some("BPF_JSET is not implemented"),
+            0x0d => Some("indirect jumps (BPF_JA|BPF_X) are not implemented"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decode one 8-byte instruction from raw bytecode (kernel `struct
+/// bpf_insn` layout: `[code, (src_reg << 4 | dst_reg), off_le16, imm_le32]`).
+///
+/// The checks mirror the kernel's order: register range first ("R%d is
+/// invalid"), then opcode validity ("unknown opcode"), then reserved
+/// fields (check_insn_fields, "BPF_* uses reserved fields"). Valid
+/// kernel opcodes the verifier does not implement are rejected as
+/// unsupported.
+pub(crate) fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
     let op = bytes[0];
     let regs = bytes[1];
     let dst = regs & 0x0F;
@@ -161,57 +276,178 @@ pub(crate) fn parse_insn(bytes: &[u8]) -> BpfInsn {
     let offset = i16::from_le_bytes([bytes[2], bytes[3]]);
     let imm = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
 
+    // the kernel's register-range pass rejects R11..R15 before the
+    // opcode checks (verifier.c: "R%d is invalid")
+    if dst > 10 {
+        return Err(DecodeError::InvalidRegister { reg: dst });
+    }
+    if src > 10 {
+        return Err(DecodeError::InvalidRegister { reg: src });
+    }
+
     match op {
-        opcode::MOV_IMM => BpfInsn::MovImm { dst, imm },
-        opcode::MOV_REG => BpfInsn::MovReg { dst, src },
-        opcode::ADD_IMM => BpfInsn::AddImm { dst, imm },
-        opcode::ADD_REG => BpfInsn::AddReg { dst, src },
-        opcode::SUB_IMM => BpfInsn::SubImm { dst, imm },
-        opcode::SUB_REG => BpfInsn::SubReg { dst, src },
-        opcode::AND_IMM => BpfInsn::AndImm { dst, imm },
-        opcode::AND_REG => BpfInsn::AndReg { dst, src },
-        opcode::OR_IMM => BpfInsn::OrImm { dst, imm },
-        opcode::OR_REG => BpfInsn::OrReg { dst, src },
-        opcode::XOR_IMM => BpfInsn::XorImm { dst, imm },
-        opcode::XOR_REG => BpfInsn::XorReg { dst, src },
-        opcode::LSH_IMM => BpfInsn::LshImm { dst, imm },
-        opcode::LSH_REG => BpfInsn::LshReg { dst, src },
-        opcode::RSH_IMM => BpfInsn::RshImm { dst, imm },
-        opcode::RSH_REG => BpfInsn::RshReg { dst, src },
-        opcode::ARSH_IMM => BpfInsn::ArshImm { dst, imm },
-        opcode::ARSH_REG => BpfInsn::ArshReg { dst, src },
-        opcode::ADD32_IMM => BpfInsn::Add32Imm { dst, imm },
-        opcode::ADD32_REG => BpfInsn::Add32Reg { dst, src },
-        opcode::SUB32_IMM => BpfInsn::Sub32Imm { dst, imm },
-        opcode::SUB32_REG => BpfInsn::Sub32Reg { dst, src },
-        opcode::AND32_IMM => BpfInsn::And32Imm { dst, imm },
-        opcode::AND32_REG => BpfInsn::And32Reg { dst, src },
-        opcode::OR32_IMM => BpfInsn::Or32Imm { dst, imm },
-        opcode::OR32_REG => BpfInsn::Or32Reg { dst, src },
-        opcode::XOR32_IMM => BpfInsn::Xor32Imm { dst, imm },
-        opcode::XOR32_REG => BpfInsn::Xor32Reg { dst, src },
-        opcode::LSH32_IMM => BpfInsn::Lsh32Imm { dst, imm },
-        opcode::LSH32_REG => BpfInsn::Lsh32Reg { dst, src },
-        opcode::RSH32_IMM => BpfInsn::Rsh32Imm { dst, imm },
-        opcode::RSH32_REG => BpfInsn::Rsh32Reg { dst, src },
-        opcode::ARSH32_IMM => BpfInsn::Arsh32Imm { dst, imm },
-        opcode::ARSH32_REG => BpfInsn::Arsh32Reg { dst, src },
-        opcode::LD_STACK => BpfInsn::LdStack { dst, offset },
-        opcode::ST_STACK => BpfInsn::StStack { src, offset },
-        opcode::JEQ => BpfInsn::Jeq { dst, src, offset },
-        opcode::JNE => BpfInsn::Jne { dst, src, offset },
-        opcode::JGT => BpfInsn::Jgt { dst, src, offset },
-        opcode::JGE => BpfInsn::Jge { dst, src, offset },
-        opcode::JLT => BpfInsn::Jlt { dst, src, offset },
-        opcode::JLE => BpfInsn::Jle { dst, src, offset },
-        opcode::JSGT => BpfInsn::Jsgt { dst, src, offset },
-        opcode::JSGE => BpfInsn::Jsge { dst, src, offset },
-        opcode::JSLT => BpfInsn::Jslt { dst, src, offset },
-        opcode::JSLE => BpfInsn::Jsle { dst, src, offset },
-        opcode::JMP => BpfInsn::Jmp { offset },
-        opcode::CALL => BpfInsn::Call { imm },
-        opcode::EXIT => BpfInsn::Exit,
-        _ => panic!("Unknown opcode: {:#04x}", op),
+        // ALU / ALU64 / MOV — field rules mirror check_alu_fields:
+        // BPF_X requires imm == 0, BPF_K requires src_reg == 0, and
+        // off must be 0 for every supported op (the kernel allows off
+        // hints only for MOV/32-bit subreg movs and DIV/MOD, none of
+        // which are implemented here)
+        _ if is_supported_alu(op) => {
+            let is_x = op & 0x08 != 0; // the kernel's BPF_SRC bit
+            if (is_x && imm != 0) || (!is_x && src != 0) || offset != 0 {
+                let message = if op == opcode::MOV_IMM || op == opcode::MOV_REG {
+                    "BPF_MOV uses reserved fields"
+                } else {
+                    "BPF_ALU uses reserved fields"
+                };
+                return Err(DecodeError::ReservedFields { message });
+            }
+            Ok(match op {
+                opcode::MOV_IMM => BpfInsn::MovImm { dst, imm },
+                opcode::MOV_REG => BpfInsn::MovReg { dst, src },
+                opcode::ADD_IMM => BpfInsn::AddImm { dst, imm },
+                opcode::ADD_REG => BpfInsn::AddReg { dst, src },
+                opcode::SUB_IMM => BpfInsn::SubImm { dst, imm },
+                opcode::SUB_REG => BpfInsn::SubReg { dst, src },
+                opcode::AND_IMM => BpfInsn::AndImm { dst, imm },
+                opcode::AND_REG => BpfInsn::AndReg { dst, src },
+                opcode::OR_IMM => BpfInsn::OrImm { dst, imm },
+                opcode::OR_REG => BpfInsn::OrReg { dst, src },
+                opcode::XOR_IMM => BpfInsn::XorImm { dst, imm },
+                opcode::XOR_REG => BpfInsn::XorReg { dst, src },
+                opcode::LSH_IMM => BpfInsn::LshImm { dst, imm },
+                opcode::LSH_REG => BpfInsn::LshReg { dst, src },
+                opcode::RSH_IMM => BpfInsn::RshImm { dst, imm },
+                opcode::RSH_REG => BpfInsn::RshReg { dst, src },
+                opcode::ARSH_IMM => BpfInsn::ArshImm { dst, imm },
+                opcode::ARSH_REG => BpfInsn::ArshReg { dst, src },
+                opcode::ADD32_IMM => BpfInsn::Add32Imm { dst, imm },
+                opcode::ADD32_REG => BpfInsn::Add32Reg { dst, src },
+                opcode::SUB32_IMM => BpfInsn::Sub32Imm { dst, imm },
+                opcode::SUB32_REG => BpfInsn::Sub32Reg { dst, src },
+                opcode::AND32_IMM => BpfInsn::And32Imm { dst, imm },
+                opcode::AND32_REG => BpfInsn::And32Reg { dst, src },
+                opcode::OR32_IMM => BpfInsn::Or32Imm { dst, imm },
+                opcode::OR32_REG => BpfInsn::Or32Reg { dst, src },
+                opcode::XOR32_IMM => BpfInsn::Xor32Imm { dst, imm },
+                opcode::XOR32_REG => BpfInsn::Xor32Reg { dst, src },
+                opcode::LSH32_IMM => BpfInsn::Lsh32Imm { dst, imm },
+                opcode::LSH32_REG => BpfInsn::Lsh32Reg { dst, src },
+                opcode::RSH32_IMM => BpfInsn::Rsh32Imm { dst, imm },
+                opcode::RSH32_REG => BpfInsn::Rsh32Reg { dst, src },
+                opcode::ARSH32_IMM => BpfInsn::Arsh32Imm { dst, imm },
+                opcode::ARSH32_REG => BpfInsn::Arsh32Reg { dst, src },
+                _ => unreachable!("is_supported_alu covered the opcode"),
+            })
+        }
+        // conditional compares — BPF_J*_X: imm is reserved (check_jmp_fields)
+        opcode::JEQ
+        | opcode::JNE
+        | opcode::JGT
+        | opcode::JGE
+        | opcode::JLT
+        | opcode::JLE
+        | opcode::JSGT
+        | opcode::JSGE
+        | opcode::JSLT
+        | opcode::JSLE => {
+            if imm != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_JMP uses reserved fields",
+                });
+            }
+            Ok(match op {
+                opcode::JEQ => BpfInsn::Jeq { dst, src, offset },
+                opcode::JNE => BpfInsn::Jne { dst, src, offset },
+                opcode::JGT => BpfInsn::Jgt { dst, src, offset },
+                opcode::JGE => BpfInsn::Jge { dst, src, offset },
+                opcode::JLT => BpfInsn::Jlt { dst, src, offset },
+                opcode::JLE => BpfInsn::Jle { dst, src, offset },
+                opcode::JSGT => BpfInsn::Jsgt { dst, src, offset },
+                opcode::JSGE => BpfInsn::Jsge { dst, src, offset },
+                opcode::JSLT => BpfInsn::Jslt { dst, src, offset },
+                opcode::JSLE => BpfInsn::Jsle { dst, src, offset },
+                _ => unreachable!("compare opcode matched above"),
+            })
+        }
+        // BPF_JA: src_reg, dst_reg and imm are reserved (check_jmp_fields)
+        opcode::JMP => {
+            if src != 0 || dst != 0 || imm != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_JA uses reserved fields",
+                });
+            }
+            Ok(BpfInsn::Jmp { offset })
+        }
+        // BPF_CALL: dst_reg must be R0 and off must be 0. src_reg 0 is a
+        // helper call (imm = helper id, kernel convention); 1 and 2 are
+        // BPF_PSEUDO_CALL / BPF_PSEUDO_KFUNC_CALL, not implemented.
+        opcode::CALL => {
+            if dst != 0 || offset != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_CALL uses reserved fields",
+                });
+            }
+            match src {
+                0 => Ok(BpfInsn::Call { imm }),
+                1 => Err(DecodeError::Unsupported {
+                    op,
+                    reason: "BPF-to-BPF calls (BPF_PSEUDO_CALL) are not implemented",
+                }),
+                2 => Err(DecodeError::Unsupported {
+                    op,
+                    reason: "kfunc calls (BPF_PSEUDO_KFUNC_CALL) are not implemented",
+                }),
+                _ => Err(DecodeError::ReservedFields {
+                    message: "BPF_CALL uses reserved fields",
+                }),
+            }
+        }
+        // BPF_EXIT: src_reg, dst_reg and imm are reserved (check_jmp_fields)
+        opcode::EXIT => {
+            if src != 0 || dst != 0 || imm != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_EXIT uses reserved fields",
+                });
+            }
+            Ok(BpfInsn::Exit)
+        }
+        // BPF_LDX|BPF_MEM|BPF_DW with R10 as the base register
+        opcode::LD_STACK => {
+            if imm != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_LDX uses reserved fields",
+                });
+            }
+            if src != 10 {
+                return Err(DecodeError::Unsupported {
+                    op,
+                    reason: "loads from a non-stack base register are not implemented",
+                });
+            }
+            Ok(BpfInsn::LdStack { dst, offset })
+        }
+        // BPF_STX|BPF_MEM|BPF_DW with R10 as the base register
+        opcode::ST_STACK => {
+            if imm != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_STX uses reserved fields",
+                });
+            }
+            if dst != 10 {
+                return Err(DecodeError::Unsupported {
+                    op,
+                    reason: "stores to a non-stack base register are not implemented",
+                });
+            }
+            Ok(BpfInsn::StStack { src, offset })
+        }
+        _ => {
+            if let Some(reason) = unsupported_reason(op) {
+                Err(DecodeError::Unsupported { op, reason })
+            } else {
+                Err(DecodeError::UnknownOpcode { op })
+            }
+        }
     }
 }
 
@@ -327,14 +563,17 @@ mod tests {
 
     #[test]
     fn parse_insn_ld_stack() {
-        // negative stack offset (frame-pointer relative)
-        let insn = parse(opcode::LD_STACK, 0, 0, -8, 0);
+        // BPF_LDX|BPF_MEM|BPF_DW: the base register field (src_reg)
+        // must name R10 (the frame pointer)
+        let insn = parse(opcode::LD_STACK, 0, 10, -8, 0);
         assert!(matches!(insn, BpfInsn::LdStack { dst: 0, offset: -8 }));
     }
 
     #[test]
     fn parse_insn_st_stack() {
-        let insn = parse(opcode::ST_STACK, 0, 1, -8, 0);
+        // BPF_STX|BPF_MEM|BPF_DW: the base register field (dst_reg)
+        // must name R10 (the frame pointer)
+        let insn = parse(opcode::ST_STACK, 10, 1, -8, 0);
         assert!(matches!(insn, BpfInsn::StStack { src: 1, offset: -8 }));
     }
 
@@ -372,6 +611,7 @@ mod tests {
 
     #[test]
     fn parse_insn_call() {
+        // the immediate is the helper id (kernel convention)
         let insn = parse(opcode::CALL, 0, 0, 0, 100);
         assert!(matches!(insn, BpfInsn::Call { imm: 100 }));
     }
@@ -454,7 +694,7 @@ mod tests {
 
     #[test]
     fn parse_insn_alu32_forms() {
-        // ALU32 opcodes are the ALU64 base op with the ALU32 flag bit
+        // ALU32 is the BPF_ALU class (0x04), not a flag on the ALU64 op
         assert!(matches!(
             parse(opcode::ADD32_IMM, 1, 0, 0, 5),
             BpfInsn::Add32Imm { dst: 1, imm: 5 }
@@ -561,11 +801,192 @@ mod tests {
         ));
     }
 
+    // ── Real-ISA decode rules (issue #56) ───────────────────────────────────
+
     #[test]
-    fn parse_insn_unknown_opcode_panics() {
-        // an unused opcode value is still rejected by the decoder
-        let result = std::panic::catch_unwind(|| parse(0x7F, 0, 0, 0, 0));
-        assert!(result.is_err());
+    fn parse_insn_unknown_opcode_rejected() {
+        // an opcode outside the kernel's instruction table is a decode
+        // error, not a panic (0xef: ALU64 class with an unused op bits)
+        let err = parse_insn(&insn_bytes(0xEF, 0, 0, 0, 0)).unwrap_err();
+        assert_eq!(err, DecodeError::UnknownOpcode { op: 0xEF });
+        assert_eq!(err.to_string(), "unknown opcode 0xef");
+    }
+
+    #[test]
+    fn parse_insn_invalid_register() {
+        // register fields above R10 are rejected like the kernel
+        // ("R%d is invalid"), before any opcode check
+        let err = parse_insn(&insn_bytes(opcode::MOV_IMM, 11, 0, 0, 0)).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidRegister { reg: 11 });
+        let err = parse_insn(&insn_bytes(opcode::MOV_REG, 0, 15, 0, 0)).unwrap_err();
+        assert_eq!(err, DecodeError::InvalidRegister { reg: 15 });
+    }
+
+    #[test]
+    fn parse_insn_reserved_fields() {
+        // BPF_K form with a non-zero src_reg
+        let err = parse_insn(&insn_bytes(opcode::ADD_IMM, 1, 2, 0, 5)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_ALU uses reserved fields"
+            }
+        );
+        // BPF_X form with a non-zero imm
+        let err = parse_insn(&insn_bytes(opcode::ADD_REG, 1, 2, 0, 5)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_ALU uses reserved fields"
+            }
+        );
+        // MOV uses its own message
+        let err = parse_insn(&insn_bytes(opcode::MOV_IMM, 1, 2, 0, 5)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_MOV uses reserved fields"
+            }
+        );
+        // compare X-form with a non-zero imm
+        let err = parse_insn(&insn_bytes(opcode::JEQ, 1, 2, 1, 3)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_JMP uses reserved fields"
+            }
+        );
+        // JA with a non-zero src_reg / dst_reg / imm
+        let err = parse_insn(&insn_bytes(opcode::JMP, 1, 0, 2, 0)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_JA uses reserved fields"
+            }
+        );
+        // EXIT with a non-zero imm
+        let err = parse_insn(&insn_bytes(opcode::EXIT, 0, 0, 0, 1)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_EXIT uses reserved fields"
+            }
+        );
+        // CALL with a non-zero dst_reg or off
+        let err = parse_insn(&insn_bytes(opcode::CALL, 1, 0, 0, 7)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_CALL uses reserved fields"
+            }
+        );
+        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 0, 1, 7)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_CALL uses reserved fields"
+            }
+        );
+        // LDX/STX with a non-zero imm
+        let err = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 10, -8, 1)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_LDX uses reserved fields"
+            }
+        );
+        let err = parse_insn(&insn_bytes(opcode::ST_STACK, 10, 1, -8, 1)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_STX uses reserved fields"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_insn_ld_st_base_register() {
+        // LDX with a base other than R10 and STX with a base other than
+        // R10 are valid kernel instructions the verifier does not
+        // implement (map/ctx access) — explicit unsupported errors
+        let err = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 1, -8, 0)).unwrap_err();
+        assert!(matches!(err, DecodeError::Unsupported { op: 0x79, .. }));
+        let err = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap_err();
+        assert!(matches!(err, DecodeError::Unsupported { op: 0x7b, .. }));
+    }
+
+    #[test]
+    fn parse_insn_call_src_reg_rules() {
+        // src_reg 1/2 are BPF_PSEUDO_CALL / BPF_PSEUDO_KFUNC_CALL —
+        // valid kernel calls, not implemented here
+        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 1, 0, 7)).unwrap_err();
+        assert!(matches!(err, DecodeError::Unsupported { op: 0x85, .. }));
+        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 2, 0, 7)).unwrap_err();
+        assert!(matches!(err, DecodeError::Unsupported { op: 0x85, .. }));
+        // src_reg 3+ is a reserved field violation
+        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 3, 0, 7)).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::ReservedFields {
+                message: "BPF_CALL uses reserved fields"
+            }
+        );
+    }
+
+    #[test]
+    fn parse_insn_unsupported_opcodes() {
+        // every unimplemented kernel opcode class gets a structured
+        // Unsupported error with a reason
+        let unsupported = [
+            // BPF_LD|BPF_IMM|BPF_DW (ldimm64)
+            (0x18u8, "ldimm64"),
+            // BPF_ST|BPF_MEM|BPF_DW (store-immediate)
+            (0x7a, "BPF_ST"),
+            // BPF_JMP32|BPF_JA
+            (0x06, "BPF_JMP32"),
+            // BPF_ALU64|BPF_MUL|BPF_K
+            (0x27, "MUL"),
+            // BPF_ALU|BPF_NEG
+            (0x84, "BPF_NEG"),
+            // BPF_ALU64|BPF_END
+            (0xd7, "BPF_END"),
+            // BPF_ALU|BPF_MOV|BPF_K (32-bit MOV)
+            (0xb4, "MOV"),
+            // BPF_JMP|BPF_JSET|BPF_K
+            (0x45, "BPF_JSET"),
+            // BPF_JMP|BPF_JEQ|BPF_K (immediate compare — issue #57)
+            (0x15, "BPF_J*_K"),
+            // BPF_LDX|BPF_MEM|BPF_W
+            (0x61, "loads"),
+            // BPF_STX|BPF_ATOMIC|BPF_DW
+            (0xdb, "stores"),
+        ];
+        for (op, needle) in unsupported {
+            let err = parse_insn(&insn_bytes(op, 0, 0, 0, 0)).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::Unsupported { .. }),
+                "op {:#04x} should be unsupported, got {:?}",
+                op,
+                err
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(needle),
+                "op {:#04x}: {:?} does not mention {:?}",
+                op,
+                err,
+                needle
+            );
+        }
+    }
+
+    #[test]
+    fn parse_insn_real_layout() {
+        // pin the raw byte layout of one instruction: kernel
+        // bpf_insn is [code, dst|src, off_le16, imm_le32]
+        // r1 = 42  →  BPF_ALU64|BPF_MOV|BPF_K, dst_reg = 1
+        let insn = parse_insn(&[0xb7, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00]).unwrap();
+        assert!(matches!(insn, BpfInsn::MovImm { dst: 1, imm: 42 }));
     }
 
     // ── RegState (v0.2) ─────────────────────────────────────────────────────

@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn verify_mini_unknown_helper() {
-        let program = vec![BpfInsn::Call { imm: -99 }, BpfInsn::Exit];
+        let program = vec![BpfInsn::Call { imm: 99 }, BpfInsn::Exit];
         let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("unknown helper"));
     }
@@ -797,7 +797,7 @@ mod tests {
         // 3: exit           (R0 = [MIN, MAX])
         // 4: exit           (R0 = [0, 0])
         let program = vec![
-            BpfInsn::Call { imm: -7 },
+            BpfInsn::Call { imm: 7 },
             BpfInsn::MovImm { dst: 1, imm: 0 },
             BpfInsn::Jeq {
                 dst: 0,
@@ -878,7 +878,7 @@ mod tests {
         // 1: r0 = r1  → R1 is uninitialized → REJECT
         // 2: exit
         let program = vec![
-            BpfInsn::Call { imm: -7 },
+            BpfInsn::Call { imm: 7 },
             BpfInsn::MovReg { dst: 0, src: 1 },
             BpfInsn::Exit,
         ];
@@ -895,7 +895,7 @@ mod tests {
         // 3: exit
         let program = vec![
             BpfInsn::MovImm { dst: 6, imm: 5 },
-            BpfInsn::Call { imm: -7 },
+            BpfInsn::Call { imm: 7 },
             BpfInsn::MovReg { dst: 0, src: 6 },
             BpfInsn::Exit,
         ];

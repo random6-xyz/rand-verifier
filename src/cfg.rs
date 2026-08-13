@@ -3,61 +3,15 @@
 use crate::error::VerificationFailure;
 use crate::insn::BpfInsn;
 
-/// Maximum number of subprograms in one program.
-const MAX_SUBPROGS: usize = 256;
-
-/// Validate and register a single call target as a subprogram entry point.
-fn register_subprog(
-    call_idx: u32,
-    target_offset: i32,
-    insn_cnt: u32,
-    subprogs: &mut Vec<u32>,
-) -> Result<(), VerificationFailure> {
-    // offset range check
-    let target = target_offset as u32;
-    if target >= insn_cnt {
-        return Err(VerificationFailure::new(
-            call_idx,
-            format!("call target {} is out of range (0..{})", target, insn_cnt),
-        ));
-    }
-
-    // dedup
-    if subprogs.contains(&target) {
-        return Ok(());
-    }
-
-    // max subprog check
-    if subprogs.len() >= MAX_SUBPROGS {
-        return Err(VerificationFailure::new(
-            call_idx,
-            format!("exceeded maximum number of subprograms ({})", MAX_SUBPROGS),
-        ));
-    }
-
-    subprogs.push(target);
-    subprogs.sort_unstable();
-
-    Ok(())
-}
-
-/// Walk all instructions and collect subprogram entry points.
-/// Returns a sorted Vec starting with the main program (index 0).
-pub(crate) fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
-    let insn_cnt = insns.len() as u32;
-    let mut subprogs = vec![0u32];
-
-    for (idx, insn) in insns.iter().enumerate() {
-        // helper calls use negative immediates (kernel convention) and
-        // are not subprograms
-        if let BpfInsn::Call { imm } = insn
-            && *imm >= 0
-        {
-            register_subprog(idx as u32, *imm, insn_cnt, &mut subprogs)?;
-        }
-    }
-
-    Ok(subprogs)
+/// Collect subprogram entry points.
+///
+/// BPF-to-BPF calls (BPF_PSEUDO_CALL) are rejected at decode time
+/// (issue #56), so every program is a single subprogram: the main
+/// program at index 0. The subprogram machinery (the boundary checks
+/// in `visit_insn`) stays in place — with `subprogs == [0]` the
+/// boundaries are simply the whole program.
+pub(crate) fn add_subprog(_insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
+    Ok(vec![0u32])
 }
 
 /// Return the [start, end) range of the subprogram that contains `insn_idx`.
@@ -135,21 +89,9 @@ pub(crate) fn visit_insn(
             }
             vec![target, idx + 1]
         }
-        // subprogram call (imm >= 0) — callee entry + return address;
-        // helper calls (imm < 0, kernel convention) fall straight through
-        BpfInsn::Call { imm } => {
-            if *imm < 0 {
-                return Ok(vec![idx + 1]);
-            }
-            let target = *imm as u32;
-            if target >= insn_cnt {
-                return Err(VerificationFailure::new(
-                    idx,
-                    format!("call target {} is out of range (0..{})", target, insn_cnt),
-                ));
-            }
-            vec![target, idx + 1]
-        }
+        // helper calls (imm = helper id, kernel convention) fall
+        // straight through; BPF-to-BPF calls are rejected at decode
+        BpfInsn::Call { .. } => vec![idx + 1],
         // everything else — straight-line fall-through
         _ => vec![idx + 1],
     };
@@ -257,37 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn add_subprog_collects_and_sorts() {
-        // call targets 4 and 2 → sorted with the main entry 0
+    fn add_subprog_single_subprogram() {
+        // BPF_PSEUDO_CALL is rejected at decode time, so every program
+        // is one subprogram — calls (helper ids) never add entries
         let insns = vec![
             BpfInsn::Call { imm: 4 },
             BpfInsn::Call { imm: 2 },
             BpfInsn::Exit,
-            BpfInsn::Exit,
-            BpfInsn::Exit,
         ];
         let subprogs = add_subprog(&insns).unwrap();
-        assert_eq!(subprogs, vec![0, 2, 4]);
-    }
-
-    #[test]
-    fn add_subprog_dedup_target() {
-        // two calls to the same target → registered once
-        let insns = vec![
-            BpfInsn::Call { imm: 2 },
-            BpfInsn::Call { imm: 2 },
-            BpfInsn::Exit,
-            BpfInsn::Exit,
-        ];
-        let subprogs = add_subprog(&insns).unwrap();
-        assert_eq!(subprogs, vec![0, 2]);
-    }
-
-    #[test]
-    fn add_subprog_out_of_range() {
-        // call target beyond the program → error
-        let insns = vec![BpfInsn::Call { imm: 99 }, BpfInsn::Exit];
-        assert!(add_subprog(&insns).is_err());
+        assert_eq!(subprogs, vec![0]);
     }
 
     // ── find_subprog_range ───────────────────────────────────────────────────
@@ -369,10 +290,10 @@ mod tests {
 
     #[test]
     fn visit_insn_call() {
-        // Call imm is an absolute insn index: callee 2, return address 1
+        // a helper call (imm = helper id) falls straight through
         let insns = vec![BpfInsn::Call { imm: 2 }, BpfInsn::Exit, BpfInsn::Exit];
-        let nexts = visit_insn(0, &insns, &[0, 2]).unwrap();
-        assert_eq!(nexts, vec![2, 1]);
+        let nexts = visit_insn(0, &insns, &[0]).unwrap();
+        assert_eq!(nexts, vec![1]);
     }
 
     #[test]
@@ -417,15 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn check_cfg_valid_with_subprog() {
-        // main [0, 2): Call → subprog [2, 4), both end with Exit
+    fn check_cfg_valid_with_helper_call() {
+        // helper calls fall through; the whole program is one subprogram
         let insns = vec![
             BpfInsn::Call { imm: 2 },
-            BpfInsn::Exit,
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
         ];
-        assert!(check_cfg(&insns, &[0, 2]).is_ok());
+        assert!(check_cfg(&insns, &[0]).is_ok());
     }
 
     #[test]
@@ -437,30 +357,6 @@ mod tests {
             BpfInsn::Exit,
         ];
         assert!(check_cfg(&insns, &[0]).is_err());
-    }
-
-    #[test]
-    fn check_cfg_fallthrough_violation() {
-        // insn 1 falls through from subprog [0, 2) into subprog [2, 4)
-        let insns = vec![
-            BpfInsn::Call { imm: 2 },
-            BpfInsn::MovImm { dst: 0, imm: 1 },
-            BpfInsn::Exit,
-            BpfInsn::Exit,
-        ];
-        assert!(check_cfg(&insns, &[0, 2]).is_err());
-    }
-
-    #[test]
-    fn check_cfg_jmp_out_of_subprog() {
-        // Jmp at 0 in subprog [0, 2): target 0 + 1 + 2 = 3 crosses the boundary
-        let insns = vec![
-            BpfInsn::Jmp { offset: 2 },
-            BpfInsn::Exit,
-            BpfInsn::Exit,
-            BpfInsn::Exit,
-        ];
-        assert!(check_cfg(&insns, &[0, 2]).is_err());
     }
 
     #[test]
@@ -510,15 +406,6 @@ mod tests {
             "{}",
             err.message
         );
-        // every subprogram of a call chain must end with EXIT too
-        let insns = vec![
-            BpfInsn::Call { imm: 2 },
-            BpfInsn::Exit,
-            BpfInsn::MovImm { dst: 0, imm: 1 }, // subprog [2..4) without exit
-            BpfInsn::MovImm { dst: 0, imm: 2 },
-        ];
-        let err = check_cfg(&insns, &[0, 2]).unwrap_err();
-        assert!(err.message.contains("does not end with exit"));
     }
 
     #[test]
