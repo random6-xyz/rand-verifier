@@ -138,13 +138,15 @@ pub fn drop_privileged_caps() -> Result<String, String> {
             std::io::Error::last_os_error()
         ));
     }
-    // keep only CAP_BPF and CAP_NET_ADMIN (both in the first u32)
-    let keep = (1u32 << (CAP_BPF % 32)) | (1u32 << (CAP_NET_ADMIN % 32));
-    data[0].effective = keep;
-    data[0].permitted = keep;
+    // keep only CAP_NET_ADMIN (cap 12 → first u32) and CAP_BPF
+    // (cap 39 → second u32, bit 7)
+    let cap_net_admin_bit = 1u32 << CAP_NET_ADMIN;
+    let cap_bpf_bit = 1u32 << (CAP_BPF % 32);
+    data[0].effective = cap_net_admin_bit;
+    data[0].permitted = cap_net_admin_bit;
     data[0].inheritable = 0;
-    data[1].effective = 0;
-    data[1].permitted = 0;
+    data[1].effective = cap_bpf_bit;
+    data[1].permitted = cap_bpf_bit;
     data[1].inheritable = 0;
     let ret = unsafe {
         libc::syscall(
@@ -168,7 +170,7 @@ pub fn drop_privileged_caps() -> Result<String, String> {
             after.as_mut_ptr() as *mut libc::c_void,
         )
     };
-    if ret != 0 || after[0].effective != keep || after[1].effective != 0 {
+    if ret != 0 || after[0].effective != cap_net_admin_bit || after[1].effective != cap_bpf_bit {
         Err("capset did not take effect (CAP_SYS_ADMIN/CAP_PERFMON still present)".to_string())
     } else {
         Ok("only CAP_BPF+CAP_NET_ADMIN kept — privileged verifier rules disabled".to_string())
