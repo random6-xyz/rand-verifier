@@ -84,7 +84,7 @@ pub fn delete_insns(bytes: &[u8], remove: &[u32]) -> Option<Vec<u8>> {
 /// The code offset of a branch instruction — `None` for everything
 /// else (ALU/MOV/LD/ST: their offset field is a stack offset or zero;
 /// CALL/EXIT: off must be 0 and is never re-based).
-fn branch_offset(insn: &BpfInsn) -> Option<i16> {
+pub(crate) fn branch_offset(insn: &BpfInsn) -> Option<i16> {
     match insn {
         BpfInsn::Jmp { offset } => Some(*offset),
         BpfInsn::Jeq { offset, .. }
