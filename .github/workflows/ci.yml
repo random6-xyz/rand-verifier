@@ -44,8 +44,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build the diff binary
-        run: cargo build --bin diff
+      - name: Build the binaries
+        run: cargo build --bin diff --bin fuzz
 
       - name: Run the differential harness
         # build as the runner user, run only the binary as root —
