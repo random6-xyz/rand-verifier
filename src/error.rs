@@ -3,8 +3,8 @@
 /// A single verification failure: where it happened and why.
 #[derive(Debug, Clone)]
 pub struct VerificationFailure {
-    pub(crate) insn_idx: u32,   // instruction index where verification failed
-    pub(crate) message: String, // e.g. "unbounded loop", "invalid access"
+    pub(crate) insn_idx: u32, // instruction index where verification failed
+    pub message: String,      // e.g. "unbounded loop", "invalid access"
 }
 
 impl VerificationFailure {

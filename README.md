@@ -86,6 +86,24 @@ verification failed at insn 0: back edge to insn 0 creates an unbounded loop
 
 A verification failure is a normal result (`Ok(Verdict::Unsafe)`) — only I/O and decode-level errors abort the process.
 
+### Differential harness (Phase 3, v0.6)
+
+Load a program into the real kernel verifier via the raw `bpf()` syscall (no libbpf):
+
+```sh
+cargo run --bin kernel_run -- tests/programs/accept/minimal_exit   # one program
+cargo run --bin kernel_run -- --all                                 # the whole corpus
+```
+
+Compare rand-verifier vs the kernel on the whole corpus (verdict matrix, findings, JSON report):
+
+```sh
+cargo run --bin diff            # table + summary; exit 1 on non-whitelisted findings
+cargo run --bin diff -- --json report.json
+```
+
+Both need root / CAP_BPF on systems with unprivileged BPF disabled (`kernel.unprivileged_bpf_disabled = 2`). The reason categories come from the exact kernel `verbose()` formats (see `src/klog.rs`); known semantic differences are whitelisted (see `src/diff.rs`, `docs/DIFFERENTIAL_PLAN.md` §6).
+
 ## Instruction subset
 
 The verifier accepts the kernel's `struct bpf_insn` encoding (8 bytes per
