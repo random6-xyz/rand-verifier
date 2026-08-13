@@ -40,11 +40,11 @@ The crate is a library (`rand-verifier`) plus a thin CLI binary.
 
 | Module | Stage | Responsibility |
 |--------|-------|----------------|
-| `src/insn.rs` | — | Instruction representation and raw-bytecode decoding (simplified custom opcode set) |
+| `src/insn.rs` | — | Instruction representation and raw-bytecode decoding (kernel `struct bpf_insn` UAPI encoding, issue #56) |
 | `src/cfg.rs` | structural | CFG checks: subprogram discovery, reachability, jump/branch target validation, back-edge (loop) rejection |
 | `src/state.rs` | abstract state | Abstract register state (`Uninit`, `Scalar[min,max]`, `PtrToStack`, `PtrToCtx`, `PtrToMap`, `PtrToMapValue`, `PtrToMapValueOrNull`) and the 512-byte stack model (8-byte slots) |
 | `src/exec.rs` | abstract execution | Symbolic single-instruction execution (`step`), branch range refinement, static branch verdicts (`is_branch_taken`), successor expansion |
-| `src/helper.rs` | path exploration | Helper prototypes and R1..R5 argument validation (kernel convention: negative immediate = helper call) |
+| `src/helper.rs` | path exploration | Helper prototypes and R1..R5 argument validation (kernel convention: the CALL immediate is the helper id) |
 | `src/mini.rs` | path exploration | Worklist-based path exploration, per-pc state dedup/subsumption (kernel's `is_state_visited` analog), exploration limits |
 | `src/tnum.rs` | — | Tracked number abstraction (kernel's `struct tnum`); implemented but not yet wired into `RegState` (Meso) |
 | `src/trace.rs` | abstract execution | Execution trace rendering |
@@ -88,32 +88,47 @@ A verification failure is a normal result (`Ok(Verdict::Unsafe)`) — only I/O a
 
 ## Instruction subset
 
-The current instruction subset uses a simplified custom encoding (8 bytes per instruction, not the real eBPF opcode space):
-
-```text
-[op, (src << 4 | dst), off_le16, imm_le32]
-```
+The verifier accepts the kernel's `struct bpf_insn` encoding (8 bytes per
+instruction, `[code, (src_reg << 4 | dst_reg), off_le16, imm_le32]`) — the
+same bytes clang and the kernel selftests emit (issue #56):
 
 | Opcode | Mnemonic | Semantics |
 |--------|----------|-----------|
-| `0x01` | `MOV_IMM` | `rX = imm` |
-| `0x02` | `MOV_REG` | `rX = rY` |
-| `0x03` | `ADD_IMM` | `rX += imm` (scalars and stack-pointer offsets) |
-| `0x04` | `ADD_REG` | `rX += rY` (scalars only) |
-| `0x05` | `LD_STACK` | `rX = [r10 + off]` |
-| `0x06` | `ST_STACK` | `[r10 + off] = rX` |
-| `0x07` | `JEQ` | `if rX == rY goto +off` |
-| `0x08` | `JGT` | `if rX > rY goto +off` (signed) |
-| `0x09` | `JMP` | `goto +off` |
-| `0x0A` | `CALL` | helper call (negative `imm`, kernel convention) |
-| `0x0B` | `EXIT` | terminate path |
+| `0xb7`/`0xbf` | `MOV64` | `rX = imm` / `rX = rY` |
+| `0x07`/`0x0f` | `ADD64` | `rX += imm` / `rX += rY` (scalars and stack-pointer offsets) |
+| `0x17`/`0x1f` | `SUB64` | `rX -= imm` / `rX -= rY` |
+| `0x57`/`0x5f` | `AND64` | `rX &= imm` / `rX &= rY` |
+| `0x47`/`0x4f` | `OR64` | `rX |= imm` / `rX |= rY` |
+| `0xa7`/`0xaf` | `XOR64` | `rX ^= imm` / `rX ^= rY` |
+| `0x67`/`0x6f` | `LSH64` | `rX <<= imm` / `rX <<= rY` |
+| `0x77`/`0x7f` | `RSH64` | `rX >>= imm` / `rX >>= rY` |
+| `0xc7`/`0xcf` | `ARSH64` | `rX s>>= imm` / `rX s>>= rY` |
+| `0x04`/`0x0c` | `ADD32` | `wX += imm` / `wX += rY` (truncating, zero-extending) |
+| `0x14`/`0x1c` | `SUB32` | `wX -= imm` / `wX -= rY` |
+| `0x54`/`0x5c` | `AND32` | `wX &= imm` / `wX &= rY` |
+| `0x44`/`0x4c` | `OR32` | `wX |= imm` / `wX |= rY` |
+| `0xa4`/`0xac` | `XOR32` | `wX ^= imm` / `wX ^= rY` |
+| `0x64`/`0x6c` | `LSH32` | `wX <<= imm` / `wX <<= rY` |
+| `0x74`/`0x7c` | `RSH32` | `wX >>= imm` / `wX >>= rY` |
+| `0xc4`/`0xcc` | `ARSH32` | `wX s>>= imm` / `wX s>>= rY` |
+| `0x79` | `LD_STACK` | `rX = [r10 + off]` (8-byte, `src_reg = 10`) |
+| `0x7b` | `ST_STACK` | `[r10 + off] = rX` (8-byte, `dst_reg = 10`) |
+| `0x1d`…`0xdd` | compares | `if rX op rY goto +off` — `JEQ`/`JNE`/`JGT`/`JGE`/`JLT`/`JLE` (unsigned) and `JSGT`/`JSGE`/`JSLT`/`JSLE` (signed), register forms (`BPF_J*_X`) |
+| `0x05` | `JMP` | `goto +off` (`BPF_JA`) |
+| `0x85` | `CALL` | helper call — `imm` is the helper id (kernel convention) |
+| `0x95` | `EXIT` | terminate path |
+
+Unknown opcodes, invalid registers and non-zero reserved fields are
+rejected with structured decode errors; valid kernel opcodes outside this
+subset (ldimm64, `BPF_JMP32`, store-immediate, `BPF_JSET`, 32-bit MOV,
+BPF-to-BPF/kfunc calls, …) are rejected as unsupported.
 
 ## Test corpus
 
 Raw bytecode fixtures live in `tests/programs/`:
 
-- `tests/programs/accept/` — 13 programs that must pass
-- `tests/programs/reject/` — 19 programs that must fail
+- `tests/programs/accept/` — 28 programs that must pass
+- `tests/programs/reject/` — 29 programs that must fail
 
 Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list.
 
