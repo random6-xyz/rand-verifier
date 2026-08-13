@@ -174,12 +174,24 @@ host-dependent and recorded separately). Triage groups are the Phase 6 analysis
 entry points — they flow into the failure reducer (v0.8) and the kernel patch
 work (v1.0).
 
-First campaign numbers (v0.7, unprivileged, 2026-08):
+Whitelist policy: on top of the v0.6 name-based diff whitelist, the first
+kernel-backed campaigns added one **category-based** entry — a mini reject with
+a `stack slot ... is uninitialized` reason plus kernel ACCEPT is the privileged
+`allow_uninit_stack` design difference (`bpf_ns_capable` treats CAP_SYS_ADMIN as
+a superset of every BPF cap, verified against kernel/bpf/token.c in v0.6) and
+is whitelisted by category so fuzzer-generated programs are covered too.
+Uninit *register* reads stay soundness candidates — the kernel rejects those,
+so an accept would be a real bug.
+
+First campaign numbers (v0.7, 2026-08):
 
 | campaign | verdicts | findings | notes |
 |----------|----------|----------|-------|
-| generation (seed 42, 2000 iters) | agree 1404, skipped 596 | 0 | kernel columns skipped; no model bugs surfaced |
-| mutation (seed 5, 2000 iters) | agree 1752, inconclusive 1, skipped 28 | 0 | validity rate 86.3% (1377/1596); 38 verdict flips (34 accept→reject, 4 reject→accept) |
+| generation (seed 42, 2000 iters, unprivileged) | agree 1404, skipped 596 | 0 | kernel columns skipped; no model bugs surfaced |
+| mutation (seed 5, 2000 iters, unprivileged) | agree 1752, inconclusive 1, skipped 28 | 0 | validity rate 86.3% (1377/1596); 38 verdict flips (34 accept→reject, 4 reject→accept) |
+| mutation + kernel (seed 5, 200 iters, privileged) | agree 159, whitelisted 1, inconclusive 1, rv-precision-gap 1, soundness-candidate 1 | 2 → both analysed | the soundness candidate is the privileged uninit-stack design difference (mseed-5-19, now whitelisted by category); the rv gap is mini's arithmetic-time pointer checks vs the kernel's access-time checks (#45, mseed-5-99) — Phase 6 material |
+| generation + kernel (seed 42, 500 iters, privileged) | agree 500 | 0 | the kernel agrees with rand-verifier on every generated program |
+| mutation + kernel --strict (seed 5, 200 iters) | agree 157, whitelisted 4, inconclusive 1, skipped 1 | 0 | strict `!root` rules absorbed by the strict whitelist |
 
 ## Instruction subset
 

@@ -22,6 +22,7 @@ struct Case {
     env: BpfVerifierEnv,
     verdict: Verdict,
     mini: SideVerdict,
+    mini_reason: Option<String>,
     concrete: ConcreteSide,
 }
 
@@ -33,11 +34,14 @@ fn run_case(seed: u64) -> Case {
     let mut env = BpfVerifierEnv::new();
     env.setup_prog_bytes(&bytes).unwrap();
     let verdict = env.verify().unwrap();
-    let mini = match &verdict {
-        Verdict::Safe => SideVerdict::Accept,
-        Verdict::Unsafe(f) => SideVerdict::Reject {
-            category: categorize_mini_reason(f),
-        },
+    let (mini, mini_reason) = match &verdict {
+        Verdict::Safe => (SideVerdict::Accept, None),
+        Verdict::Unsafe(f) => (
+            SideVerdict::Reject {
+                category: categorize_mini_reason(f),
+            },
+            Some(f.message.clone()),
+        ),
     };
     let concrete = concrete_side(env.concrete_report.as_ref().expect("concrete report"));
     Case {
@@ -45,6 +49,7 @@ fn run_case(seed: u64) -> Case {
         env,
         verdict,
         mini,
+        mini_reason,
         concrete,
     }
 }
@@ -81,6 +86,7 @@ fn campaign_invariants() {
                 &case.env,
                 &format!("seed-{seed}"),
                 &case.mini,
+                case.mini_reason.as_deref(),
                 &kernel_skipped,
                 false,
             );
@@ -113,7 +119,7 @@ fn campaign_invariants() {
             let concrete = concrete_side(env.concrete_report.as_ref().expect("concrete report"));
             if concrete == ConcreteSide::Safe {
                 let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-                let f = classify_env(&env, &name, &mini, &kernel_accept, false);
+                let f = classify_env(&env, &name, &mini, None, &kernel_accept, false);
                 assert!(
                     f == Finding::RvPrecisionGap || f == Finding::Whitelisted,
                     "{name}: {f:?}"
@@ -184,7 +190,14 @@ fn campaign_finding_replay() {
     for seed in 0..200u64 {
         let case = run_case(seed);
         let name = format!("seed-{seed}");
-        let f = classify_env(&case.env, &name, &case.mini, &kernel_accept, false);
+        let f = classify_env(
+            &case.env,
+            &name,
+            &case.mini,
+            case.mini_reason.as_deref(),
+            &kernel_accept,
+            false,
+        );
         if !f.is_finding() {
             continue;
         }
@@ -212,7 +225,7 @@ fn campaign_finding_replay() {
                 category: categorize_mini_reason(f),
             },
         };
-        let f2 = classify_env(&env, &name, &mini, &kernel_accept, false);
+        let f2 = classify_env(&env, &name, &mini, None, &kernel_accept, false);
         assert_eq!(f, f2, "seed {seed}: classification changed on replay");
         replayed += 1;
     }

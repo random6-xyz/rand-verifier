@@ -91,6 +91,11 @@ pub struct OracleInput<'a> {
     pub name: &'a str,
     /// The rand-verifier side (`diff::mini_side`).
     pub mini: &'a SideVerdict,
+    /// The mini failure message, when mini rejected — needed to
+    /// distinguish uninit-stack from uninit-register rejects (the
+    /// category alone is too coarse; privileged loads allow uninit
+    /// stack reads by design, #73 empirical).
+    pub mini_reason: Option<&'a str>,
     /// The concrete side.
     pub concrete: ConcreteSide,
     /// The kernel side (`diff::kernel_side`), `Skipped` when the kernel
@@ -109,6 +114,7 @@ pub fn classify(input: &OracleInput) -> Finding {
     let OracleInput {
         name,
         mini,
+        mini_reason,
         concrete,
         kernel,
         strict,
@@ -121,7 +127,9 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // v0.6 kernel-accepts fixtures are design behaviour
                 // (e.g. stack_write_before_read under privilege)
                 SideVerdict::Accept => {
-                    if whitelisted(name, mini, kernel).is_some() {
+                    if whitelisted(name, mini, kernel).is_some()
+                        || is_privileged_uninit_stack(mini, *mini_reason)
+                    {
                         Finding::Whitelisted
                     } else {
                         Finding::SoundnessCandidate
@@ -173,6 +181,25 @@ pub fn classify(input: &OracleInput) -> Finding {
     }
 }
 
+/// Privileged loads allow uninit stack reads by design
+/// (`allow_uninit_stack`; `bpf_ns_capable` treats CAP_SYS_ADMIN as a
+/// superset of every BPF cap — verified against kernel/bpf/token.c in
+/// v0.6). mini rejects those with "stack slot ... is uninitialized",
+/// while the kernel accepts under privilege — the same design
+/// difference as the v0.6 `stack_write_before_read` whitelist, applied
+/// by category so it also covers fuzzer-generated programs (found
+/// empirically as mseed-5-19 in the first kernel-backed campaign,
+/// #73). Uninit *register* reads stay soundness candidates — the
+/// kernel rejects those too, so a kernel accept would be a real bug.
+fn is_privileged_uninit_stack(mini: &SideVerdict, mini_reason: Option<&str>) -> bool {
+    matches!(
+        mini,
+        SideVerdict::Reject {
+            category: ReasonCategory::UninitRead
+        }
+    ) && mini_reason.is_some_and(|r| r.contains("stack slot"))
+}
+
 /// Classify a verified program from its environment — the binary-
 /// facing wrapper for the campaign runner (#69): reads the concrete
 /// report produced by the last [`BpfVerifierEnv::verify`] call. A
@@ -183,6 +210,7 @@ pub fn classify_env(
     env: &BpfVerifierEnv,
     name: &str,
     mini: &SideVerdict,
+    mini_reason: Option<&str>,
     kernel: &SideVerdict,
     strict: bool,
 ) -> Finding {
@@ -194,6 +222,7 @@ pub fn classify_env(
     classify(&OracleInput {
         name,
         mini,
+        mini_reason,
         concrete,
         kernel,
         strict,
@@ -237,6 +266,7 @@ mod tests {
         classify(&OracleInput {
             name,
             mini: &mini,
+            mini_reason: None,
             concrete,
             kernel: &kernel,
             strict,
@@ -419,6 +449,7 @@ mod tests {
                 let finding = classify(&OracleInput {
                     name: &name,
                     mini: &mini,
+                    mini_reason: None,
                     concrete,
                     kernel: &kernel,
                     strict: false,
@@ -508,7 +539,7 @@ mod tests {
         let insns = [insn_bytes(0xb7, 0, 0, 0, 42), insn_bytes(0x95, 0, 0, 0, 0)];
         let (verdict, env) = verify_bytes(&insns);
         assert!(matches!(verdict, Verdict::Safe));
-        let finding = classify_env(&env, "seed-0-0", &acc(), &skip(), false);
+        let finding = classify_env(&env, "seed-0-0", &acc(), None, &skip(), false);
         assert_eq!(finding, Finding::Skipped);
 
         // reject-that-executes + kernel reject with a different reason
@@ -523,7 +554,7 @@ mod tests {
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let mini = rej(ReasonCategory::Unreachable);
         let kernel = rej(ReasonCategory::UninitRead);
-        let finding = classify_env(&env, "seed-0-1", &mini, &kernel, false);
+        let finding = classify_env(&env, "seed-0-1", &mini, None, &kernel, false);
         assert_eq!(finding, Finding::PrecisionCandidate);
 
         // decode-error program: no concrete report → inconclusive
@@ -539,9 +570,40 @@ mod tests {
             &env,
             "seed-0-2",
             &rej(ReasonCategory::Other),
+            None,
             &rej(ReasonCategory::Other),
             false,
         );
         assert_eq!(finding, Finding::Inconclusive);
+    }
+
+    /// The privileged uninit-stack design difference whitelists by
+    /// category (empirical: mseed-5-19 in the first kernel-backed
+    /// campaign, #73) — the fuzzer-side counterpart of the v0.6
+    /// `stack_write_before_read` whitelist. Uninit *register* reads
+    /// stay soundness candidates.
+    #[test]
+    fn whitelist_privileged_uninit_stack() {
+        // r2 = 10; r0 = *(u64 *)(r10 - 8); exit — the mseed-5-19 shape
+        let insns = [
+            insn_bytes(0xb7, 2, 0, 0, 10),
+            insn_bytes(0x79, 0, 10, -8, 0),
+            insn_bytes(0x95, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_bytes(&insns);
+        assert!(matches!(verdict, Verdict::Unsafe(_)));
+        let mini = rej(ReasonCategory::UninitRead);
+
+        // stack-slot uninit + kernel accept = privileged design
+        // behaviour (allow_uninit_stack)
+        let reason = "stack slot at offset -8 is uninitialized (write before read)";
+        let finding = classify_env(&env, "mseed-5-19", &mini, Some(reason), &acc(), false);
+        assert_eq!(finding, Finding::Whitelisted);
+
+        // register uninit + kernel accept stays a soundness candidate
+        // (the kernel rejects those — an accept would be a real bug)
+        let reason = "register r2 is uninitialized";
+        let finding = classify_env(&env, "mseed-x", &mini, Some(reason), &acc(), false);
+        assert_eq!(finding, Finding::SoundnessCandidate);
     }
 }

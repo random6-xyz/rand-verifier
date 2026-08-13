@@ -406,7 +406,14 @@ fn run_program(args: &Args, name: &str, insns: &[BpfInsn]) -> anyhow::Result<Out
         (SideVerdict::Skipped, None, None)
     };
 
-    let finding = classify_env(&env, name, &mini, &kernel, args.strict);
+    let finding = classify_env(
+        &env,
+        name,
+        &mini,
+        mini_reason.as_deref(),
+        &kernel,
+        args.strict,
+    );
     Ok(Outcome {
         name: name.to_string(),
         bytes,
