@@ -8,9 +8,11 @@
 //! and operand passes (#79/#80), driven by a fixpoint driver (#81) and
 //! a CLI (#82).
 
+pub mod ddmin;
 pub mod fixup;
 pub mod replay;
 
+pub use ddmin::{OracleCache, ddmin};
 pub use fixup::delete_insns;
 pub use replay::{
     Baseline, FindingSpec, Invariant, ReduceError, Sides, evaluate_bytes, invariant_for,
