@@ -1,0 +1,14 @@
+   0: MovReg { dst: 6, src: 10 }
+   1: AddImm { dst: 6, imm: -32 }
+   2: Call { imm: 7 }
+   3: MovReg { dst: 2, src: 0 }
+   4: MovImm { dst: 3, imm: 255 }
+   5: Jslt { dst: 2, src: 3, offset: 1 }
+   6: Exit
+   7: MovImm { dst: 4, imm: 0 }
+   8: Jsge { dst: 2, src: 4, offset: 1 }
+   9: Exit
+  10: AndImm { dst: 2, imm: 248 }
+  11: AddReg { dst: 6, src: 2 }
+  12: MovImm { dst: 0, imm: 1 }
+  13: Exit

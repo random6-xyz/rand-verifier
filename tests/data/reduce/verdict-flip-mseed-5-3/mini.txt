@@ -1,0 +1,2 @@
+mini: REJECT
+reason: register r4 is uninitialized

@@ -1,0 +1,7 @@
+{
+  "label": "verdict-flip",
+  "name": "mseed-5-3",
+  "finding": "agree",
+  "mini": "REJECT(UninitRead)",
+  "kernel": "REJECT(UninitRead)"
+}

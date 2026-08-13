@@ -45,7 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build the binaries
-        run: cargo build --bin diff --bin fuzz
+        run: cargo build --bin diff --bin fuzz --bin reduce
 
       - name: Run the differential harness
         # build as the runner user, run only the binary as root —
@@ -59,6 +59,19 @@ jobs:
         with:
           name: diff-report
           path: /tmp/diff.json
+          if-no-files-found: error
+
+      - name: Reduce the kernel-dependent v0.7 finding
+        # the rv-precision-gap fixture (mseed-5-99) needs the kernel
+        # column — a privileged run; exits 1 when the reduced program
+        # no longer re-classifies to the finding (reducer bug) (#83)
+        run: sudo ./target/debug/reduce tests/data/reduce/rv-precision-gap-mseed-5-99 --kernel --out-dir /tmp/reduce-kernel
+
+      - name: Upload the reduced kernel-dependent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reduce-kernel
+          path: /tmp/reduce-kernel/
           if-no-files-found: error
 
       - name: Run a short kernel-backed fuzz campaign
@@ -83,13 +96,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build the fuzz binary
-        run: cargo build --bin fuzz
+        run: cargo build --bin fuzz --bin reduce
 
       - name: Run the fuzzer regression suite
         # fixed-seed determinism, classification invariants, opcode
         # coverage, finding replay — all without a bpf() syscall (#72)
         # (quoted: YAML would parse the ':: ' in 'fuzz:: --lib' as a mapping)
         run: "cargo test fuzz:: --lib"
+
+      - name: Reduce the unprivileged verdict-flip fixture
+        # kernel-independent finding (mini + concrete only); exits 1 on
+        # a classification change (reducer bug) (#83)
+        run: ./target/debug/reduce tests/data/reduce/verdict-flip-mseed-5-3 --out-dir /tmp/reduce-out
+
+      - name: Upload the reduced verdict-flip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reduce-unprivileged
+          path: /tmp/reduce-out/
+          if-no-files-found: error
 
       - name: Run an unprivileged smoke campaign
         # kernel columns are skipped without privileges; exits 1 only
