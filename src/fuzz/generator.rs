@@ -81,7 +81,7 @@ impl Generator {
                 // from conditional backward edges instead (#66).
                 insns.push(insn_lib::jmp((body_len - pc - 1) as i16));
             } else {
-                insns.push(self.gen_body_insn(pc, body_len));
+                insns.push(gen_body_insn(&mut self.rng, pc, body_len));
             }
         }
 
@@ -124,153 +124,154 @@ impl Generator {
             self.gen_program(cfg)
         }
     }
+}
 
-    /// One body instruction (never the unconditional jump — see the
-    /// module docs). `pc` is the body index, `body_len` the body
-    /// length; the exit sits at index `body_len`.
-    fn gen_body_insn(&mut self, pc: usize, body_len: usize) -> BpfInsn {
-        let roll = self.rng.below(100);
-        if roll < WEIGHT_ALU64 {
-            self.gen_alu(false)
-        } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 {
-            self.gen_alu(true)
-        } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP {
-            self.gen_cmp(pc, body_len)
-        } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP + WEIGHT_STACK {
-            self.gen_stack()
-        } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP + WEIGHT_STACK + WEIGHT_HELPER {
-            self.gen_helper()
-        } else {
-            unreachable!("weights sum to 100")
-        }
+/// One body instruction (never the unconditional jump — see the
+/// module docs). `pc` is the body index, `body_len` the body
+/// length; the exit sits at index `body_len`. A free function so the
+/// mutator (#71) can reuse the weighted distribution.
+pub(crate) fn gen_body_insn(rng: &mut SplitMix64, pc: usize, body_len: usize) -> BpfInsn {
+    let roll = rng.below(100);
+    if roll < WEIGHT_ALU64 {
+        gen_alu(rng, false)
+    } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 {
+        gen_alu(rng, true)
+    } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP {
+        gen_cmp(rng, pc, body_len)
+    } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP + WEIGHT_STACK {
+        gen_stack(rng)
+    } else if roll < WEIGHT_ALU64 + WEIGHT_ALU32 + WEIGHT_CMP + WEIGHT_STACK + WEIGHT_HELPER {
+        gen_helper(rng)
+    } else {
+        unreachable!("weights sum to 100")
     }
+}
 
-    /// A random ALU instruction: op, K/X form, operands from the pools.
-    fn gen_alu(&mut self, alu32: bool) -> BpfInsn {
-        // op index: 0 = mov, 1 = add, 2 = sub, 3 = and, 4 = or, 5 = xor,
-        // 6 = lsh, 7 = rsh, 8 = arsh. There is no MOV32 in the supported
-        // subset, so ALU32 draws from 1..=8 only.
-        let op = if alu32 {
-            1 + self.rng.below(8) as usize
-        } else {
-            self.rng.below(9) as usize
-        };
-        let dst = *self.rng.pick(ALU_REGS);
-        let k_form = self.rng.below(2) == 0;
-        match (alu32, k_form, op) {
-            (false, true, 0) => insn_lib::mov_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 0) => insn_lib::mov_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 1) => insn_lib::add_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 1) => insn_lib::add_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 2) => insn_lib::sub_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 2) => insn_lib::sub_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 3) => insn_lib::and_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 3) => insn_lib::and_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 4) => insn_lib::or_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 4) => insn_lib::or_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 5) => insn_lib::xor_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 5) => insn_lib::xor_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 6) => insn_lib::lsh_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 6) => insn_lib::lsh_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 7) => insn_lib::rsh_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 7) => insn_lib::rsh_reg(dst, *self.rng.pick(ALU_REGS)),
-            (false, true, 8) => insn_lib::arsh_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (false, false, 8) => insn_lib::arsh_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 1) => insn_lib::add32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 1) => insn_lib::add32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 2) => insn_lib::sub32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 2) => insn_lib::sub32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 3) => insn_lib::and32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 3) => insn_lib::and32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 4) => insn_lib::or32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 4) => insn_lib::or32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 5) => insn_lib::xor32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 5) => insn_lib::xor32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 6) => insn_lib::lsh32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 6) => insn_lib::lsh32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 7) => insn_lib::rsh32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 7) => insn_lib::rsh32_reg(dst, *self.rng.pick(ALU_REGS)),
-            (true, true, 8) => insn_lib::arsh32_imm(dst, *self.rng.pick(IMMEDIATES)),
-            (true, false, 8) => insn_lib::arsh32_reg(dst, *self.rng.pick(ALU_REGS)),
-            // (true, _, 0) — no MOV32 in the supported subset
-            _ => unreachable!("all op/alu32/k_form combinations are covered"),
-        }
+/// A random ALU instruction: op, K/X form, operands from the pools.
+fn gen_alu(rng: &mut SplitMix64, alu32: bool) -> BpfInsn {
+    // op index: 0 = mov, 1 = add, 2 = sub, 3 = and, 4 = or, 5 = xor,
+    // 6 = lsh, 7 = rsh, 8 = arsh. There is no MOV32 in the supported
+    // subset, so ALU32 draws from 1..=8 only.
+    let op = if alu32 {
+        1 + rng.below(8) as usize
+    } else {
+        rng.below(9) as usize
+    };
+    let dst = *rng.pick(ALU_REGS);
+    let k_form = rng.below(2) == 0;
+    match (alu32, k_form, op) {
+        (false, true, 0) => insn_lib::mov_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 0) => insn_lib::mov_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 1) => insn_lib::add_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 1) => insn_lib::add_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 2) => insn_lib::sub_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 2) => insn_lib::sub_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 3) => insn_lib::and_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 3) => insn_lib::and_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 4) => insn_lib::or_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 4) => insn_lib::or_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 5) => insn_lib::xor_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 5) => insn_lib::xor_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 6) => insn_lib::lsh_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 6) => insn_lib::lsh_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 7) => insn_lib::rsh_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 7) => insn_lib::rsh_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 8) => insn_lib::arsh_imm(dst, *rng.pick(IMMEDIATES)),
+        (false, false, 8) => insn_lib::arsh_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 1) => insn_lib::add32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 1) => insn_lib::add32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 2) => insn_lib::sub32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 2) => insn_lib::sub32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 3) => insn_lib::and32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 3) => insn_lib::and32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 4) => insn_lib::or32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 4) => insn_lib::or32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 5) => insn_lib::xor32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 5) => insn_lib::xor32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 6) => insn_lib::lsh32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 6) => insn_lib::lsh32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 7) => insn_lib::rsh32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 7) => insn_lib::rsh32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 8) => insn_lib::arsh32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 8) => insn_lib::arsh32_reg(dst, *rng.pick(ALU_REGS)),
+        // (true, _, 0) — no MOV32 in the supported subset
+        _ => unreachable!("all op/alu32/k_form combinations are covered"),
     }
+}
 
-    /// A random conditional compare. The branch offset always points at
-    /// a valid instruction: target = pc + 1 + offset in `[0, body_len]`
-    /// (the exit sits at `body_len`). Backward edges (bounded-loop
-    /// candidates) are allowed.
-    fn gen_cmp(&mut self, pc: usize, body_len: usize) -> BpfInsn {
-        const OPS: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let op = OPS[self.rng.below(OPS.len() as u64) as usize];
-        let dst = *self.rng.pick(ALU_REGS);
-        let k_form = self.rng.below(2) == 0;
-        let offset = self.gen_branch_offset(pc, body_len);
-        let src = *self.rng.pick(ALU_REGS);
-        let imm = *self.rng.pick(IMMEDIATES);
-        match (k_form, op) {
-            (false, 0) => insn_lib::jeq(dst, src, offset),
-            (true, 0) => insn_lib::jeq_imm(dst, imm, offset),
-            (false, 1) => insn_lib::jne(dst, src, offset),
-            (true, 1) => insn_lib::jne_imm(dst, imm, offset),
-            (false, 2) => insn_lib::jgt(dst, src, offset),
-            (true, 2) => insn_lib::jgt_imm(dst, imm, offset),
-            (false, 3) => insn_lib::jge(dst, src, offset),
-            (true, 3) => insn_lib::jge_imm(dst, imm, offset),
-            (false, 4) => insn_lib::jlt(dst, src, offset),
-            (true, 4) => insn_lib::jlt_imm(dst, imm, offset),
-            (false, 5) => insn_lib::jle(dst, src, offset),
-            (true, 5) => insn_lib::jle_imm(dst, imm, offset),
-            (false, 6) => insn_lib::jsgt(dst, src, offset),
-            (true, 6) => insn_lib::jsgt_imm(dst, imm, offset),
-            (false, 7) => insn_lib::jsge(dst, src, offset),
-            (true, 7) => insn_lib::jsge_imm(dst, imm, offset),
-            (false, 8) => insn_lib::jslt(dst, src, offset),
-            (true, 8) => insn_lib::jslt_imm(dst, imm, offset),
-            (false, 9) => insn_lib::jsle(dst, src, offset),
-            (true, 9) => insn_lib::jsle_imm(dst, imm, offset),
-            _ => unreachable!("all op/k_form combinations are covered"),
-        }
+/// A random conditional compare. The branch offset always points at
+/// a valid instruction: target = pc + 1 + offset in `[0, body_len]`
+/// (the exit sits at `body_len`). Backward edges (bounded-loop
+/// candidates) are allowed.
+fn gen_cmp(rng: &mut SplitMix64, pc: usize, body_len: usize) -> BpfInsn {
+    const OPS: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let op = OPS[rng.below(OPS.len() as u64) as usize];
+    let dst = *rng.pick(ALU_REGS);
+    let k_form = rng.below(2) == 0;
+    let offset = gen_branch_offset(rng, pc, body_len);
+    let src = *rng.pick(ALU_REGS);
+    let imm = *rng.pick(IMMEDIATES);
+    match (k_form, op) {
+        (false, 0) => insn_lib::jeq(dst, src, offset),
+        (true, 0) => insn_lib::jeq_imm(dst, imm, offset),
+        (false, 1) => insn_lib::jne(dst, src, offset),
+        (true, 1) => insn_lib::jne_imm(dst, imm, offset),
+        (false, 2) => insn_lib::jgt(dst, src, offset),
+        (true, 2) => insn_lib::jgt_imm(dst, imm, offset),
+        (false, 3) => insn_lib::jge(dst, src, offset),
+        (true, 3) => insn_lib::jge_imm(dst, imm, offset),
+        (false, 4) => insn_lib::jlt(dst, src, offset),
+        (true, 4) => insn_lib::jlt_imm(dst, imm, offset),
+        (false, 5) => insn_lib::jle(dst, src, offset),
+        (true, 5) => insn_lib::jle_imm(dst, imm, offset),
+        (false, 6) => insn_lib::jsgt(dst, src, offset),
+        (true, 6) => insn_lib::jsgt_imm(dst, imm, offset),
+        (false, 7) => insn_lib::jsge(dst, src, offset),
+        (true, 7) => insn_lib::jsge_imm(dst, imm, offset),
+        (false, 8) => insn_lib::jslt(dst, src, offset),
+        (true, 8) => insn_lib::jslt_imm(dst, imm, offset),
+        (false, 9) => insn_lib::jsle(dst, src, offset),
+        (true, 9) => insn_lib::jsle_imm(dst, imm, offset),
+        _ => unreachable!("all op/k_form combinations are covered"),
     }
+}
 
-    /// A branch offset for an instruction at body index `pc`: the
-    /// target `pc + 1 + offset` lies in `[0, body_len]`. Forward edges
-    /// point into the remaining body or at the exit; backward edges
-    /// (30%) point at an earlier instruction, forming a loop.
-    fn gen_branch_offset(&mut self, pc: usize, body_len: usize) -> i16 {
-        if pc > 0 && self.rng.below(100) < BACKWARD_PERCENT {
-            // target in [0, pc) — backward edge, bounded-loop candidate
-            let target = self.rng.below(pc as u64) as usize;
-            (target as i64 - pc as i64 - 1) as i16
-        } else {
-            // target in [pc + 1, body_len] — forward edge (body_len is
-            // the exit), so no instruction is ever jumped over
-            let ahead = (body_len - pc) as u64;
-            let target = pc + 1 + self.rng.below(ahead) as usize;
-            (target as i64 - pc as i64 - 1) as i16
-        }
+/// A branch offset for an instruction at body index `pc`: the
+/// target `pc + 1 + offset` lies in `[0, body_len]`. Forward edges
+/// point into the remaining body or at the exit; backward edges
+/// (30%) point at an earlier instruction, forming a loop.
+fn gen_branch_offset(rng: &mut SplitMix64, pc: usize, body_len: usize) -> i16 {
+    if pc > 0 && rng.below(100) < BACKWARD_PERCENT {
+        // target in [0, pc) — backward edge, bounded-loop candidate
+        let target = rng.below(pc as u64) as usize;
+        (target as i64 - pc as i64 - 1) as i16
+    } else {
+        // target in [pc + 1, body_len] — forward edge (body_len is
+        // the exit), so no instruction is ever jumped over
+        let ahead = (body_len - pc) as u64;
+        let target = pc + 1 + rng.below(ahead) as usize;
+        (target as i64 - pc as i64 - 1) as i16
     }
+}
 
-    /// A stack access: frame-pointer-relative DW load or store with an
-    /// offset from the pool. Write-before-read is enforced later by the
-    /// mini pass — a rejected program is a normal fuzz outcome.
-    fn gen_stack(&mut self) -> BpfInsn {
-        let reg = *self.rng.pick(ALU_REGS);
-        let offset = *self.rng.pick(OFFSETS);
-        if self.rng.below(2) == 0 {
-            insn_lib::ld_stack(reg, offset)
-        } else {
-            insn_lib::st_stack(reg, offset)
-        }
+/// A stack access: frame-pointer-relative DW load or store with an
+/// offset from the pool. Write-before-read is enforced later by the
+/// mini pass — a rejected program is a normal fuzz outcome.
+fn gen_stack(rng: &mut SplitMix64) -> BpfInsn {
+    let reg = *rng.pick(ALU_REGS);
+    let offset = *rng.pick(OFFSETS);
+    if rng.below(2) == 0 {
+        insn_lib::ld_stack(reg, offset)
+    } else {
+        insn_lib::st_stack(reg, offset)
     }
+}
 
-    /// A helper call: `get_prandom_u32` (id 7) needs no arguments and
-    /// returns an unknown scalar in R0 — the supported helper scope
-    /// (FUZZ_PLAN §11).
-    fn gen_helper(&mut self) -> BpfInsn {
-        insn_lib::call(7)
-    }
+/// A helper call: `get_prandom_u32` (id 7) needs no arguments and
+/// returns an unknown scalar in R0 — the supported helper scope
+/// (FUZZ_PLAN §11).
+fn gen_helper(_rng: &mut SplitMix64) -> BpfInsn {
+    insn_lib::call(7)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
