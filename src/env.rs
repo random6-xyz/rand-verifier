@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::cfg::{add_subprog, check_cfg};
 use crate::concrete::{ConcreteReport, check_coverage, render_coverage_report, run_concrete};
-use crate::error::Verdict;
+use crate::error::{Verdict, VerificationFailure};
 use crate::insn::{BpfInsn, parse_insn};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
 
@@ -20,6 +20,11 @@ pub(crate) struct BpfProg {
     pub(crate) insns: Vec<BpfInsn>,
     subprogs: Vec<u32>,
     pub(crate) insn_cnt: u32,
+    /// The first decode failure, if any: decode errors are program
+    /// rejections (like the kernel's "unknown opcode"), so they are
+    /// stored and reported by `verify()` as `Verdict::Unsafe` instead
+    /// of aborting the load (issue #56).
+    decode_error: Option<VerificationFailure>,
 }
 
 /// The verifier environment: owns the loaded program and runs the
@@ -54,13 +59,27 @@ impl BpfVerifierEnv {
 
         let insn_cnt = (raw_data.len() / 8) as u32;
 
-        let insns: Vec<BpfInsn> = raw_data.chunks_exact(8).map(parse_insn).collect();
+        // decode every 8-byte instruction; the first decode error stops
+        // the decode (like the kernel's per-instruction check loop)
+        let mut insns = Vec::with_capacity(insn_cnt as usize);
+        let mut decode_error = None;
+        for (idx, chunk) in raw_data.chunks_exact(8).enumerate() {
+            match parse_insn(chunk) {
+                Ok(insn) => insns.push(insn),
+                Err(e) => {
+                    decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
+                    insns.clear();
+                    break;
+                }
+            }
+        }
 
         self.prog.name = name.clone();
         self.prog.location = name;
         self.prog.raw_data = raw_data;
         self.prog.insns = insns;
         self.prog.insn_cnt = insn_cnt;
+        self.prog.decode_error = decode_error;
 
         Ok(insn_cnt)
     }
@@ -77,6 +96,13 @@ impl BpfVerifierEnv {
     /// and is reported via [`BpfVerifierEnv::concrete_report_text`].
     pub fn verify(&mut self) -> Result<Verdict> {
         self.concrete_report = None;
+        // a decode failure is a rejection: the program could not even be
+        // decoded (unknown opcode, invalid register, reserved fields).
+        // The concrete cross-check is skipped — there are no instructions
+        // to run (issue #56).
+        if let Some(failure) = &self.prog.decode_error {
+            return Ok(Verdict::Unsafe(failure.clone()));
+        }
         // structural checks (nano)
         let subprogs = match add_subprog(&self.prog.insns) {
             Ok(subprogs) => subprogs,
@@ -396,7 +422,7 @@ mod tests {
         // r0 = get_prandom_u32(-7); exit — helper seeds must all be
         // covered by the abstract unknown scalar range
         let insns = [
-            insn_bytes(opcode::CALL, 0, 0, 0, -7),
+            insn_bytes(opcode::CALL, 0, 0, 0, 7),
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
         let (verdict, env) = verify_temp_program(&insns, "accept_prandom");
@@ -480,6 +506,31 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_decode_error_is_rejection() {
+        // a program with an unknown opcode is rejected at decode time
+        // (issue #56), with the failing instruction index; there are no
+        // instructions, so no concrete cross-check runs
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 1),
+            insn_bytes(0xEF, 0, 0, 0, 0), // not in the kernel instruction table
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+        let (verdict, env) = verify_temp_program(&insns, "decode_error");
+        match verdict {
+            Verdict::Safe => panic!("decode-error program was accepted"),
+            Verdict::Unsafe(failure) => {
+                assert_eq!(failure.insn_idx, 1);
+                assert!(
+                    failure.message.contains("unknown opcode"),
+                    "{}",
+                    failure.message
+                );
+            }
+        }
+        assert!(env.concrete_report.is_none());
     }
 
     // ── Worklist (v0.3) ──────────────────────────────────────────────────────
