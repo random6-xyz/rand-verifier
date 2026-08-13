@@ -29,7 +29,9 @@ use rand_verifier::env::BpfVerifierEnv;
 use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::generator::{GenConfig, Generator};
 use rand_verifier::fuzz::insn_lib::{self, opcode_family};
-use rand_verifier::fuzz::oracle::{Finding, classify_env};
+use rand_verifier::fuzz::oracle::{Finding, classify_env, first_violation_pc};
+use rand_verifier::fuzz::triage::{Candidate, Divergence, Group, group};
+use rand_verifier::klog::ReasonCategory;
 use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel};
 
 /// Share of idiom-template programs in a generation campaign — the
@@ -126,6 +128,7 @@ fn main() -> anyhow::Result<()> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut coverage: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut findings: Vec<(String, String)> = Vec::new(); // (name, dir)
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     for i in 0..args.iters {
         let name = format!("seed-{}-{}", args.seed, i);
@@ -141,21 +144,24 @@ fn main() -> anyhow::Result<()> {
         // rand-verifier side (mini + concrete)
         let mut env = BpfVerifierEnv::new();
         env.setup_prog_bytes(&bytes)?;
-        let (mini, mini_reason) = match env.verify()? {
-            Verdict::Safe => (SideVerdict::Accept, None),
-            Verdict::Unsafe(failure) => (
-                SideVerdict::Reject {
-                    category: categorize_mini_reason(&failure),
-                },
-                Some(failure.message),
-            ),
+        let (mini, mini_reason, mini_insn) = match env.verify()? {
+            Verdict::Safe => (SideVerdict::Accept, None, None),
+            Verdict::Unsafe(failure) => {
+                let category = categorize_mini_reason(&failure);
+                let insn = failure.insn_idx();
+                (
+                    SideVerdict::Reject { category },
+                    Some(failure.message),
+                    Some(insn),
+                )
+            }
         };
 
         // kernel side (optional)
-        let (kernel, kernel_message) = if args.kernel {
+        let (kernel, kernel_message, kernel_insn) = if args.kernel {
             kernel_side_of(&load_with_kernel(&bytes))
         } else {
-            (SideVerdict::Skipped, None)
+            (SideVerdict::Skipped, None, None)
         };
 
         let finding = classify_env(&env, &name, &mini, &kernel, args.strict);
@@ -168,18 +174,43 @@ fn main() -> anyhow::Result<()> {
                 &ProgramResult {
                     name: &name,
                     finding,
-                    mini,
+                    mini: mini.clone(),
                     mini_reason,
-                    kernel,
+                    kernel: kernel.clone(),
                     kernel_message,
                     bytes: &bytes,
                 },
             )?;
-            findings.push((name, dir.display().to_string()));
+            findings.push((name.clone(), dir.display().to_string()));
+            // triage input: the divergence signature (#70)
+            candidates.push(Candidate {
+                name,
+                finding,
+                mini,
+                kernel,
+                divergence: Divergence {
+                    mini_insn,
+                    kernel_insn,
+                    concrete_pc: first_violation_pc(&env),
+                },
+            });
         }
     }
 
-    write_summary(&args, &counts, &coverage, &findings)?;
+    // dedup into groups: one representative per root cause (#70)
+    let groups = group(candidates);
+    let groups_dir = args.out_dir.join("groups");
+    if !groups.is_empty() {
+        fs::create_dir_all(&groups_dir)?;
+        for (i, g) in groups.iter().enumerate() {
+            let gdir = groups_dir.join(format!("{}-{:03}", g.priority, i));
+            let src = findings_dir.join(format!("{}-{}", g.key.finding.name(), g.representative));
+            copy_dir(&src, &gdir)?;
+            fs::write(gdir.join("group.json"), group_json(g, &gdir))?;
+        }
+    }
+
+    write_summary(&args, &counts, &coverage, &findings, &groups, &groups_dir)?;
 
     println!("campaign done: seed {} iters {}", args.seed, args.iters);
     for (k, v) in &counts {
@@ -202,25 +233,32 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The kernel side of one load, with the message for the finding
-/// artifact (same mapping as the diff harness).
-fn kernel_side_of(outcome: &KernelOutcome) -> (SideVerdict, Option<String>) {
+/// The kernel side of one load, with the message and reject index for
+/// the finding artifact (same mapping as the diff harness).
+fn kernel_side_of(outcome: &KernelOutcome) -> (SideVerdict, Option<String>, Option<u32>) {
     match outcome {
-        KernelOutcome::Accept => (SideVerdict::Accept, None),
+        KernelOutcome::Accept => (SideVerdict::Accept, None, None),
         KernelOutcome::Reject {
-            message, category, ..
+            message,
+            category,
+            insn_idx,
+            ..
         } => (
             SideVerdict::Reject {
                 category: *category,
             },
             Some(message.clone()),
+            Some(*insn_idx),
         ),
-        KernelOutcome::Privilege => (SideVerdict::Skipped, Some("EPERM (privilege)".into())),
+        KernelOutcome::Privilege => (SideVerdict::Skipped, Some("EPERM (privilege)".into()), None),
         KernelOutcome::NoErrorLine { errno } => (
             SideVerdict::Skipped,
             Some(format!("errno {errno} (no log line)")),
+            None,
         ),
-        KernelOutcome::InvalidProgram => (SideVerdict::Skipped, Some("invalid program".into())),
+        KernelOutcome::InvalidProgram => {
+            (SideVerdict::Skipped, Some("invalid program".into()), None)
+        }
     }
 }
 
@@ -296,6 +334,71 @@ fn side_json(side: &SideVerdict) -> String {
     }
 }
 
+/// Copy the artifact files of one finding into a group directory
+/// (existing files only — kernel.log is optional).
+fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dst)?;
+    for name in [
+        "prog.bin",
+        "prog.dump",
+        "mini.txt",
+        "concrete.txt",
+        "kernel.log",
+        "meta.json",
+    ] {
+        let from = src.join(name);
+        if from.is_file() {
+            fs::copy(&from, dst.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// The per-group group.json (deterministic).
+fn group_json(g: &Group, dir: &Path) -> String {
+    let mut s = String::from("{\n");
+    s.push_str(&format!("  \"finding\": \"{}\",\n", g.key.finding.name()));
+    s.push_str(&format!(
+        "  \"mini_category\": {},\n",
+        opt_category(g.key.mini_category)
+    ));
+    s.push_str(&format!(
+        "  \"kernel_category\": {},\n",
+        opt_category(g.key.kernel_category)
+    ));
+    s.push_str(&format!("  \"div_insn\": {},\n", opt_u32(g.key.div_insn)));
+    s.push_str(&format!(
+        "  \"concrete_pc\": {},\n",
+        opt_u32(g.key.concrete_pc)
+    ));
+    s.push_str(&format!("  \"count\": {},\n", g.count));
+    s.push_str(&format!("  \"priority\": {},\n", g.priority));
+    s.push_str(&format!(
+        "  \"representative\": \"{}\",\n",
+        json_escape(&g.representative)
+    ));
+    s.push_str(&format!(
+        "  \"dir\": \"{}\"\n",
+        json_escape(&dir.display().to_string())
+    ));
+    s.push_str("}\n");
+    s
+}
+
+fn opt_category(c: Option<ReasonCategory>) -> String {
+    match c {
+        Some(c) => format!("\"{:?}\"", c),
+        None => "null".to_string(),
+    }
+}
+
+fn opt_u32(v: Option<u32>) -> String {
+    match v {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    }
+}
+
 /// The campaign summary (schema: see #69 / the PR).
 ///
 /// ```json
@@ -303,13 +406,18 @@ fn side_json(side: &SideVerdict) -> String {
 ///   "counts": { "agree": 980, "precision-candidate": 2, ... },
 ///   "opcode_coverage": { "alu64": 512, ... },
 ///   "findings": [ { "name": "seed-42-7", "finding": "precision-candidate",
-///                   "dir": "out/findings/..." } ] }
+///                   "dir": "out/findings/..." } ],
+///   "groups": [ { "finding": "precision-candidate", "count": 2,
+///                  "priority": 1, "representative": "seed-42-7",
+///                  "dir": "out/groups/1-000" } ] }
 /// ```
 fn write_summary(
     args: &Args,
     counts: &BTreeMap<&'static str, usize>,
     coverage: &BTreeMap<&'static str, usize>,
     findings: &[(String, String)],
+    groups: &[Group],
+    groups_dir: &Path,
 ) -> anyhow::Result<()> {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"seed\": {},\n", args.seed));
@@ -326,6 +434,20 @@ fn write_summary(
             "    {{\"name\": \"{}\", \"dir\": \"{}\"}}{}\n",
             json_escape(name),
             json_escape(dir),
+            comma
+        ));
+    }
+    s.push_str("  ],\n  \"groups\": [\n");
+    for (i, g) in groups.iter().enumerate() {
+        let comma = if i + 1 == groups.len() { "" } else { "," };
+        let gdir = groups_dir.join(format!("{}-{:03}", g.priority, i));
+        s.push_str(&format!(
+            "    {{\"finding\": \"{}\", \"count\": {}, \"priority\": {}, \"representative\": \"{}\", \"dir\": \"{}\"}}{}\n",
+            g.key.finding.name(),
+            g.count,
+            g.priority,
+            json_escape(&g.representative),
+            json_escape(&gdir.display().to_string()),
             comma
         ));
     }

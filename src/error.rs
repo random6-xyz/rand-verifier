@@ -14,6 +14,12 @@ impl VerificationFailure {
             message: message.into(),
         }
     }
+
+    /// The instruction index where verification failed — exposed for
+    /// the fuzzer's triage (the divergence point, #70).
+    pub fn insn_idx(&self) -> u32 {
+        self.insn_idx
+    }
 }
 
 impl std::fmt::Display for VerificationFailure {

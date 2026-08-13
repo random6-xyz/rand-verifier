@@ -33,7 +33,7 @@ pub(crate) fn concrete_side(report: &ConcreteReport) -> ConcreteSide {
 }
 
 /// The classification of one program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Finding {
     /// 🎯 Kernel REJECT + concrete SAFE (non-whitelisted) — the v0.7
     /// target: the kernel rejects a concretely safe program.
@@ -198,6 +198,15 @@ pub fn classify_env(
         kernel,
         strict,
     })
+}
+
+/// The first coverage-violation pc of the last verification, if any —
+/// the concrete divergence point for triage (#70).
+pub fn first_violation_pc(env: &BpfVerifierEnv) -> Option<u32> {
+    env.concrete_report
+        .as_ref()
+        .and_then(|r| r.violations.first())
+        .map(|v| v.pc)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
