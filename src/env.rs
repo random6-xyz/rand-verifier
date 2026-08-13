@@ -45,8 +45,26 @@ impl BpfVerifierEnv {
     pub fn setup_prog(&mut self, name: String) -> Result<u32> {
         let raw_data =
             fs::read(&name).map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", name, e))?;
+        self.load_raw(raw_data, &name)
+    }
 
-        if raw_data.len() % 8 != 0 {
+    /// Load a BPF program from an in-memory byte buffer (the raw
+    /// `struct bpf_insn` encoding) and return the instruction count.
+    /// Identical semantics to [`Self::setup_prog`]: the same validation
+    /// (multiple of 8, non-empty), the same decode behaviour (a decode
+    /// error is stored and reported by `verify()` as `Verdict::Unsafe`),
+    /// no filesystem involved. This is the entry point for the fuzzer
+    /// (v0.7) to feed generated programs without a file round-trip.
+    pub fn setup_prog_bytes(&mut self, bytes: &[u8]) -> Result<u32> {
+        self.load_raw(bytes.to_vec(), "<memory>")
+    }
+
+    /// Shared loading logic: validate, decode, and fill `BpfProg` from
+    /// raw bytecode. `label` is a display name only — the file path for
+    /// `setup_prog`, `"<memory>"` for `setup_prog_bytes` (currently not
+    /// used in any output).
+    fn load_raw(&mut self, raw_data: Vec<u8>, label: &str) -> Result<u32> {
+        if !raw_data.len().is_multiple_of(8) {
             anyhow::bail!(
                 "Invalid BPF program: size {} is not a multiple of 8",
                 raw_data.len()
@@ -74,8 +92,8 @@ impl BpfVerifierEnv {
             }
         }
 
-        self.prog.name = name.clone();
-        self.prog.location = name;
+        self.prog.name = label.to_string();
+        self.prog.location = label.to_string();
         self.prog.raw_data = raw_data;
         self.prog.insns = insns;
         self.prog.insn_cnt = insn_cnt;
@@ -243,6 +261,108 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn setup_prog_bytes_basic() {
+        let insns = [
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 42),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ];
+
+        let mut env = BpfVerifierEnv::new();
+        let insn_cnt = env.setup_prog_bytes(&prog_bytes(&insns)).unwrap();
+
+        assert_eq!(insn_cnt, 2);
+        assert_eq!(env.prog.insn_cnt, 2);
+        assert_eq!(env.prog.insns.len(), 2);
+        assert!(matches!(
+            env.prog.insns[0],
+            BpfInsn::MovImm { dst: 0, imm: 42 }
+        ));
+        assert!(matches!(env.prog.insns[1], BpfInsn::Exit));
+        assert_eq!(env.prog.name, "<memory>");
+    }
+
+    #[test]
+    fn setup_prog_bytes_validation() {
+        let mut env = BpfVerifierEnv::new();
+
+        // empty input is rejected
+        let err = env.setup_prog_bytes(&[]).unwrap_err();
+        assert!(err.to_string().contains("BPF program is empty"));
+
+        // a size that is not a multiple of 8 is rejected
+        let err = env.setup_prog_bytes(&[0u8; 7]).unwrap_err();
+        assert!(err.to_string().contains("not a multiple of 8"));
+    }
+
+    /// The byte-array loading path must behave identically to the file
+    /// path for every corpus fixture: same verdict, same failure, same
+    /// concrete report (both the rendered text and the structured
+    /// fields).
+    #[test]
+    fn corpus_parity_bytes_vs_file() {
+        for dir in ["tests/programs/accept", "tests/programs/reject"] {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                // skip docs and directories; corpus files have no extension
+                if !path.is_file() || path.extension().is_some() {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+
+                // file path
+                let mut env_file = BpfVerifierEnv::new();
+                env_file
+                    .setup_prog(path.to_str().unwrap().to_string())
+                    .unwrap();
+                let v_file = env_file.verify().unwrap();
+
+                // byte array
+                let mut env_bytes = BpfVerifierEnv::new();
+                env_bytes.setup_prog_bytes(&bytes).unwrap();
+                let v_bytes = env_bytes.verify().unwrap();
+
+                // identical verdict and failure detail
+                match (&v_file, &v_bytes) {
+                    (Verdict::Safe, Verdict::Safe) => {}
+                    (Verdict::Unsafe(a), Verdict::Unsafe(b)) => {
+                        assert_eq!(a.insn_idx, b.insn_idx, "{:?}", path);
+                        assert_eq!(a.message, b.message, "{:?}", path);
+                    }
+                    _ => panic!("verdict mismatch for {:?}", path),
+                }
+
+                // identical rendered concrete report
+                assert_eq!(
+                    env_file.concrete_report_text(),
+                    env_bytes.concrete_report_text(),
+                    "{:?}",
+                    path
+                );
+
+                // identical structured report fields
+                match (
+                    env_file.concrete_report.as_ref(),
+                    env_bytes.concrete_report.as_ref(),
+                ) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.inconclusive, b.inconclusive, "{:?}", path);
+                        assert_eq!(a.reject_note, b.reject_note, "{:?}", path);
+                        assert_eq!(
+                            a.unexpected_failure.as_ref().map(|f| f.to_string()),
+                            b.unexpected_failure.as_ref().map(|f| f.to_string()),
+                            "{:?}",
+                            path
+                        );
+                        assert_eq!(a.violations.len(), b.violations.len(), "{:?}", path);
+                    }
+                    _ => panic!("concrete report presence mismatch for {:?}", path),
+                }
+            }
+        }
+    }
+
     // ── test corpus (file fixtures) ─────────────────────────────────────────
 
     /// Load a corpus program file and run the full verification pipeline
@@ -387,16 +507,13 @@ mod tests {
 
     // ── Concrete integration (v0.5, #53) ───────────────────────────────────
 
-    /// Write a raw program to a temp file, verify it, and return the
-    /// verdict plus the env (for the concrete report).
-    fn verify_temp_program(insns: &[[u8; 8]], tag: &str) -> (Verdict, BpfVerifierEnv) {
-        let path =
-            std::env::temp_dir().join(format!("rand_verifier_{}_{}.bpf", tag, std::process::id()));
-        std::fs::write(&path, prog_bytes(insns)).unwrap();
+    /// Verify an in-memory program (raw bytes) and return the verdict
+    /// plus the env (for the concrete report). No temp files involved
+    /// since #64.
+    fn verify_temp_program(insns: &[[u8; 8]]) -> (Verdict, BpfVerifierEnv) {
         let mut env = BpfVerifierEnv::new();
-        env.setup_prog(path.to_str().unwrap().to_string()).unwrap();
+        env.setup_prog_bytes(&prog_bytes(insns)).unwrap();
         let verdict = env.verify().unwrap();
-        std::fs::remove_file(&path).ok();
         (verdict, env)
     }
 
@@ -406,7 +523,7 @@ mod tests {
             insn_bytes(opcode::MOV_IMM, 0, 0, 0, 42),
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "accept_clean");
+        let (verdict, env) = verify_temp_program(&insns);
         assert!(matches!(verdict, Verdict::Safe));
         let report = env.concrete_report.as_ref().unwrap();
         assert!(report.violations.is_empty());
@@ -425,7 +542,7 @@ mod tests {
             insn_bytes(opcode::CALL, 0, 0, 0, 7),
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "accept_prandom");
+        let (verdict, env) = verify_temp_program(&insns);
         assert!(matches!(verdict, Verdict::Safe));
         let report = env.concrete_report.as_ref().unwrap();
         assert!(report.violations.is_empty(), "{:?}", report.violations);
@@ -441,7 +558,7 @@ mod tests {
             insn_bytes(opcode::ADD_REG, 0, 2, 0, 0),
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "reject_uninit");
+        let (verdict, env) = verify_temp_program(&insns);
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let report = env.concrete_report.as_ref().unwrap();
         let note = report.reject_note.as_deref().expect("reject note");
@@ -460,7 +577,7 @@ mod tests {
             insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "reject_unreachable");
+        let (verdict, env) = verify_temp_program(&insns);
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let report = env.concrete_report.as_ref().unwrap();
         let note = report.reject_note.as_deref().expect("reject note");
@@ -476,7 +593,7 @@ mod tests {
             insn_bytes(opcode::ADD_IMM, 0, 0, 0, 1),
             insn_bytes(opcode::JMP, 0, 0, -2, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "reject_loop");
+        let (verdict, env) = verify_temp_program(&insns);
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let report = env.concrete_report.as_ref().unwrap();
         // the structured flag stays in sync with the note
@@ -518,7 +635,7 @@ mod tests {
             insn_bytes(0xEF, 0, 0, 0, 0), // not in the kernel instruction table
             insn_bytes(opcode::EXIT, 0, 0, 0, 0),
         ];
-        let (verdict, env) = verify_temp_program(&insns, "decode_error");
+        let (verdict, env) = verify_temp_program(&insns);
         match verdict {
             Verdict::Safe => panic!("decode-error program was accepted"),
             Verdict::Unsafe(failure) => {
