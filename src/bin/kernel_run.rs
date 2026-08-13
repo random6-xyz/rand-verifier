@@ -22,7 +22,9 @@ use std::process;
 
 use rand_verifier::insn::{disassemble, parse_insn};
 use rand_verifier::klog::ReasonCategory;
-use rand_verifier::krun::{KernelOutcome, drop_cap_perfmon, load_with_kernel_verbose};
+use rand_verifier::krun::{
+    KernelOutcome, drop_cap_perfmon, load_with_kernel_debug, load_with_kernel_verbose,
+};
 
 /// Print the disassembly of a program (decode errors are shown inline —
 /// the kernel would reject them as "unknown opcode").
@@ -55,7 +57,7 @@ fn category_name(category: ReasonCategory) -> &'static str {
 /// category) / privileged-load failure. With `dump_log` the raw
 /// verifier log is printed too (accepts included — it shows the whole
 /// trace).
-fn run_program(path: &Path, dump_log: bool) {
+fn run_program(path: &Path, dump_log: bool, debug_log: bool) {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -68,7 +70,11 @@ fn run_program(path: &Path, dump_log: bool) {
         print_program(&data);
     }
 
-    let (outcome, log) = load_with_kernel_verbose(&data);
+    let (outcome, log) = if debug_log {
+        load_with_kernel_debug(&data)
+    } else {
+        load_with_kernel_verbose(&data)
+    };
     match &outcome {
         KernelOutcome::Accept => println!("{}: ACCEPT", path.display()),
         KernelOutcome::Reject {
@@ -138,6 +144,7 @@ fn main() {
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let strict = rest.contains(&"--strict");
     let dump_log = rest.contains(&"--log");
+    let debug_log = rest.contains(&"--log2");
     if strict {
         match drop_cap_perfmon() {
             Ok(msg) => eprintln!("strict mode: {}", msg),
@@ -146,15 +153,15 @@ fn main() {
     }
     match rest
         .iter()
-        .find(|a| **a != "--strict" && **a != "--log" && **a != "--")
+        .find(|a| **a != "--strict" && **a != "--log" && **a != "--log2" && **a != "--")
         .copied()
     {
         Some("--all") => {
             for path in corpus_programs() {
-                run_program(&path, false);
+                run_program(&path, false, false);
             }
         }
-        Some(path) => run_program(Path::new(path), dump_log),
+        Some(path) => run_program(Path::new(path), dump_log || debug_log, debug_log),
         None => usage(),
     }
 }

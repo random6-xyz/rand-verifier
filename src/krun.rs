@@ -57,13 +57,13 @@ struct BpfProgLoadAttr {
 
 /// Raw `bpf(BPF_PROG_LOAD, ...)` syscall. `log_buf` receives the
 /// verifier log. Returns the program fd, or the errno.
-fn bpf_prog_load(insns: &[u8], log_buf: &mut [u8]) -> Result<i32, i32> {
+fn bpf_prog_load(insns: &[u8], log_buf: &mut [u8], log_level: u32) -> Result<i32, i32> {
     let mut attr = BpfProgLoadAttr {
         prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
         insn_cnt: (insns.len() / 8) as u32,
         insns: insns.as_ptr() as u64,
         license: c"GPL".as_ptr() as u64,
-        log_level: 1,
+        log_level,
         log_size: log_buf.len() as u32,
         log_buf: log_buf.as_mut_ptr() as u64,
     };
@@ -176,16 +176,28 @@ pub fn drop_cap_perfmon() -> Result<String, String> {
 /// (`kernel.unprivileged_bpf_disabled = 2`): without root / CAP_BPF the
 /// outcome is [`KernelOutcome::Privilege`].
 pub fn load_with_kernel(insns: &[u8]) -> KernelOutcome {
-    load_with_kernel_verbose(insns).0
+    load_with_level(insns, 1).0
 }
 
 /// [`load_with_kernel`] plus the raw verifier log (diagnostics).
 pub fn load_with_kernel_verbose(insns: &[u8]) -> (KernelOutcome, String) {
+    load_with_level(insns, 1)
+}
+
+/// [`load_with_kernel_verbose`] at log_level 2 (BPF_LOG_LEVEL2): full
+/// register/stack state dumps per instruction. Unlike level 1, the log
+/// is kept even when the program is accepted — the kernel resets it on
+/// success at level 1 (bpf_vlog_reset in do_check_common).
+pub fn load_with_kernel_debug(insns: &[u8]) -> (KernelOutcome, String) {
+    load_with_level(insns, 2)
+}
+
+fn load_with_level(insns: &[u8], log_level: u32) -> (KernelOutcome, String) {
     if insns.is_empty() || !insns.len().is_multiple_of(8) {
         return (KernelOutcome::InvalidProgram, String::new());
     }
     let mut log_buf = vec![0u8; LOG_BUF_SIZE];
-    let outcome = match bpf_prog_load(insns, &mut log_buf) {
+    let outcome = match bpf_prog_load(insns, &mut log_buf, log_level) {
         Ok(fd) => {
             // the fd is only a proof of acceptance — nothing to attach
             unsafe { libc::close(fd) };
