@@ -82,7 +82,7 @@ pub(crate) mod opcode {
 
 /// The supported eBPF subset, decoded from the kernel encoding (see
 /// [`opcode`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 // register fields (dst/src/imm/offset) are consumed by state tracking (v0.2)
 pub enum BpfInsn {
     MovImm { dst: u8, imm: i32 },
