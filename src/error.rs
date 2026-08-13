@@ -14,6 +14,12 @@ impl VerificationFailure {
             message: message.into(),
         }
     }
+
+    /// The instruction index where verification failed — exposed for
+    /// the fuzzer's triage (the divergence point, #70).
+    pub fn insn_idx(&self) -> u32 {
+        self.insn_idx
+    }
 }
 
 impl std::fmt::Display for VerificationFailure {
@@ -27,6 +33,7 @@ impl std::fmt::Display for VerificationFailure {
 }
 
 /// The overall result of running the verification pipeline on a program.
+#[derive(Debug)]
 pub enum Verdict {
     Safe,
     Unsafe(VerificationFailure),

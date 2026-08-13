@@ -5,7 +5,7 @@
 /// The categories mirror the rand-verifier failure kinds so the diff
 /// harness (#60) can compare the reasons of the two verifiers on the
 /// same program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReasonCategory {
     /// Reading a register or stack slot before it was initialized
     /// ("R%d !read_ok", "invalid read from stack off ...").

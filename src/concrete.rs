@@ -1007,6 +1007,24 @@ fn helper_return_seeds(
     }
 }
 
+/// The concrete side's own verdict on a program (v0.7, #68): what the
+/// concrete interpreter actually found, independent of the abstract
+/// verdict. This is the fuzzer oracle's truth axis — `Safe`/`Unsafe`
+/// feed the classification matrix, `Inconclusive` is a non-finding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ConcreteVerdict {
+    /// The concrete run executed the program without failures and the
+    /// abstract states covered every visited state.
+    #[default]
+    Safe,
+    /// The concrete run failed (rejected programs) or the abstract
+    /// states failed to cover it (violations / unexpected failure on
+    /// accepted programs).
+    Unsafe,
+    /// The concrete run hit an exploration budget — no verdict.
+    Inconclusive,
+}
+
 /// The concrete-side report of the last verification (v0.5, #53): what
 /// the concrete interpreter found next to the verdict. The verdict
 /// itself is unchanged — an unsoundness is a verifier/model bug, not a
@@ -1027,6 +1045,9 @@ pub(crate) struct ConcreteReport {
     /// Rejected programs: informational cross-check of the concrete
     /// run ("also fails" / "precision candidate" / "inconclusive").
     pub(crate) reject_note: Option<String>,
+    /// The structural concrete verdict (v0.7, #68) — the machine-
+    /// readable counterpart of the reject note, set by `env::verify()`.
+    pub(crate) verdict: ConcreteVerdict,
 }
 
 // ── Abstract↔concrete coverage checker (#52) ────────────────────────────────

@@ -16,6 +16,7 @@
 //! - [`trace`] — execution trace rendering
 //! - [`error`] — verification error types and the final verdict
 //! - [`env`] — program loading and the full verification pipeline
+//! - [`fuzz`] — fuzz infrastructure (v0.7): instruction builders and value pools
 
 pub mod cfg;
 pub mod concrete;
@@ -23,6 +24,7 @@ pub mod diff;
 pub mod env;
 pub mod error;
 pub mod exec;
+pub mod fuzz;
 pub mod helper;
 pub mod insn;
 pub mod klog;

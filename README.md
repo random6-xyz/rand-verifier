@@ -6,15 +6,19 @@ The project reimplements the verifier's way of thinking step by step — instruc
 
 ## Current status
 
-The first three milestones are complete:
+The milestones completed so far:
 
 | Milestone | Theme | What it does |
 |-----------|-------|--------------|
 | **v0.1** | Structural verification | Instruction decoding, CFG construction, jump-target/subprogram boundary checks, unreachable-code detection, loop (back-edge) rejection |
 | **v0.2** | Abstract interpretation | Register/stack abstract state, scalar range tracking, pointer types, spill/fill, branch refinement, execution traces |
 | **v0.3** | Path-sensitive verification | Worklist exploration, branch refinement, state equivalence/subsumption (pruning), nullable pointers, helper calls, complexity limits |
+| **v0.4** | Meso verifier | Signed/unsigned scalar ranges, ALU32/ALU64 semantics, tnum integration, overflow/wraparound, pointer offset/alignment, bounded loops |
+| **v0.5** | Concrete execution engine | An interpreter that checks the abstract state always covers the concrete results (soundness), plus a coverage checker |
+| **v0.6** | Linux differential verifier | Native eBPF input, kernel-runner via the raw `bpf()` syscall, verdict matrix vs the kernel, whitelisted design differences |
+| **v0.7** | Verifier fuzzer | Deterministic program generation + seed-based mutation, oracle classification matrix, triage/dedup, campaign runner |
 
-The next phase — the **Meso verifier** (signed/unsigned ranges, ALU32/ALU64 semantics, tnum integration, overflow handling, bounded loops) — is planned as described in the [Roadmap](#roadmap) section below.
+The next milestone — the **failure reducer** (automatic testcase minimization) — is planned as described in the [Roadmap](#roadmap) section below.
 
 ## Verification pipeline
 
@@ -126,6 +130,69 @@ GitHub Actions: hosted runners have passwordless `sudo` and run directly in a VM
 `sudo -E cargo run --bin diff` works in CI (do not use a `container:` job — Docker's
 default seccomp profile blocks the `bpf()` syscall).
 
+### Fuzzer (Phase 4, v0.7)
+
+Automatically generate and mutate eBPF programs, verify them through rand-verifier
+(mini + concrete), consult the kernel when privileged, and classify every program
+into exactly one actionable bucket:
+
+```sh
+cargo run --bin fuzz -- --seed 42 --iters 1000                 # generation (mini + concrete)
+cargo run --bin fuzz -- --seed 5 --iters 1000 --mode mutation  # seed-based mutation (corpus + campaign pool)
+cargo run --bin fuzz -- --seed 7 --iters 100 --kernel          # + kernel (needs root / CAP_BPF)
+cargo run --bin fuzz -- --seed 7 --iters 100 --kernel --strict # unprivileged-equivalent kernel rules
+```
+
+Generation is framed (r0 init → body → EXIT) so every program passes the nano
+checks by construction; 30% of programs use verifier-stress idiom templates
+(overflow chains, ALU32 roundtrips, signed/unsigned dual refinement, bounded
+loops, ...). Mutation mode reuses the corpus fixtures and the campaign pool as
+seeds (field replacement, insertion, deletion, splice) and tracks verdict flips.
+
+The classification matrix (concrete is the truth axis):
+
+| mini | concrete | kernel | classification |
+|------|----------|--------|----------------|
+| any | SAFE | REJECT (non-whitelisted) | 🎯 **precision candidate** — v0.7 target |
+| any | UNSAFE | ACCEPT | 🚨 **soundness candidate** — v1.0 target |
+| REJECT | SAFE | ACCEPT | rand-verifier precision gap |
+| ACCEPT | UNSAFE | any | rand-verifier soundness bug — model bug, always surfaced |
+| else | | | agree → discard |
+
+Output layout (`--out-dir`, default `fuzz-out/`):
+
+- `findings/` — one directory per finding (`prog.bin` replayable via `kernel_run`,
+  decoded dump, mini/concrete reports, kernel log, `meta.json`); mutation-mode
+  verdict flips are saved as `verdict-flip-*`.
+- `groups/` — triage dedup: one representative per root cause, ordered by
+  priority (model bug > soundness > precision > rv gap).
+- `summary.json` — verdict counts, opcode coverage, mutation validity/flips,
+  findings and groups.
+
+Deterministic for a fixed seed on the rand-verifier side (kernel outcomes are
+host-dependent and recorded separately). Triage groups are the Phase 6 analysis
+entry points — they flow into the failure reducer (v0.8) and the kernel patch
+work (v1.0).
+
+Whitelist policy: on top of the v0.6 name-based diff whitelist, the first
+kernel-backed campaigns added one **category-based** entry — a mini reject with
+a `stack slot ... is uninitialized` reason plus kernel ACCEPT is the privileged
+`allow_uninit_stack` design difference (`bpf_ns_capable` treats CAP_SYS_ADMIN as
+a superset of every BPF cap, verified against kernel/bpf/token.c in v0.6) and
+is whitelisted by category so fuzzer-generated programs are covered too.
+Uninit *register* reads stay soundness candidates — the kernel rejects those,
+so an accept would be a real bug.
+
+First campaign numbers (v0.7, 2026-08):
+
+| campaign | verdicts | findings | notes |
+|----------|----------|----------|-------|
+| generation (seed 42, 2000 iters, unprivileged) | agree 1404, skipped 596 | 0 | kernel columns skipped; no model bugs surfaced |
+| mutation (seed 5, 2000 iters, unprivileged) | agree 1752, inconclusive 1, skipped 28 | 0 | validity rate 86.3% (1377/1596); 38 verdict flips (34 accept→reject, 4 reject→accept) |
+| mutation + kernel (seed 5, 200 iters, privileged) | agree 159, whitelisted 1, inconclusive 1, rv-precision-gap 1, soundness-candidate 1 | 2 → both analysed | the soundness candidate is the privileged uninit-stack design difference (mseed-5-19, now whitelisted by category); the rv gap is mini's arithmetic-time pointer checks vs the kernel's access-time checks (#45, mseed-5-99) — Phase 6 material |
+| generation + kernel (seed 42, 500 iters, privileged) | agree 500 | 0 | the kernel agrees with rand-verifier on every generated program |
+| mutation + kernel --strict (seed 5, 200 iters) | agree 157, whitelisted 4, inconclusive 1, skipped 1 | 0 | strict `!root` rules absorbed by the strict whitelist |
+
 ## Instruction subset
 
 The verifier accepts the kernel's `struct bpf_insn` encoding (8 bytes per
@@ -180,7 +247,10 @@ cargo test
 
 ## CI
 
-GitHub Actions runs `cargo check`, `cargo test`, `cargo fmt --check`, and `cargo clippy -D warnings` on every push/PR to `main`.
+GitHub Actions runs `cargo check`, `cargo test`, `cargo fmt --check`, and `cargo clippy -D warnings` on every push/PR to `main`, plus:
+
+- a **fuzzer smoke job** (unprivileged) — the fixed-seed regression suite (#72) and a short generation campaign;
+- a **kernel differential job** (privileged runner) — the corpus diff plus a short kernel-backed fuzz campaign (#73), both failing on non-whitelisted findings.
 
 ## Roadmap
 
