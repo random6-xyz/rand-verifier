@@ -41,6 +41,9 @@ pub enum ReduceError {
     /// finding (verifier drift, tampered meta.json, host-dependent
     /// kernel outcome).
     ReplayMismatch { expected: String, actual: String },
+    /// The mandatory final re-check failed: the reduced program no
+    /// longer exhibits the finding — a reducer bug, always surfaced.
+    FinalCheckFailed { expected: String, actual: String },
     /// The finding directory does not have the expected layout
     /// (missing prog.bin / meta.json, unparsable fields).
     InvalidFinding(String),
@@ -58,6 +61,10 @@ impl std::fmt::Display for ReduceError {
                     "replay mismatch: expected {expected}, re-derived {actual}"
                 )
             }
+            ReduceError::FinalCheckFailed { expected, actual } => write!(
+                f,
+                "final re-check failed (reducer bug): expected {expected}, got {actual}"
+            ),
             ReduceError::InvalidFinding(msg) => write!(f, "invalid finding: {msg}"),
             ReduceError::Pipeline(msg) => write!(f, "pipeline error: {msg}"),
         }

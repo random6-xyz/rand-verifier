@@ -9,12 +9,14 @@
 //! a CLI (#82).
 
 pub mod ddmin;
+pub mod driver;
 pub mod fixup;
 pub mod operand;
 pub mod passes;
 pub mod replay;
 
 pub use ddmin::{OracleCache, ddmin};
+pub use driver::{ReduceConfig, ReduceReport, reduce_finding};
 pub use fixup::delete_insns;
 pub use operand::operand_candidates;
 pub use passes::{dead_code, failure_anchor, simplify_dead_side, slice_to_anchor};
