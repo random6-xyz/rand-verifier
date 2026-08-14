@@ -84,7 +84,7 @@ impl BpfVerifierEnv {
     }
 
     /// Load a BPF program from a binary file and return the instruction count.
-    /// A sibling `<name>.maps` JSON sidecar ({"<fd>": {"type": "array",
+    /// A sibling `<name>.maps` JSON sidecar ({"<fd>": {"map_type": "array",
     /// "key_size": 4, "value_size": 8, "max_entries": 1}}) registers the
     /// maps referenced by ldimm64 pseudo instructions (#89).
     pub fn setup_prog(&mut self, name: String) -> Result<u32> {
