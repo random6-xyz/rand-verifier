@@ -2036,16 +2036,8 @@ mod tests {
         state.regs[0] = Some(ConcreteValue::MapPtr(map_region_base(1) + 8));
         let mut maps = map_env();
         let mut mem = MapMem::default();
-        let err = concrete_map_access(
-            0,
-            MapAccess::Load { dst: 4 },
-            0,
-            0,
-            &state,
-            &mut maps,
-            &mut mem,
-        )
-        .unwrap_err();
+        let err = concrete_map_access(0, MapAccess::Load { dst: 4 }, 0, 0, &state, &maps, &mut mem)
+            .unwrap_err();
         assert!(
             matches!(err, ConcreteFailure::MapValueOutOfBounds { .. }),
             "{err}"
