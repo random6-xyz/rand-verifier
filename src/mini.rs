@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::cfg::compute_loop_pcs;
 use crate::error::VerificationFailure;
 use crate::exec::{WorkItem, successors};
 use crate::insn::BpfInsn;
@@ -167,6 +168,12 @@ fn verify_mini_core(
     loop_heads: &[u32],
     limits: &VerifierLimits,
 ) -> Result<(usize, HashMap<u32, Vec<VerifierState>>), VerificationFailure> {
+    // the instructions lying on a cycle (#90): an exactly-equal state
+    // revisit at one of them is an infinite loop (kernel states.c —
+    // the kernel's read/precision marks keep loop-body states distinct,
+    // so its EXACT comparison fires where mini's dedup would otherwise
+    // prune the revisit before it reaches the loop head)
+    let loop_pcs: Vec<u32> = compute_loop_pcs(program, &[0], loop_heads);
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
@@ -201,7 +208,7 @@ fn verify_mini_core(
         // "infinite loop detected at insn %d", states_equal EXACT).
         // A bounded loop's head state changes every iteration, so it
         // never trips this rule.
-        if loop_heads.contains(&item.pc) && seen.contains(&item.state) {
+        if loop_pcs.contains(&item.pc) && seen.contains(&item.state) {
             return Err(VerificationFailure::new(
                 item.pc,
                 format!("infinite loop detected at insn {}", item.pc),

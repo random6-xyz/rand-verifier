@@ -355,10 +355,10 @@ fn alu_imm(
         }
         // PtrToStack + imm => PtrToStack at the shifted offset; only
         // ADD is allowed on stack pointers — like the kernel's
-        // check_alu_op. The offset interval is widened unconditionally:
-        // frame bounds and alignment are validated at access time
-        // (#87, kernel adjust_ptr_min_max_vals — no arithmetic-time
-        // bounds check for privileged loads).
+        // check_alu_op. The offset interval is widened: frame bounds
+        // and alignment are validated at access time (#87), while the
+        // kernel's arithmetic-time sanity bound (BPF_MAX_VAR_OFF,
+        // check_reg_sane_offset_*) still applies (#90).
         RegState::PtrToStack {
             min_offset,
             max_offset,
@@ -373,6 +373,8 @@ fn alu_imm(
                     ),
                 ));
             }
+            check_sane_addend(pc, "stack", ScalarBounds::constant(imm as i64))?;
+            check_sane_result_offset(pc, "stack", min_offset as i64 + imm as i64)?;
             // saturating add keeps the interval inside i32; anything
             // beyond is far out of the 512-byte frame and rejected by
             // any later access
@@ -421,6 +423,8 @@ fn alu_imm(
                     ),
                 ));
             }
+            check_sane_addend(pc, "map_value", ScalarBounds::constant(imm as i64))?;
+            check_sane_result_offset(pc, "map_value", min_offset as i64 + imm as i64)?;
             let mut next = *state;
             next.regs[dst as usize] = RegState::PtrToMapValue {
                 min_offset: min_offset.saturating_add(imm),
