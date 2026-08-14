@@ -14,6 +14,25 @@ use crate::error::{Verdict, VerificationFailure};
 use crate::insn::{BpfInsn, decode_program};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
 
+/// Parse a `<name>.maps` JSON sidecar into a map registry (fd → info).
+pub fn parse_maps_sidecar(name: &str) -> HashMap<u32, MapInfo> {
+    let sidecar = format!("{}.maps", name);
+    let Ok(text) = fs::read_to_string(&sidecar) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<HashMap<String, MapInfo>>(&text) else {
+        eprintln!("warning: ignoring unparseable maps sidecar {}", sidecar);
+        return HashMap::new();
+    };
+    let mut maps = HashMap::new();
+    for (fd, info) in entries {
+        if let Ok(fd) = fd.parse::<u32>() {
+            maps.insert(fd, info);
+        }
+    }
+    maps
+}
+
 /// Map metadata carried by `PtrToMap` and needed for key/value argument
 /// validation and map-value access bounds (#89). Mirrors the kernel's
 /// `struct bpf_map` attributes relevant to verification.
@@ -102,18 +121,8 @@ impl BpfVerifierEnv {
 
     /// Load map metadata from a `<name>.maps` JSON sidecar, if present.
     pub fn load_maps_sidecar(&mut self, name: &str) {
-        let sidecar = format!("{}.maps", name);
-        let Ok(text) = fs::read_to_string(&sidecar) else {
-            return;
-        };
-        let Ok(entries) = serde_json::from_str::<HashMap<String, MapInfo>>(&text) else {
-            eprintln!("warning: ignoring unparseable maps sidecar {}", sidecar);
-            return;
-        };
-        for (fd, info) in entries {
-            if let Ok(fd) = fd.parse::<u32>() {
-                self.register_map(fd, info);
-            }
+        for (fd, info) in parse_maps_sidecar(name) {
+            self.register_map(fd, info);
         }
     }
 
