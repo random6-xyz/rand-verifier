@@ -525,7 +525,7 @@ fn save_finding(dir: &Path, env: &BpfVerifierEnv, result: &ProgramResult) -> any
     fs::write(dir.join("prog.bin"), result.bytes)?;
 
     let mut dump = String::new();
-    match rand_verifier::insn::decode_program(&result.bytes) {
+    match rand_verifier::insn::decode_program(result.bytes) {
         Ok(decoded) => {
             for (idx, insn) in decoded.iter().enumerate() {
                 dump.push_str(&format!("{idx:4}: {insn:?}\n"));
