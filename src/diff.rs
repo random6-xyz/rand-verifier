@@ -148,33 +148,27 @@ pub fn classify(mini: &SideVerdict, kernel: &SideVerdict) -> DiffClass {
 /// Known semantic differences (docs/DIFFERENTIAL_PLAN.md §6) that do
 /// not count as findings. `name` is the corpus program name (file
 /// stem). Returns the reason when the pair is expected.
+///
+/// The computed-offset / pointer-arith entries were removed in v0.8.1
+/// (#90): #87 moved bounds/alignment validation to access time like the
+/// kernel, so those fixtures moved to the accept corpus and the pairs
+/// no longer occur.
 pub fn whitelisted(name: &str, mini: &SideVerdict, kernel: &SideVerdict) -> Option<&'static str> {
     match (mini, kernel) {
         (SideVerdict::Reject { .. }, SideVerdict::Accept) => match name {
-            // mini's state budget is 1024 vs the kernel's much larger
-            // limits — an intentional design limit, not a bug
+            // mini's state budget is 1024 vs the kernel's limits
+            // (BPF_COMPLEXITY_LIMIT_JMP_SEQ 8192, STATES 64, INSNS —
+            // kernel/bpf/verifier.c) — an intentional design limit,
+            // not a bug
             "complexity_limit" => {
                 Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
             }
-            // the kernel validates pointer alignment/bounds at access
-            // time only; these computed pointers are never dereferenced
-            "computed_offset_misaligned" => Some(
-                "mini requires provable 8-byte alignment at pointer arithmetic (#45); the kernel validates at access time — r6 is never dereferenced",
-            ),
-            "computed_offset_out_of_frame" => Some(
-                "mini requires in-frame offsets at pointer arithmetic (#45); the kernel validates at access time — r6 is never dereferenced",
-            ),
-            // the kernel explicitly allows scalar += pointer (dst
-            // inherits the pointer state); mini only implements
-            // immediate offsets (#20)
-            "pointer_reg_arith" => Some(
-                "mini does not implement register-offset pointer arithmetic (#20); the kernel allows scalar += pointer by design",
-            ),
             // privileged load: allow_uninit_stack is
             // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
             // CAP_SYS_ADMIN as a superset of every BPF capability
-            // (kernel/bpf/token.c) — uninit stack reads are allowed for
-            // privileged loaders by design
+            // (kernel/bpf/token.c: ns_capable(ns, cap) || (cap !=
+            // CAP_SYS_ADMIN && ns_capable(ns, CAP_SYS_ADMIN))) — uninit
+            // stack reads are allowed for privileged loaders by design
             "stack_write_before_read" => Some(
                 "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
             ),
@@ -341,13 +335,15 @@ mod tests {
         let acc = SideVerdict::Accept;
         // the documented mini-limit difference is whitelisted
         assert!(whitelisted("complexity_limit", &rej, &acc).is_some());
-        // documented mini-precision gaps (empirical, v0.6 first run)
-        assert!(whitelisted("computed_offset_misaligned", &rej, &acc).is_some());
-        assert!(whitelisted("computed_offset_out_of_frame", &rej, &acc).is_some());
-        assert!(whitelisted("pointer_reg_arith", &rej, &acc).is_some());
         // privileged loads allow uninit stack reads by design
-        // (allow_uninit_stack, CAP_SYS_ADMIN superset)
+        // (allow_uninit_stack, CAP_SYS_ADMIN superset — token.c)
         assert!(whitelisted("stack_write_before_read", &rej, &acc).is_some());
+        // the computed-offset / pointer-arith entries were removed in
+        // v0.8.1 (#90): the fixtures moved to the accept corpus after
+        // #87 moved validation to access time
+        assert!(whitelisted("computed_offset_misaligned", &rej, &acc).is_none());
+        assert!(whitelisted("computed_offset_out_of_frame", &rej, &acc).is_none());
+        assert!(whitelisted("pointer_reg_arith", &rej, &acc).is_none());
         // the same pair under another name is a finding
         assert!(whitelisted("bounded_loop", &rej, &acc).is_none());
         // and the whitelist never applies to other pairs
