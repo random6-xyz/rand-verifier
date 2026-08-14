@@ -144,6 +144,7 @@ impl Invariant {
                     mini_reason: sides.mini_reason.as_deref(),
                     concrete: sides.concrete,
                     kernel: &sides.kernel,
+                    kernel_reason: None,
                     strict,
                 });
                 if candidate != *finding {
@@ -313,6 +314,7 @@ pub fn replay_check(spec: &FindingSpec, sides: &Sides, strict: bool) -> Result<(
             mini_reason: sides.mini_reason.as_deref(),
             concrete: sides.concrete,
             kernel: &sides.kernel,
+            kernel_reason: None,
             strict,
         });
         if actual != finding {

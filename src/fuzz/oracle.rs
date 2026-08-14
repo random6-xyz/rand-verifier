@@ -101,6 +101,13 @@ pub struct OracleInput<'a> {
     /// The kernel side (`diff::kernel_side`), `Skipped` when the kernel
     /// was not consulted (unprivileged runs).
     pub kernel: &'a SideVerdict,
+    /// The kernel rejection message, when the kernel rejected — the
+    /// strict-mode whitelist keys off the literal "for !root" suffix
+    /// the kernel prints for unprivileged-only design rules (e.g.
+    /// "R6 variable stack access prohibited for !root" is StackBounds
+    /// category, but a `!root` rule like "R10 pointer comparison
+    /// prohibited"; m5 empirical).
+    pub kernel_reason: Option<&'a str>,
     /// Strict mode: the kernel ran with unprivileged-equivalent rules
     /// (v0.6 `--strict`), so `!root` rejections (R10 pointer comparison
     /// prohibited, insn limits) are design behaviour, not findings.
@@ -117,6 +124,7 @@ pub fn classify(input: &OracleInput) -> Finding {
         mini_reason,
         concrete,
         kernel,
+        kernel_reason,
         strict,
     } = input;
     match concrete {
@@ -159,12 +167,16 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // strict mode: unprivileged-equivalent kernel rules are
                 // design behaviour (v0.6 --strict empirical run:
                 // "R10 pointer comparison prohibited" → PointerArith,
-                // insn limits → Complexity)
+                // insn limits → Complexity; v0.7 m5: "R6 variable
+                // stack access prohibited for !root" → StackBounds).
+                // The kernel marks every unprivileged-only rule with
+                // the literal "for !root" in its message, so any such
+                // rejection is design behaviour regardless of category.
                 if *strict
-                    && matches!(
+                    && (matches!(
                         category,
                         ReasonCategory::PointerArith | ReasonCategory::Complexity
-                    )
+                    ) || kernel_reason.is_some_and(|m| m.contains("for !root")))
                 {
                     return Finding::Whitelisted;
                 }
@@ -204,6 +216,7 @@ pub fn classify_env(
     mini: &SideVerdict,
     mini_reason: Option<&str>,
     kernel: &SideVerdict,
+    kernel_reason: Option<&str>,
     strict: bool,
 ) -> Finding {
     let concrete = env
@@ -217,6 +230,7 @@ pub fn classify_env(
         mini_reason,
         concrete,
         kernel,
+        kernel_reason,
         strict,
     })
 }
@@ -261,8 +275,75 @@ mod tests {
             mini_reason: None,
             concrete,
             kernel: &kernel,
+            kernel_reason: None,
             strict,
         })
+    }
+
+    /// `classify_with` plus a kernel rejection message — for the
+    /// strict-mode `!root` message whitelist tests.
+    fn classify_with_kernel_reason(
+        mini: SideVerdict,
+        concrete: ConcreteSide,
+        kernel: SideVerdict,
+        kernel_reason: Option<&str>,
+        strict: bool,
+    ) -> Finding {
+        classify(&OracleInput {
+            name: "p",
+            mini: &mini,
+            mini_reason: None,
+            concrete,
+            kernel: &kernel,
+            kernel_reason,
+            strict,
+        })
+    }
+
+    /// Strict mode: kernel rejections carrying the literal "for !root"
+    /// are unprivileged-only design rules (v0.7 m5 empirical: "R6
+    /// variable stack access prohibited for !root" is StackBounds
+    /// category, not PointerArith) — whitelisted by message. Genuine
+    /// StackBounds rejections stay precision candidates.
+    #[test]
+    fn strict_whitelist_for_root_message() {
+        let s = ReasonCategory::StackBounds;
+        // "R6 variable stack access prohibited for !root, var_off=..."
+        // — the mseed-99399-20/-97 shape → design behaviour
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(s),
+                Some("R6 variable stack access prohibited for !root, var_off=0xffff... off=0"),
+                true,
+            ),
+            Finding::Whitelisted
+        );
+        // a genuine stack-bounds rejection (not a !root rule) stays a
+        // precision candidate even in strict mode
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(s),
+                Some("invalid stack off=-520 size=8"),
+                true,
+            ),
+            Finding::PrecisionCandidate
+        );
+        // outside strict mode the message rule does not apply — the
+        // rejection stays a precision candidate
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(s),
+                Some("R6 variable stack access prohibited for !root, var_off=0xffff... off=0"),
+                false,
+            ),
+            Finding::PrecisionCandidate
+        );
     }
 
     /// Every row of the classification matrix plus the precedence
@@ -445,6 +526,7 @@ mod tests {
                     mini_reason: None,
                     concrete,
                     kernel: &kernel,
+                    kernel_reason: None,
                     strict: false,
                 });
                 match dir {
@@ -532,7 +614,7 @@ mod tests {
         let insns = [insn_bytes(0xb7, 0, 0, 0, 42), insn_bytes(0x95, 0, 0, 0, 0)];
         let (verdict, env) = verify_bytes(&insns);
         assert!(matches!(verdict, Verdict::Safe));
-        let finding = classify_env(&env, "seed-0-0", &acc(), None, &skip(), false);
+        let finding = classify_env(&env, "seed-0-0", &acc(), None, &skip(), None, false);
         assert_eq!(finding, Finding::Skipped);
 
         // reject-that-executes + kernel reject with a different reason
@@ -547,7 +629,7 @@ mod tests {
         assert!(matches!(verdict, Verdict::Unsafe(_)));
         let mini = rej(ReasonCategory::Unreachable);
         let kernel = rej(ReasonCategory::UninitRead);
-        let finding = classify_env(&env, "seed-0-1", &mini, None, &kernel, false);
+        let finding = classify_env(&env, "seed-0-1", &mini, None, &kernel, None, false);
         assert_eq!(finding, Finding::PrecisionCandidate);
 
         // decode-error program: no concrete report → inconclusive
@@ -565,6 +647,7 @@ mod tests {
             &rej(ReasonCategory::Other),
             None,
             &rej(ReasonCategory::Other),
+            None,
             false,
         );
         assert_eq!(finding, Finding::Inconclusive);
@@ -590,13 +673,13 @@ mod tests {
         // stack-slot uninit + kernel accept = privileged design
         // behaviour (allow_uninit_stack)
         let reason = "stack slot at offset -8 is uninitialized (write before read)";
-        let finding = classify_env(&env, "mseed-5-19", &mini, Some(reason), &acc(), false);
+        let finding = classify_env(&env, "mseed-5-19", &mini, Some(reason), &acc(), None, false);
         assert_eq!(finding, Finding::Whitelisted);
 
         // register uninit + kernel accept stays a soundness candidate
         // (the kernel rejects those — an accept would be a real bug)
         let reason = "register r2 is uninitialized";
-        let finding = classify_env(&env, "mseed-x", &mini, Some(reason), &acc(), false);
+        let finding = classify_env(&env, "mseed-x", &mini, Some(reason), &acc(), None, false);
         assert_eq!(finding, Finding::SoundnessCandidate);
     }
 }

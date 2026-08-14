@@ -88,6 +88,7 @@ fn campaign_invariants() {
                 &case.mini,
                 case.mini_reason.as_deref(),
                 &kernel_skipped,
+                None,
                 false,
             );
             assert_eq!(f, Finding::RvSoundnessBug, "seed {seed}: model bug hidden");
@@ -123,7 +124,7 @@ fn campaign_invariants() {
             let concrete = concrete_side(report);
             if concrete == ConcreteSide::Safe {
                 let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-                let f = classify_env(&env, &name, &mini, None, &kernel_accept, false);
+                let f = classify_env(&env, &name, &mini, None, &kernel_accept, None, false);
                 assert!(
                     f == Finding::RvPrecisionGap || f == Finding::Whitelisted,
                     "{name}: {f:?}"
@@ -200,6 +201,7 @@ fn campaign_finding_replay() {
             &case.mini,
             case.mini_reason.as_deref(),
             &kernel_accept,
+            None,
             false,
         );
         if !f.is_finding() {
@@ -229,7 +231,7 @@ fn campaign_finding_replay() {
                 category: categorize_mini_reason(f),
             },
         };
-        let f2 = classify_env(&env, &name, &mini, None, &kernel_accept, false);
+        let f2 = classify_env(&env, &name, &mini, None, &kernel_accept, None, false);
         assert_eq!(f, f2, "seed {seed}: classification changed on replay");
         replayed += 1;
     }

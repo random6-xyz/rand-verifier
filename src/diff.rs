@@ -54,6 +54,11 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // "stack access at r6+0 with base offsets ...",
         // "stack pointer ... may leave/are out of the frame"
         ReasonCategory::StackBounds
+    } else if msg.contains("not a scalar") {
+        // "r0 is not a scalar value at exit" — the kernel's
+        // check_return_code rejects a non-scalar R0 at exit
+        // ("R0 leaks addr as return value" / "R0 is not a known value")
+        ReasonCategory::ExitR0
     } else if msg.contains("helper") || msg.contains("expected") {
         ReasonCategory::HelperArgs
     } else if msg.contains("back-edge") || msg.contains("complexity limit") {
@@ -351,6 +356,7 @@ mod tests {
                 ReasonCategory::Complexity,
             ),
             ("r0 is uninitialized at exit", ReasonCategory::UninitRead),
+            ("r0 is not a scalar value at exit", ReasonCategory::ExitR0),
             (
                 "verification complexity limit exceeded (max_states 1024)",
                 ReasonCategory::Complexity,
@@ -390,6 +396,15 @@ mod tests {
         assert_eq!(classify(&skip, &acc), DiffClass::Skipped);
         assert_eq!(classify(&acc, &skip), DiffClass::Skipped);
         assert_eq!(classify(&skip, &skip), DiffClass::Skipped);
+    }
+
+    #[test]
+    fn categorize_mini_exit_r0_pointer() {
+        // the mini rejects a pointer in R0 at exit (mseed-99399-57) —
+        // same ExitR0 category as the kernel's "R0 leaks addr as
+        // return value" / "R0 is not a known value"
+        let failure = VerificationFailure::new(3, "r0 is not a scalar value at exit");
+        assert_eq!(categorize_mini_reason(&failure), ReasonCategory::ExitR0);
     }
 
     #[test]
