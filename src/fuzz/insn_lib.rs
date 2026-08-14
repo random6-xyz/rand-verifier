@@ -63,6 +63,21 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         // verifier requires a stack pointer at exec time)
         BpfInsn::LdMem { dst, base, offset } => (opcode::LD_STACK, *dst, *base, *offset, 0),
         BpfInsn::StMem { src, base, offset } => (opcode::ST_STACK, *base, *src, *offset, 0),
+        // ldimm64 (#89): each entry encodes one 8-byte slot — the
+        // instruction pair [LdImm64/LdMap*, LdImm64Second] roundtrips
+        // to the kernel's two-slot encoding
+        BpfInsn::LdImm64 { dst, imm } => (opcode::LD_IMM64, *dst, 0, 0, *imm as u32 as i32),
+        BpfInsn::LdMapFd { dst, fd, .. } => {
+            (opcode::LD_IMM64, *dst, opcode::PSEUDO_MAP_FD, 0, *fd as i32)
+        }
+        BpfInsn::LdMapValue { dst, fd, .. } => (
+            opcode::LD_IMM64,
+            *dst,
+            opcode::PSEUDO_MAP_VALUE,
+            0,
+            *fd as i32,
+        ),
+        BpfInsn::LdImm64Second { imm_hi } => (0x00, 0, 0, 0, *imm_hi as i32),
         // compares — register and immediate forms
         BpfInsn::Jeq { dst, src, offset } => (opcode::JEQ, *dst, *src, *offset, 0),
         BpfInsn::Jne { dst, src, offset } => (opcode::JNE, *dst, *src, *offset, 0),
@@ -338,6 +353,10 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::Jsle { .. }
         | BpfInsn::JsleImm { .. } => "cmp_signed",
         BpfInsn::LdMem { .. } | BpfInsn::StMem { .. } => "stack",
+        BpfInsn::LdImm64 { .. }
+        | BpfInsn::LdMapFd { .. }
+        | BpfInsn::LdMapValue { .. }
+        | BpfInsn::LdImm64Second { .. } => "ldimm64",
         BpfInsn::Call { .. } => "helper",
         BpfInsn::Jmp { .. } => "jmp",
         BpfInsn::Exit => "exit",

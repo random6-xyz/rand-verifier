@@ -63,6 +63,7 @@ pub(crate) fn visit_insn(
                     ),
                 ));
             }
+            check_ldimm64_target(idx, target, insns)?;
             vec![target]
         }
         // conditional branches — branch target + fall-through
@@ -97,6 +98,7 @@ pub(crate) fn visit_insn(
                     ),
                 ));
             }
+            check_ldimm64_target(idx, target, insns)?;
             vec![target, idx + 1]
         }
         // helper calls (imm = helper id, kernel convention) fall
@@ -115,6 +117,28 @@ pub(crate) fn visit_insn(
     }
 
     Ok(nexts)
+}
+
+/// Reject branch targets that land on the second slot of an ldimm64
+/// (kernel: "jump into the middle of ldimm64 insn", #89).
+fn check_ldimm64_target(
+    idx: u32,
+    target: u32,
+    insns: &[BpfInsn],
+) -> Result<(), VerificationFailure> {
+    if matches!(
+        insns.get(target as usize),
+        Some(BpfInsn::LdImm64Second { .. })
+    ) {
+        return Err(VerificationFailure::new(
+            idx,
+            format!(
+                "jump target {} lands in the middle of an ldimm64 instruction",
+                target
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Check the control flow graph with an iterative DFS:
@@ -356,6 +380,34 @@ mod tests {
             BpfInsn::Exit,
         ];
         assert!(check_cfg(&insns, &[0]).is_ok());
+    }
+
+    #[test]
+    fn check_cfg_ldimm64_pairs_are_transparent() {
+        // an ldimm64 pair (instruction + second-slot marker) falls
+        // through normally; a branch may target the instruction but
+        // never the marker (#89)
+        let insns = vec![
+            BpfInsn::LdImm64 { dst: 0, imm: 7 },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        assert!(check_cfg(&insns, &[0]).is_ok());
+        // a branch into the marker is rejected
+        let insns = vec![
+            BpfInsn::Jmp { offset: 1 }, // target = 2 (the marker)
+            BpfInsn::LdImm64 { dst: 0, imm: 7 },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let err = check_cfg(&insns, &[0]).unwrap_err();
+        assert!(
+            err.message.contains("middle of an ldimm64"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

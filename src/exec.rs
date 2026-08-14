@@ -93,6 +93,51 @@ pub(crate) fn step(
         // ALU64: rX += imm (pointer + immediate stays the only pointer
         // arithmetic, #20)
         BpfInsn::AddImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Add, AluWidth::W64),
+        // ldimm64 (#89): a plain 64-bit constant. The map-fd forms and
+        // the second-slot marker are handled below.
+        BpfInsn::LdImm64 { dst, imm } => {
+            check_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::constant(*imm as i64));
+            Ok(next)
+        }
+        // BPF_PSEUDO_MAP_FD → CONST_PTR_TO_MAP with the map metadata
+        // resolved at load time (#89).
+        BpfInsn::LdMapFd {
+            dst,
+            key_size,
+            value_size,
+            ..
+        } => {
+            check_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::PtrToMap {
+                key_size: *key_size,
+                value_size: *value_size,
+            };
+            Ok(next)
+        }
+        // BPF_PSEUDO_MAP_VALUE → a pointer into the map value at the
+        // fixed offset (kernel check_ld_imm64) (#89).
+        BpfInsn::LdMapValue {
+            dst,
+            offset,
+            value_size,
+            ..
+        } => {
+            check_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::PtrToMapValue {
+                min_offset: *offset as i32,
+                max_offset: *offset as i32,
+                align_off: (*offset % 8) as u8,
+                value_size: *value_size,
+            };
+            Ok(next)
+        }
+        // the second slot of an ldimm64 is transparent — it never
+        // carries state (jumps into it are rejected by the CFG checks)
+        BpfInsn::LdImm64Second { .. } => Ok(*state),
         BpfInsn::AddReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Add, AluWidth::W64),
         BpfInsn::SubImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Sub, AluWidth::W64),
         BpfInsn::SubReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Sub, AluWidth::W64),
@@ -229,6 +274,14 @@ pub(crate) fn step(
                 next.regs[reg] = RegState::Uninit;
             }
             next.regs[0] = helper.return_type;
+            // map_lookup's return depends on the map's value size: fill
+            // it from R1's PtrToMap metadata before the clobber (kernel
+            // check_helper_call builds the return from the map, #89)
+            if *imm == 1
+                && let RegState::PtrToMap { value_size, .. } = state.regs[1]
+            {
+                next.regs[0] = RegState::PtrToMapValueOrNull { value_size };
+            }
             Ok(next)
         }
     }
@@ -307,18 +360,18 @@ fn alu_imm(
             pc,
             format!("arithmetic on context pointer r{} is not allowed", dst),
         )),
-        RegState::PtrToMap => Err(VerificationFailure::new(
+        RegState::PtrToMap { .. } => Err(VerificationFailure::new(
             pc,
             format!("arithmetic on map pointer r{} is not allowed", dst),
         )),
-        RegState::PtrToMapValue => Err(VerificationFailure::new(
+        RegState::PtrToMapValue { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "arithmetic on map value pointer r{} is not supported yet",
                 dst
             ),
         )),
-        RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+        RegState::PtrToMapValueOrNull { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "arithmetic on nullable pointer r{} is not allowed (check for NULL first)",
@@ -1569,13 +1622,14 @@ fn cond_branch_impl(
         // NULL check: a nullable pointer compared to the constant 0. For
         // `== 0` the taken branch becomes the scalar 0 and the fall-through
         // a valid map value pointer; for `!= 0` the roles are swapped.
-        (RegState::PtrToMapValueOrNull, RegState::Scalar(s))
-        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull)
+        // The map's value size is propagated into the refined pointer (#89).
+        (RegState::PtrToMapValueOrNull { value_size }, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull { value_size })
             if s.is_zero() =>
         {
             match op {
                 CondOp::Eq | CondOp::Ne => {
-                    let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull) {
+                    let ptr_reg = if matches!(dst_state, RegState::PtrToMapValueOrNull { .. }) {
                         dst
                     } else {
                         // only the reg-reg form can have the pointer in
@@ -1593,7 +1647,12 @@ fn cond_branch_impl(
                     let mut null_state = *state;
                     null_state.regs[ptr_reg as usize] = RegState::Scalar(ScalarBounds::constant(0));
                     let mut valid = *state;
-                    valid.regs[ptr_reg as usize] = RegState::PtrToMapValue;
+                    valid.regs[ptr_reg as usize] = RegState::PtrToMapValue {
+                        min_offset: 0,
+                        max_offset: 0,
+                        align_off: 0,
+                        value_size,
+                    };
                     vec![(null_side, null_state), (valid_side, valid)]
                 }
                 _ => {
@@ -1610,8 +1669,8 @@ fn cond_branch_impl(
         // a non-null map value pointer compared to 0: equality and
         // inequality are kept without refinement (simplified — the kernel
         // marks the taken branch of == 0 infeasible)
-        (RegState::PtrToMapValue, RegState::Scalar(s))
-        | (RegState::Scalar(s), RegState::PtrToMapValue)
+        (RegState::PtrToMapValue { .. }, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValue { .. })
             if s.is_zero() =>
         {
             match op {
@@ -1631,22 +1690,24 @@ fn cond_branch_impl(
         // without refinement; ordered comparisons on pointers are not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
         | (RegState::PtrToCtx, RegState::PtrToCtx)
-        | (RegState::PtrToMap, RegState::PtrToMap)
-        | (RegState::PtrToMapValue, RegState::PtrToMapValue)
-        | (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => match op {
-            CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
-            _ => {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "comparing pointers r{} {} {} is not allowed",
-                        dst,
-                        op.symbol(),
-                        src_name
-                    ),
-                ));
+        | (RegState::PtrToMap { .. }, RegState::PtrToMap { .. })
+        | (RegState::PtrToMapValue { .. }, RegState::PtrToMapValue { .. })
+        | (RegState::PtrToMapValueOrNull { .. }, RegState::PtrToMapValueOrNull { .. }) => {
+            match op {
+                CondOp::Eq | CondOp::Ne => vec![(taken_pc, *state), (fall_pc, *state)],
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "comparing pointers r{} {} {} is not allowed",
+                            dst,
+                            op.symbol(),
+                            src_name
+                        ),
+                    ));
+                }
             }
-        },
+        }
         // read_reg rejects uninitialized registers before we get here
         (RegState::Uninit, _) | (_, RegState::Uninit) => {
             unreachable!("read_reg rejects uninitialized registers")
@@ -2773,7 +2834,7 @@ mod tests {
         // r0 != 0 on a nullable pointer: taken is the valid pointer,
         // fall-through is NULL (scalar 0)
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
@@ -2793,7 +2854,15 @@ mod tests {
         // taken (r0 != 0): a valid map value pointer
         let (valid_pc, valid) = &nexts[1];
         assert_eq!(*valid_pc, 2);
-        assert_eq!(valid.regs[0], RegState::PtrToMapValue);
+        assert_eq!(
+            valid.regs[0],
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+        );
     }
 
     #[test]
@@ -4186,7 +4255,7 @@ mod tests {
         // branch becomes the scalar 0, the fall-through a valid map
         // value pointer
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         let nexts = successors(
             0,
             &BpfInsn::JeqImm {
@@ -4203,7 +4272,15 @@ mod tests {
         assert_eq!(taken.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
-        assert_eq!(fall.regs[0], RegState::PtrToMapValue);
+        assert_eq!(
+            fall.regs[0],
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+        );
     }
 
     #[test]
@@ -4248,7 +4325,7 @@ mod tests {
     fn successors_null_check_issue_example() {
         // issue example: r0 = PtrToMapValueOrNull; if r0 == 0 (via r1 = 0)
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
 
         let nexts = successors(
@@ -4270,14 +4347,22 @@ mod tests {
         // fall (r0 != 0): refined to a valid map value pointer
         let (fall_pc, fall) = &nexts[1];
         assert_eq!(*fall_pc, 1);
-        assert_eq!(fall.regs[0], RegState::PtrToMapValue);
+        assert_eq!(
+            fall.regs[0],
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+        );
     }
 
     #[test]
     fn successors_null_check_reversed_operands() {
         // the constant 0 may also be the dst register: if r1 == r0 with r1 = 0
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
@@ -4294,7 +4379,15 @@ mod tests {
             nexts[0].1.regs[0],
             RegState::Scalar(ScalarBounds::constant(0))
         );
-        assert_eq!(nexts[1].1.regs[0], RegState::PtrToMapValue);
+        assert_eq!(
+            nexts[1].1.regs[0],
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+        );
     }
 
     #[test]
@@ -4302,7 +4395,7 @@ mod tests {
         // only the constant 0 enables a NULL check; other scalars keep the
         // different-types rejection
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(8));
         let err = successors(
             0,
@@ -4321,7 +4414,12 @@ mod tests {
     fn successors_map_value_vs_zero_both_branches() {
         // a non-null map value pointer compared to 0 keeps both branches
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValue;
+        state.regs[0] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+        };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
@@ -4342,7 +4440,12 @@ mod tests {
     fn successors_same_type_map_pointers() {
         // equality is allowed without refinement, > is not
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValue;
+        state.regs[0] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+        };
         let nexts = successors(
             0,
             &BpfInsn::Jeq {
@@ -4373,7 +4476,7 @@ mod tests {
     fn step_add_imm_nullable_ptr_rejected() {
         // arithmetic on a nullable pointer is rejected until the NULL check
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         let err = step(0, &state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
         assert!(err.message.contains("NULL"));
     }
@@ -4381,7 +4484,12 @@ mod tests {
     #[test]
     fn step_add_imm_map_value_ptr_rejected() {
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValue;
+        state.regs[0] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+        };
         let err = step(0, &state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
         assert!(err.message.contains("map value pointer"));
     }
@@ -4394,10 +4502,16 @@ mod tests {
         // nullable map value pointer (#27's producer) and the argument
         // registers are clobbered (#29)
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::PtrToMap;
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         state.regs[2] = ptr_stack(-8);
         let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
-        assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
+        assert_eq!(
+            next.regs[0],
+            RegState::PtrToMapValueOrNull { value_size: 8 }
+        );
         assert_eq!(next.regs[1], RegState::Uninit);
         assert_eq!(next.regs[2], RegState::Uninit);
     }
@@ -4415,7 +4529,10 @@ mod tests {
         // map_update(map, key, value, flags): all four args validated,
         // returns 0 on success
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::PtrToMap;
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         state.regs[2] = ptr_stack(-8);
         state.regs[3] = ptr_stack(-16);
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
@@ -4427,7 +4544,10 @@ mod tests {
     fn step_call_map_update_missing_value() {
         // R3 (the value pointer) is uninitialized → #14 error
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::PtrToMap;
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         state.regs[2] = ptr_stack(-8);
         let err = step(0, &state, &BpfInsn::Call { imm: 2 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
@@ -4453,7 +4573,10 @@ mod tests {
     fn step_call_uninit_arg() {
         // R2 (the key pointer) is uninitialized → #14 error
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::PtrToMap;
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
@@ -4462,7 +4585,10 @@ mod tests {
     fn step_call_clobbers_r1_to_r5_preserves_r6_to_r9() {
         // the eBPF calling convention: R1..R5 are scratch, R6..R9 callee-saved
         let mut state = VerifierState::initial();
-        state.regs[1] = RegState::PtrToMap;
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         state.regs[2] = ptr_stack(-8);
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(1));
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(2));
@@ -4474,7 +4600,10 @@ mod tests {
 
         let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         // R0 = return type, R1..R5 invalidated
-        assert_eq!(next.regs[0], RegState::PtrToMapValueOrNull);
+        assert_eq!(
+            next.regs[0],
+            RegState::PtrToMapValueOrNull { value_size: 8 }
+        );
         for reg in 1..=5 {
             assert_eq!(next.regs[reg], RegState::Uninit, "r{}", reg);
         }

@@ -219,12 +219,27 @@ pub(crate) enum RegState {
         align_off: u8,
     },
     PtrToCtx,
-    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP). Never
-    /// constructed yet — program loading that injects it lands in Meso.
-    #[allow(dead_code)] // constructed only by program loading (Meso)
-    PtrToMap,
-    PtrToMapValue,
-    PtrToMapValueOrNull,
+    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP) carrying the
+    /// map metadata resolved at load time (#89).
+    PtrToMap {
+        key_size: u32,
+        value_size: u32,
+    },
+    /// A pointer into a map value (non-null) — an offset interval
+    /// within the value; bounds are validated at access time against
+    /// `value_size` (#89, kernel check_map_access).
+    PtrToMapValue {
+        min_offset: i32,
+        max_offset: i32,
+        /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
+        align_off: u8,
+        value_size: u32,
+    },
+    /// Nullable map value pointer; must pass a NULL check before use
+    /// (#27). Carries the map's value size for the refinement (#89).
+    PtrToMapValueOrNull {
+        value_size: u32,
+    },
 }
 
 impl std::fmt::Display for RegState {
@@ -248,9 +263,29 @@ impl std::fmt::Display for RegState {
                 }
             }
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
-            RegState::PtrToMap => write!(f, "PTR_MAP"),
-            RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
-            RegState::PtrToMapValueOrNull => write!(f, "PTR_MAP_VALUE_OR_NULL"),
+            RegState::PtrToMap {
+                key_size,
+                value_size,
+            } => write!(f, "PTR_MAP(k:{},v:{})", key_size, value_size),
+            RegState::PtrToMapValue {
+                min_offset,
+                max_offset,
+                value_size,
+                ..
+            } => {
+                if min_offset == max_offset {
+                    write!(f, "PTR_MAP_VALUE({},sz:{})", min_offset, value_size)
+                } else {
+                    write!(
+                        f,
+                        "PTR_MAP_VALUE({}..{},sz:{})",
+                        min_offset, max_offset, value_size
+                    )
+                }
+            }
+            RegState::PtrToMapValueOrNull { value_size } => {
+                write!(f, "PTR_MAP_VALUE_OR_NULL(sz:{})", value_size)
+            }
         }
     }
 }
@@ -406,9 +441,9 @@ pub(crate) fn read_scalar(
         RegState::Scalar(bounds) => Ok(bounds),
         RegState::PtrToStack { .. }
         | RegState::PtrToCtx
-        | RegState::PtrToMap
-        | RegState::PtrToMapValue
-        | RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+        | RegState::PtrToMap { .. }
+        | RegState::PtrToMapValue { .. }
+        | RegState::PtrToMapValueOrNull { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
@@ -469,11 +504,27 @@ mod tests {
         );
         assert_eq!(ptr_stack(-8).to_string(), "PTR_STACK(-8)");
         assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
-        assert_eq!(RegState::PtrToMap.to_string(), "PTR_MAP");
-        assert_eq!(RegState::PtrToMapValue.to_string(), "PTR_MAP_VALUE");
         assert_eq!(
-            RegState::PtrToMapValueOrNull.to_string(),
-            "PTR_MAP_VALUE_OR_NULL"
+            RegState::PtrToMap {
+                key_size: 4,
+                value_size: 8,
+            }
+            .to_string(),
+            "PTR_MAP(k:4,v:8)"
+        );
+        assert_eq!(
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+            .to_string(),
+            "PTR_MAP_VALUE(0,sz:8)"
+        );
+        assert_eq!(
+            RegState::PtrToMapValueOrNull { value_size: 8 }.to_string(),
+            "PTR_MAP_VALUE_OR_NULL(sz:8)"
         );
     }
 
@@ -727,7 +778,7 @@ mod tests {
         // an OrNull pointer survives spill/fill — the NULL check is still
         // required after the fill
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         let state = step(
             0,
             &state,
@@ -748,7 +799,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToMapValueOrNull);
+        assert_eq!(
+            next.regs[5],
+            RegState::PtrToMapValueOrNull { value_size: 8 }
+        );
     }
 
     #[test]

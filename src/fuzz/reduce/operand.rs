@@ -276,7 +276,11 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::Lsh32Imm { dst, .. }
         | BpfInsn::Rsh32Imm { dst, .. }
         | BpfInsn::Arsh32Imm { dst, .. }
-        | BpfInsn::LdMem { dst, .. } => used[*dst as usize] = true,
+        | BpfInsn::LdMem { dst, .. }
+        | BpfInsn::LdImm64 { dst, .. }
+        | BpfInsn::LdMapFd { dst, .. }
+        | BpfInsn::LdMapValue { dst, .. } => used[*dst as usize] = true,
+        BpfInsn::LdImm64Second { .. } => {}
         BpfInsn::MovReg { dst, src }
         | BpfInsn::AddReg { dst, src }
         | BpfInsn::SubReg { dst, src }

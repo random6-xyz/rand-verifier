@@ -1,5 +1,6 @@
 // ── BPF program loading and the verification environment ────────────────────
 
+use std::collections::HashMap;
 use std::fs;
 
 use anyhow::Result;
@@ -9,8 +10,43 @@ use crate::concrete::{
     ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report, run_concrete,
 };
 use crate::error::{Verdict, VerificationFailure};
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::{BpfInsn, DecodeError, opcode, parse_insn, parse_ldimm64};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
+
+/// Map metadata carried by `PtrToMap` and needed for key/value argument
+/// validation and map-value access bounds (#89). Mirrors the kernel's
+/// `struct bpf_map` attributes relevant to verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct MapInfo {
+    /// Kernel map type (only ARRAY is implemented so far).
+    pub map_type: MapType,
+    /// The key size in bytes.
+    pub key_size: u32,
+    /// The value size in bytes.
+    pub value_size: u32,
+    /// Maximum number of entries.
+    pub max_entries: u32,
+}
+
+/// The subset of kernel `enum bpf_map_type` supported by the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MapType {
+    #[default]
+    Array,
+}
+
+impl MapInfo {
+    /// The default test map: ARRAY, 4-byte key, 8-byte value, one entry.
+    pub fn array_default() -> Self {
+        Self {
+            map_type: MapType::Array,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        }
+    }
+}
 
 /// A loaded BPF program: raw bytecode plus decoded instructions and
 /// subprogram entry points.
@@ -36,6 +72,10 @@ pub struct BpfVerifierEnv {
     pub(crate) prog: BpfProg, // BPF program data
     /// The concrete-side report of the last `verify()` call (v0.5).
     pub(crate) concrete_report: Option<ConcreteReport>,
+    /// Map fd → metadata, resolved at load time for ldimm64 pseudo
+    /// instructions (#89; kernel: check_ld_imm64 resolves the fd
+    /// against the loader's table).
+    pub(crate) maps: HashMap<u32, MapInfo>,
 }
 
 impl BpfVerifierEnv {
@@ -44,10 +84,36 @@ impl BpfVerifierEnv {
     }
 
     /// Load a BPF program from a binary file and return the instruction count.
+    /// A sibling `<name>.maps` JSON sidecar ({"<fd>": {"type": "array",
+    /// "key_size": 4, "value_size": 8, "max_entries": 1}}) registers the
+    /// maps referenced by ldimm64 pseudo instructions (#89).
     pub fn setup_prog(&mut self, name: String) -> Result<u32> {
+        self.load_maps_sidecar(&name);
         let raw_data =
             fs::read(&name).map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", name, e))?;
         self.load_raw(raw_data, &name)
+    }
+
+    /// Register a map in the environment (kernel: the loader's fd table).
+    pub fn register_map(&mut self, fd: u32, info: MapInfo) {
+        self.maps.insert(fd, info);
+    }
+
+    /// Load map metadata from a `<name>.maps` JSON sidecar, if present.
+    pub fn load_maps_sidecar(&mut self, name: &str) {
+        let sidecar = format!("{}.maps", name);
+        let Ok(text) = fs::read_to_string(&sidecar) else {
+            return;
+        };
+        let Ok(entries) = serde_json::from_str::<HashMap<String, MapInfo>>(&text) else {
+            eprintln!("warning: ignoring unparseable maps sidecar {}", sidecar);
+            return;
+        };
+        for (fd, info) in entries {
+            if let Ok(fd) = fd.parse::<u32>() {
+                self.register_map(fd, info);
+            }
+        }
     }
 
     /// Load a BPF program from an in-memory byte buffer (the raw
@@ -80,17 +146,103 @@ impl BpfVerifierEnv {
         let insn_cnt = (raw_data.len() / 8) as u32;
 
         // decode every 8-byte instruction; the first decode error stops
-        // the decode (like the kernel's per-instruction check loop)
+        // the decode (like the kernel's per-instruction check loop).
+        // ldimm64 (0x18) occupies two slots and is decoded as the
+        // instruction plus a transparent marker entry (#89).
         let mut insns = Vec::with_capacity(insn_cnt as usize);
         let mut decode_error = None;
-        for (idx, chunk) in raw_data.chunks_exact(8).enumerate() {
-            match parse_insn(chunk) {
-                Ok(insn) => insns.push(insn),
-                Err(e) => {
-                    decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
-                    insns.clear();
-                    break;
+        let mut idx = 0usize;
+        let chunks: Vec<&[u8]> = raw_data.chunks_exact(8).collect();
+        while idx < chunks.len() {
+            let chunk = chunks[idx];
+            if chunk[0] == opcode::LD_IMM64 {
+                match chunks.get(idx + 1) {
+                    Some(second) => match parse_ldimm64(chunk, second) {
+                        Ok(insn) => {
+                            insns.push(insn);
+                            insns.push(BpfInsn::LdImm64Second {
+                                imm_hi: u32::from_le_bytes([
+                                    second[4], second[5], second[6], second[7],
+                                ]),
+                            });
+                            idx += 2;
+                        }
+                        Err(e) => {
+                            decode_error =
+                                Some(VerificationFailure::new(idx as u32, e.to_string()));
+                            insns.clear();
+                            break;
+                        }
+                    },
+                    None => {
+                        decode_error = Some(VerificationFailure::new(
+                            idx as u32,
+                            DecodeError::LdImm64Truncated.to_string(),
+                        ));
+                        insns.clear();
+                        break;
+                    }
                 }
+            } else {
+                match parse_insn(chunk) {
+                    Ok(insn) => {
+                        insns.push(insn);
+                        idx += 1;
+                    }
+                    Err(e) => {
+                        decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
+                        insns.clear();
+                        break;
+                    }
+                }
+            }
+        }
+        // resolve map fds from the registry at load time (kernel:
+        // check_ld_imm64 resolves the fd against the loader's table)
+        if decode_error.is_none() {
+            for (i, insn) in insns.iter_mut().enumerate() {
+                match insn {
+                    BpfInsn::LdMapFd {
+                        fd,
+                        key_size,
+                        value_size,
+                        ..
+                    } => match self.maps.get(fd) {
+                        Some(info) => {
+                            *key_size = info.key_size;
+                            *value_size = info.value_size;
+                        }
+                        None => {
+                            decode_error = Some(VerificationFailure::new(
+                                i as u32,
+                                format!("unknown map fd {}", fd),
+                            ));
+                            break;
+                        }
+                    },
+                    BpfInsn::LdMapValue {
+                        fd,
+                        key_size,
+                        value_size,
+                        ..
+                    } => match self.maps.get(fd) {
+                        Some(info) => {
+                            *key_size = info.key_size;
+                            *value_size = info.value_size;
+                        }
+                        None => {
+                            decode_error = Some(VerificationFailure::new(
+                                i as u32,
+                                format!("unknown map fd {}", fd),
+                            ));
+                            break;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            if decode_error.is_some() {
+                insns.clear();
             }
         }
 

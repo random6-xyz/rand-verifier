@@ -47,11 +47,29 @@ pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
             },
         ) => old_min == new_min && old_max == new_max && old_align == new_align,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
-        (RegState::PtrToMap, RegState::PtrToMap) => true,
-        (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
-        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => true,
+        (RegState::PtrToMap { .. }, RegState::PtrToMap { .. }) => true,
+        (
+            RegState::PtrToMapValue { .. },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+        ) => true,
+        (RegState::PtrToMapValueOrNull { .. }, RegState::PtrToMapValueOrNull { value_size: 8 }) => {
+            true
+        }
         // a nullable pointer is a superset of the non-null one
-        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValue) => true,
+        (
+            RegState::PtrToMapValueOrNull { .. },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+        ) => true,
         // different types are never comparable
         _ => false,
     }
@@ -793,9 +811,14 @@ mod tests {
     fn subsumes_nullable_pointer() {
         // OrNull = {valid} ∪ {NULL} subsumes the non-null pointer
         let mut or_null = VerifierState::initial();
-        or_null.regs[0] = RegState::PtrToMapValueOrNull;
+        or_null.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         let mut valid = VerifierState::initial();
-        valid.regs[0] = RegState::PtrToMapValue;
+        valid.regs[0] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+        };
         assert!(subsumes(&or_null, &valid));
         assert!(!subsumes(&valid, &or_null));
         // same types subsume themselves
@@ -921,7 +944,10 @@ mod tests {
     #[test]
     fn subsumes_ptr_to_map() {
         let mut map = VerifierState::initial();
-        map.regs[1] = RegState::PtrToMap;
+        map.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         let ctx = VerifierState::initial();
         // same type subsumes itself; a map pointer never subsumes a ctx
         // pointer (or vice versa)

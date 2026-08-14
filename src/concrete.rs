@@ -233,9 +233,9 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
         (RegState::Scalar(_), _)
         | (RegState::PtrToStack { .. }, _)
         | (RegState::PtrToCtx, _)
-        | (RegState::PtrToMap, _)
-        | (RegState::PtrToMapValue, _)
-        | (RegState::PtrToMapValueOrNull, _) => false,
+        | (RegState::PtrToMap { .. }, _)
+        | (RegState::PtrToMapValue { .. }, _)
+        | (RegState::PtrToMapValueOrNull { .. }, _) => false,
     }
 }
 
@@ -621,6 +621,21 @@ pub(crate) fn concrete_step(
         BpfInsn::Arsh32Reg { dst, src } => {
             concrete_alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
+        // ldimm64 (#89): a plain 64-bit constant
+        BpfInsn::LdImm64 { dst, imm } => {
+            check_concrete_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::Scalar(*imm));
+            Ok(next)
+        }
+        // map-fd forms have no concrete address class yet — the full
+        // map model lands with the concrete map memory (C3); until then
+        // any program using them fails here like a pointer misuse
+        BpfInsn::LdMapFd { dst, .. } | BpfInsn::LdMapValue { dst, .. } => {
+            Err(ConcreteFailure::PointerArithmetic { pc, reg: *dst })
+        }
+        // the second slot of an ldimm64 is transparent
+        BpfInsn::LdImm64Second { .. } => Ok(*state),
         // [base + off] = rY → spill the value and its pointer kind
         // (#30); the base must be a stack pointer and the access is
         // validated at access time (#87)
@@ -1385,9 +1400,17 @@ mod tests {
     fn map_ptr_family_not_covered() {
         // no concrete address class exists for map pointers yet
         for reg in [
-            RegState::PtrToMap,
-            RegState::PtrToMapValue,
-            RegState::PtrToMapValueOrNull,
+            RegState::PtrToMap {
+                key_size: 4,
+                value_size: 8,
+            },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+            RegState::PtrToMapValueOrNull { value_size: 8 },
         ] {
             for value in [
                 ConcreteValue::Scalar(0),
