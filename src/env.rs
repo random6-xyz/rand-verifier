@@ -7,7 +7,8 @@ use anyhow::Result;
 
 use crate::cfg::{add_subprog, check_cfg};
 use crate::concrete::{
-    ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report, run_concrete,
+    ConcreteLimits, ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report,
+    run_concrete_with_maps,
 };
 use crate::error::{Verdict, VerificationFailure};
 use crate::insn::{BpfInsn, DecodeError, opcode, parse_insn, parse_ldimm64};
@@ -293,7 +294,12 @@ impl BpfVerifierEnv {
                 // soundness question (every concrete visited state must
                 // be covered by an abstract state at the same pc)
                 let mut report = ConcreteReport::default();
-                match run_concrete(&self.prog.insns, &loop_heads) {
+                match run_concrete_with_maps(
+                    &self.prog.insns,
+                    &loop_heads,
+                    &ConcreteLimits::default(),
+                    &self.maps,
+                ) {
                     Err(failure) => {
                         report.unexpected_failure = Some(failure);
                         report.verdict = ConcreteVerdict::Unsafe;
@@ -328,7 +334,12 @@ impl BpfVerifierEnv {
         loop_heads: &[u32],
     ) -> Result<Verdict> {
         let mut report = ConcreteReport::default();
-        match run_concrete(&self.prog.insns, loop_heads) {
+        match run_concrete_with_maps(
+            &self.prog.insns,
+            loop_heads,
+            &ConcreteLimits::default(),
+            &self.maps,
+        ) {
             Err(concrete_failure) => {
                 report.reject_note = Some(format!(
                     "concrete cross-check: also fails {}",
