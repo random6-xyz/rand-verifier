@@ -121,8 +121,11 @@ pub enum BpfInsn {
     Rsh32Reg { dst: u8, src: u8 },
     Arsh32Imm { dst: u8, imm: i32 },
     Arsh32Reg { dst: u8, src: u8 },
-    LdStack { dst: u8, offset: i16 },
-    StStack { src: u8, offset: i16 },
+    // 8-byte memory access through a base register (any register; the
+    // verifier requires a stack pointer base, #87). `base` is the
+    // kernel's src_reg for loads and dst_reg for stores.
+    LdMem { dst: u8, base: u8, offset: i16 },
+    StMem { src: u8, base: u8, offset: i16 },
     // compares: equality, unsigned family, signed family (#39)
     Jeq { dst: u8, src: u8, offset: i16 },
     Jne { dst: u8, src: u8, offset: i16 },
@@ -463,35 +466,31 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
             }
             Ok(BpfInsn::Exit)
         }
-        // BPF_LDX|BPF_MEM|BPF_DW with R10 as the base register
+        // BPF_LDX|BPF_MEM|BPF_DW — 8-byte load from [base + off]
         opcode::LD_STACK => {
             if imm != 0 {
                 return Err(DecodeError::ReservedFields {
                     message: "BPF_LDX uses reserved fields",
                 });
             }
-            if src != 10 {
-                return Err(DecodeError::Unsupported {
-                    op,
-                    reason: "loads from a non-stack base register are not implemented",
-                });
-            }
-            Ok(BpfInsn::LdStack { dst, offset })
+            Ok(BpfInsn::LdMem {
+                dst,
+                base: src,
+                offset,
+            })
         }
-        // BPF_STX|BPF_MEM|BPF_DW with R10 as the base register
+        // BPF_STX|BPF_MEM|BPF_DW — 8-byte store to [base + off]
         opcode::ST_STACK => {
             if imm != 0 {
                 return Err(DecodeError::ReservedFields {
                     message: "BPF_STX uses reserved fields",
                 });
             }
-            if dst != 10 {
-                return Err(DecodeError::Unsupported {
-                    op,
-                    reason: "stores to a non-stack base register are not implemented",
-                });
-            }
-            Ok(BpfInsn::StStack { src, offset })
+            Ok(BpfInsn::StMem {
+                src,
+                base: dst,
+                offset,
+            })
         }
         _ => {
             if let Some(reason) = unsupported_reason(op) {
@@ -542,8 +541,8 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         BpfInsn::Rsh32Reg { dst, src } => format!("w{} >>= r{}", dst, src),
         BpfInsn::Arsh32Imm { dst, imm } => format!("w{} s>>= {}", dst, imm),
         BpfInsn::Arsh32Reg { dst, src } => format!("w{} s>>= r{}", dst, src),
-        BpfInsn::LdStack { dst, offset } => format!("r{} = [r10{:+}]", dst, offset),
-        BpfInsn::StStack { src, offset } => format!("[r10{:+}] = r{}", offset, src),
+        BpfInsn::LdMem { dst, base, offset } => format!("r{} = [r{}{:+}]", dst, base, offset),
+        BpfInsn::StMem { src, base, offset } => format!("[r{}{:+}] = r{}", base, offset, src),
         BpfInsn::Jeq { dst, src, offset } => {
             format!("if r{} == r{} goto {:+}", dst, src, offset)
         }
@@ -646,18 +645,49 @@ mod tests {
 
     #[test]
     fn parse_insn_ld_stack() {
-        // BPF_LDX|BPF_MEM|BPF_DW: the base register field (src_reg)
-        // must name R10 (the frame pointer)
+        // BPF_LDX|BPF_MEM|BPF_DW: src_reg is the base register (#87 —
+        // any register; the verifier requires a stack pointer at exec)
         let insn = parse(opcode::LD_STACK, 0, 10, -8, 0);
-        assert!(matches!(insn, BpfInsn::LdStack { dst: 0, offset: -8 }));
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }
+        ));
+        let insn = parse(opcode::LD_STACK, 0, 6, -8, 0);
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 6,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
     fn parse_insn_st_stack() {
-        // BPF_STX|BPF_MEM|BPF_DW: the base register field (dst_reg)
-        // must name R10 (the frame pointer)
+        // BPF_STX|BPF_MEM|BPF_DW: dst_reg is the base register (#87)
         let insn = parse(opcode::ST_STACK, 10, 1, -8, 0);
-        assert!(matches!(insn, BpfInsn::StStack { src: 1, offset: -8 }));
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8
+            }
+        ));
+        let insn = parse(opcode::ST_STACK, 6, 1, -8, 0);
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 1,
+                base: 6,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
@@ -989,13 +1019,26 @@ mod tests {
 
     #[test]
     fn parse_insn_ld_st_base_register() {
-        // LDX with a base other than R10 and STX with a base other than
-        // R10 are valid kernel instructions the verifier does not
-        // implement (map/ctx access) — explicit unsupported errors
-        let err = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 1, -8, 0)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x79, .. }));
-        let err = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x7b, .. }));
+        // LDX/STX accept any base register at decode (#87); the
+        // verifier requires a stack pointer at exec time
+        let insn = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 1, -8, 0)).unwrap();
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 1,
+                offset: -8
+            }
+        ));
+        let insn = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap();
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 2,
+                base: 1,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
@@ -1177,15 +1220,28 @@ mod tests {
         assert_eq!(disassemble(&BpfInsn::AddImm { dst: 2, imm: 5 }), "r2 += 5");
         assert_eq!(disassemble(&BpfInsn::AddReg { dst: 1, src: 2 }), "r1 += r2");
         assert_eq!(
-            disassemble(&BpfInsn::LdStack { dst: 0, offset: -8 }),
+            disassemble(&BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }),
             "r0 = [r10-8]"
         );
         assert_eq!(
-            disassemble(&BpfInsn::StStack {
+            disassemble(&BpfInsn::StMem {
                 src: 2,
+                base: 10,
                 offset: -16
             }),
             "[r10-16] = r2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::LdMem {
+                dst: 0,
+                base: 6,
+                offset: 0
+            }),
+            "r0 = [r6+0]"
         );
         assert_eq!(
             disassemble(&BpfInsn::Jeq {

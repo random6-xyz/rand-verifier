@@ -4,8 +4,8 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    ALIGN_UNKNOWN, RegState, ScalarBounds, StackSlot, VerifierState, check_reg, read_reg,
-    read_scalar, stack_slot_index,
+    ALIGN_UNKNOWN, RegState, STACK_SIZE, STACK_SLOT_SIZE, ScalarBounds, StackSlot, VerifierState,
+    check_reg, read_reg, read_scalar,
 };
 use crate::tnum::Tnum;
 
@@ -129,35 +129,87 @@ pub(crate) fn step(
         BpfInsn::Arsh32Reg { dst, src } => {
             alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
-        // r10[offset] = rY → spill the source's full abstract state,
-        // including pointers and scalar ranges (#30)
-        BpfInsn::StStack { src, offset } => {
-            let slot = stack_slot_index(pc, *offset as i32)?;
+        // [base + off] = rY → spill the source's full abstract state,
+        // including pointers and scalar ranges (#30). The base must be
+        // a stack pointer; bounds and alignment are validated at access
+        // time (#87, kernel check_mem_access →
+        // check_stack_access_within_bounds). A variable-offset store
+        // only initializes the covered slots — the spill info is
+        // destroyed (kernel: "Variable offset writes destroy any spilled
+        // pointers in range").
+        BpfInsn::StMem { src, base, offset } => {
+            read_stack_ptr(pc, state, *base)?;
+            let slots = stack_access_range(pc, *base, state, *offset)?;
             let src_state = read_reg(pc, state, *src)?;
             let mut next = *state;
-            next.stack.slots[slot] = StackSlot::Spilled(src_state);
+            if slots.0 == slots.1 {
+                // exact base: the full spilled state is preserved (#30)
+                next.stack.slots[slots.0] = StackSlot::Spilled(src_state);
+            } else {
+                for slot in slots.0..=slots.1 {
+                    next.stack.slots[slot] = StackSlot::Initialized;
+                }
+            }
             Ok(next)
         }
-        // rX = r10[offset] → load a stack slot; a slot must have been
+        // rX = [base + off] → load a stack slot; a slot must have been
         // written before it is read (write-before-read, #18). The full
         // spilled register state is restored, pointers included (#30).
-        BpfInsn::LdStack { dst, offset } => {
+        // A variable-offset load requires every covered slot to be
+        // initialized and rejects ranges holding spilled pointers
+        // (kernel: "invalid indirect read from stack"); the result is
+        // an unknown scalar.
+        BpfInsn::LdMem { dst, base, offset } => {
             check_reg(pc, *dst)?;
-            let slot = stack_slot_index(pc, *offset as i32)?;
-            let spilled = match state.stack.slots[slot] {
-                StackSlot::Uninit => {
-                    return Err(VerificationFailure::new(
-                        pc,
-                        format!(
-                            "stack slot at offset {} is uninitialized (write before read)",
-                            offset
-                        ),
-                    ));
-                }
-                StackSlot::Spilled(spilled) => spilled,
-            };
+            read_stack_ptr(pc, state, *base)?;
+            let slots = stack_access_range(pc, *base, state, *offset)?;
             let mut next = *state;
-            next.regs[*dst as usize] = spilled;
+            if slots.0 == slots.1 {
+                let spilled = match next.stack.slots[slots.0] {
+                    StackSlot::Uninit => {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            format!(
+                                "stack slot at offset {} is uninitialized (write before read)",
+                                offset
+                            ),
+                        ));
+                    }
+                    StackSlot::Spilled(spilled) => spilled,
+                    StackSlot::Initialized => RegState::Scalar(ScalarBounds::unknown()),
+                };
+                next.regs[*dst as usize] = spilled;
+            } else {
+                for slot in slots.0..=slots.1 {
+                    match next.stack.slots[slot] {
+                        StackSlot::Uninit => {
+                            return Err(VerificationFailure::new(
+                                pc,
+                                format!(
+                                    "stack slot at offset {} is uninitialized (write before read)",
+                                    slot_offset(slot)
+                                ),
+                            ));
+                        }
+                        StackSlot::Initialized => {}
+                        StackSlot::Spilled(spilled) => {
+                            if !matches!(spilled, RegState::Scalar(_)) {
+                                return Err(VerificationFailure::new(
+                                    pc,
+                                    format!(
+                                        "invalid indirect read from stack at r{}{:+}: spilled {} at offset {}",
+                                        base,
+                                        offset,
+                                        spilled,
+                                        slot_offset(slot)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::unknown());
+            }
             Ok(next)
         }
         // helper call: validate R1..R5 against the helper prototype, then
@@ -351,6 +403,114 @@ fn alu_reg(
     let mut next = *state;
     next.regs[dst as usize] = RegState::Scalar(next_bounds);
     Ok(next)
+}
+
+/// Read a register and require a stack pointer — the base of a memory
+/// access (#87). Loads/stores through non-stack pointers (context, map
+/// values, ...) are not implemented yet and are rejected, mirroring the
+/// old decode-time restriction.
+fn read_stack_ptr(pc: u32, state: &VerifierState, reg: u8) -> Result<(), VerificationFailure> {
+    match read_reg(pc, state, reg)? {
+        RegState::PtrToStack { .. } => Ok(()),
+        RegState::Scalar(_) => Err(VerificationFailure::new(
+            pc,
+            format!("stack access through a scalar r{} is not supported", reg),
+        )),
+        _ => Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack access through a non-stack pointer r{} is not supported",
+                reg
+            ),
+        )),
+    }
+}
+
+/// The access-time checks for `[base + off]` (#87): every possible
+/// concrete offset (the base's interval plus the fixed offset) must
+/// stay within the 512-byte frame and be 8-byte aligned; the covered
+/// slot range (inclusive) is returned. Mirrors the kernel's
+/// `check_stack_access_within_bounds` + alignment requirement.
+fn stack_access_range(
+    pc: u32,
+    base: u8,
+    state: &VerifierState,
+    off: i16,
+) -> Result<(usize, usize), VerificationFailure> {
+    let RegState::PtrToStack {
+        min_offset,
+        max_offset,
+        align_off,
+    } = state.regs[base as usize]
+    else {
+        unreachable!("read_stack_ptr checked the base")
+    };
+    let off64 = off as i64;
+    let min_off = min_offset as i64 + off64;
+    let max_off = max_offset as i64 + off64 + STACK_SLOT_SIZE as i64;
+    // alignment: every possible concrete offset must be 8-byte aligned
+    if align_off == ALIGN_UNKNOWN {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack pointer r{} alignment is not provable (computed offsets must be 8-byte aligned)",
+                base
+            ),
+        ));
+    }
+    if (align_off as i32 + off.rem_euclid(8) as i32).rem_euclid(8) != 0 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("stack access at r{}{:+} is not 8-byte aligned", base, off),
+        ));
+    }
+    // bounds: the whole access range must lie within [-512, 0)
+    if min_off >= 0 {
+        if base == 10 && min_offset == 0 && max_offset == 0 {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "stack access at r10{:+} points away from the frame (valid: r10-512..r10-8)",
+                    off
+                ),
+            ));
+        }
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack access at r{}{:+} with base offsets {}..{} exceeds the 512 byte frame",
+                base, off, min_offset, max_offset
+            ),
+        ));
+    }
+    if min_off < -(STACK_SIZE as i64) || max_off > 0 {
+        if base == 10 && min_offset == 0 && max_offset == 0 {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "stack access at r10{:+} exceeds the {} byte frame",
+                    off, STACK_SIZE
+                ),
+            ));
+        }
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack access at r{}{:+} with base offsets {}..{} exceeds the 512 byte frame",
+                base, off, min_offset, max_offset
+            ),
+        ));
+    }
+    // slot range: the access [min_off, max_off) with 8-aligned endpoints
+    // covers slots (lowest) ..= (highest); slot(o) = (-o - 1) / 8
+    let low = (-max_off / STACK_SLOT_SIZE as i64) as usize;
+    let high = ((-min_off - 1) / STACK_SLOT_SIZE as i64) as usize;
+    Ok((low, high))
+}
+
+/// The r10-relative offset of a stack slot index.
+fn slot_offset(slot: usize) -> i32 {
+    -(((slot + 1) * STACK_SLOT_SIZE) as i32)
 }
 
 /// `PtrToStack + ScalarRange` (#87): the offset interval is widened by
@@ -2342,8 +2502,26 @@ mod tests {
                 mask: 0b001,
             },
         });
-        let state = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
-        let next = step(0, &state, &BpfInsn::LdStack { dst: 3, offset: -8 }).unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
         assert_eq!(next.regs[3], state.regs[2]);
         let RegState::Scalar(b) = next.regs[3] else {
             panic!("expected scalar");
@@ -2928,6 +3106,275 @@ mod tests {
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: 0 }).unwrap();
         assert_eq!(next.regs[10], ptr_stack(0));
+    }
+
+    // ── Access-time stack validation (#87) ──────────────────────────────────
+
+    #[test]
+    fn access_time_out_of_frame_access_rejected() {
+        // r6 = r10 - 32 + [0, 248] → [r6] exceeds the frame at access time
+        let mut state = VerifierState::initial();
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: 216,
+            align_off: 0,
+        };
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("512 byte frame"), "{}", err.message);
+        // the same out-of-frame pointer without an access still passes
+        let next = step(0, &state, &BpfInsn::MovReg { dst: 7, src: 6 }).unwrap();
+        assert_eq!(next.regs[7], state.regs[6]);
+    }
+
+    #[test]
+    fn access_time_misaligned_access_rejected() {
+        // r6 with unknown low bits → the access alignment is not provable
+        let mut state = VerifierState::initial();
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: 0,
+            align_off: ALIGN_UNKNOWN,
+        };
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("alignment"), "{}", err.message);
+        // a fixed misaligned offset on r10 stays rejected
+        let err = step(
+            0,
+            &VerifierState::initial(),
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -4,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("not 8-byte aligned"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn access_time_non_stack_base_rejected() {
+        // [r1] with R1 = PtrToCtx is not implemented (kernel ctx loads
+        // are out of the subset)
+        let state = VerifierState::initial();
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 1,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("non-stack pointer"), "{}", err.message);
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 1,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("non-stack pointer"), "{}", err.message);
+    }
+
+    #[test]
+    fn access_time_computed_exact_roundtrip() {
+        // r6 = r10 - 32 (exact) → store + load through r6 roundtrips
+        // the spilled state
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 7 }).unwrap();
+        let state = step(0, &state, &BpfInsn::MovReg { dst: 6, src: 10 }).unwrap();
+        let state = step(0, &state, &BpfInsn::AddImm { dst: 6, imm: -32 }).unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.regs[3], RegState::Scalar(ScalarBounds::constant(7)));
+    }
+
+    #[test]
+    fn access_time_variable_store_scrubs_spill() {
+        // r6 interval [-256, -8]: a variable-offset store initializes
+        // the covered range and destroys spill info (#87)
+        let mut state = VerifierState::initial();
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -256,
+            max_offset: -8,
+            align_off: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(7));
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        for slot in 0..=31 {
+            assert_eq!(
+                next.stack.slots[slot],
+                StackSlot::Initialized,
+                "slot {slot}"
+            );
+        }
+        assert_eq!(next.stack.slots[32], StackSlot::Uninit);
+        // an exact load from a covered slot yields an unknown scalar
+        let loaded = step(
+            1,
+            &next,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 10,
+                offset: -16,
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded.regs[3], RegState::Scalar(ScalarBounds::unknown()));
+    }
+
+    #[test]
+    fn access_time_variable_load_over_uninit_rejected() {
+        let mut state = VerifierState::initial();
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -256,
+            max_offset: -8,
+            align_off: 0,
+        };
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("uninitialized"), "{}", err.message);
+    }
+
+    #[test]
+    fn access_time_variable_load_over_spilled_pointer_rejected() {
+        // spill a context pointer at r10-8, then read through a
+        // variable base covering that slot → indirect read is rejected
+        // (kernel: "invalid indirect read from stack")
+        let state = VerifierState::initial();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let mut state = state;
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -16,
+            max_offset: -8,
+            align_off: 0,
+        };
+        let err = step(
+            1,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("indirect read"), "{}", err.message);
+    }
+
+    #[test]
+    fn access_time_variable_load_over_spilled_scalar_ok() {
+        // spilled scalars in the range are fine; the result is an
+        // unknown scalar
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 5 }).unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -16,
+            },
+        )
+        .unwrap();
+        let mut state = state;
+        state.regs[6] = RegState::PtrToStack {
+            min_offset: -16,
+            max_offset: -8,
+            align_off: 0,
+        };
+        let next = step(
+            1,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 6,
+                offset: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.regs[3], RegState::Scalar(ScalarBounds::unknown()));
     }
 
     // ── Trace (v0.2) ─────────────────────────────────────────────────────────

@@ -89,6 +89,8 @@ pub(crate) enum ConcreteFailure {
     UninitializedStackRead { pc: u32, offset: i32 },
     /// Arithmetic on a pointer-typed register (#20).
     PointerArithmetic { pc: u32, reg: u8 },
+    /// A memory access through a non-stack-pointer base (#87).
+    NonStackBase { pc: u32, reg: u8 },
     /// A shift amount outside the accepted range (mirrors the abstract
     /// 0..64 check for both widths, `check_shift_amount`).
     InvalidShiftAmount { pc: u32, amount: u64 },
@@ -139,6 +141,11 @@ impl std::fmt::Display for ConcreteFailure {
             Self::PointerArithmetic { pc, reg } => {
                 write!(f, "at insn {}: arithmetic on pointer r{}", pc, reg)
             }
+            Self::NonStackBase { pc, reg } => write!(
+                f,
+                "at insn {}: stack access through a non-stack pointer r{} is not supported",
+                pc, reg
+            ),
             Self::InvalidShiftAmount { pc, amount } => {
                 write!(f, "at insn {}: invalid shift amount {}", pc, amount)
             }
@@ -254,6 +261,11 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
             .zip(&concrete.stack)
             .all(|(abstract_slot, value)| match (abstract_slot, value) {
                 (StackSlot::Uninit, None) => true,
+                // a variable-offset store marks slots initialized
+                // without a value — any concrete value written into
+                // them (or nothing at all, on a path that did not hit
+                // the store) is covered (unknown scalar, #87)
+                (StackSlot::Initialized, _) => true,
                 (StackSlot::Spilled(reg), Some(value)) => abstract_covers(*reg, *value),
                 _ => false,
             })
@@ -304,6 +316,21 @@ fn alu_value(op: AluOp, width: AluWidth, a: u64, b: u64) -> u64 {
     match width {
         AluWidth::W64 => alu_const64(op, a, b),
         AluWidth::W32 => alu_const32(op, a, b),
+    }
+}
+
+/// Resolve a memory access `[base + off]` to an r10-relative offset
+/// (#87): the base must be a stack pointer; the access-time frame and
+/// alignment checks happen in `concrete_stack_slot`.
+fn stack_ptr_access_offset(
+    pc: u32,
+    reg: u8,
+    base: ConcreteValue,
+    off: i32,
+) -> Result<i32, ConcreteFailure> {
+    match base {
+        ConcreteValue::StackPtr(v) => Ok((v as i64 - STACK_BASE as i64 + off as i64) as i32),
+        _ => Err(ConcreteFailure::NonStackBase { pc, reg }),
     }
 }
 
@@ -594,26 +621,29 @@ pub(crate) fn concrete_step(
         BpfInsn::Arsh32Reg { dst, src } => {
             concrete_alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
-        // r10[offset] = rY → spill the value and its pointer kind (#30)
-        BpfInsn::StStack { src, offset } => {
-            let slot = concrete_stack_slot(pc, *offset as i32)?;
+        // [base + off] = rY → spill the value and its pointer kind
+        // (#30); the base must be a stack pointer and the access is
+        // validated at access time (#87)
+        BpfInsn::StMem { src, base, offset } => {
+            let base_value = read_concrete_reg(pc, state, *base)?;
+            let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
+            let slot = concrete_stack_slot(pc, offset)?;
             let value = read_concrete_reg(pc, state, *src)?;
             let mut next = *state;
             next.stack[slot] = Some(value);
             Ok(next)
         }
-        // rX = r10[offset] → load a stack slot; a slot must have been
+        // rX = [base + off] → load a stack slot; a slot must have been
         // written before it is read (write-before-read, #18). The value
         // and its pointer kind are restored (#30).
-        BpfInsn::LdStack { dst, offset } => {
+        BpfInsn::LdMem { dst, base, offset } => {
             check_concrete_reg(pc, *dst)?;
-            let slot = concrete_stack_slot(pc, *offset as i32)?;
+            let base_value = read_concrete_reg(pc, state, *base)?;
+            let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
+            let slot = concrete_stack_slot(pc, offset)?;
             let value = match state.stack[slot] {
                 None => {
-                    return Err(ConcreteFailure::UninitializedStackRead {
-                        pc,
-                        offset: *offset as i32,
-                    });
+                    return Err(ConcreteFailure::UninitializedStackRead { pc, offset });
                 }
                 Some(value) => value,
             };
@@ -1401,6 +1431,21 @@ mod tests {
     }
 
     #[test]
+    fn state_covers_initialized_slot() {
+        // a variable-offset store marks abstract slots Initialized;
+        // they cover both an untouched (None) and a written (Some)
+        // concrete slot (#87)
+        let mut abstract_state = VerifierState::initial();
+        abstract_state.stack.slots[3] = StackSlot::Initialized;
+        let mut concrete = ConcreteState::initial();
+        assert!(state_covers(&abstract_state, &concrete));
+        concrete.stack[3] = Some(ConcreteValue::Scalar(0));
+        assert!(state_covers(&abstract_state, &concrete));
+        concrete.stack[3] = Some(ConcreteValue::StackPtr(STACK_BASE - 24));
+        assert!(state_covers(&abstract_state, &concrete));
+    }
+
+    #[test]
     fn state_covers_register_mismatch() {
         // concrete R0 = 0 where the abstract side is uninitialized
         let mut concrete = ConcreteState::initial();
@@ -1826,19 +1871,29 @@ mod tests {
         // scalar round-trip
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: 42 },
-            BpfInsn::StStack { src: 2, offset: -8 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
         ]);
         assert_eq!(state.regs[0], Some(ConcreteValue::Scalar(42)));
         // pointer round-trip: the kind survives spill/fill (#30)
         let state = run(&[
             BpfInsn::AddImm { dst: 10, imm: -8 },
-            BpfInsn::StStack {
+            BpfInsn::StMem {
                 src: 10,
+                base: 10,
                 offset: -16,
             },
-            BpfInsn::LdStack {
+            BpfInsn::LdMem {
                 dst: 0,
+                base: 10,
                 offset: -16,
             },
         ]);
@@ -1850,7 +1905,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::LdStack { dst: 0, offset: -8 },
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
         )
         .unwrap_err();
         assert_eq!(
@@ -1861,7 +1920,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 3, offset: -8 },
+            &BpfInsn::StMem {
+                src: 3,
+                base: 10,
+                offset: -8,
+            },
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::UninitializedRead { pc: 0, reg: 3 });
@@ -1873,7 +1936,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 1, offset: 0 },
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: 0,
+            },
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::StackOutOfFrame { pc: 0, offset: 0 });
@@ -1881,8 +1948,9 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack {
+            &BpfInsn::StMem {
                 src: 1,
+                base: 10,
                 offset: -520,
             },
         )
@@ -1898,7 +1966,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 1, offset: -7 },
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -7,
+            },
         )
         .unwrap_err();
         assert_eq!(

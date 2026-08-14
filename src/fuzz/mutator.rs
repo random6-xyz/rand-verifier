@@ -198,8 +198,16 @@ fn replace_imm(insn: &BpfInsn, imm: i32) -> BpfInsn {
 /// other instructions are returned unchanged).
 fn replace_off(insn: &BpfInsn, offset: i16) -> BpfInsn {
     match insn {
-        BpfInsn::LdStack { dst, .. } => BpfInsn::LdStack { dst: *dst, offset },
-        BpfInsn::StStack { src, .. } => BpfInsn::StStack { src: *src, offset },
+        BpfInsn::LdMem { dst, .. } => BpfInsn::LdMem {
+            dst: *dst,
+            base: 10,
+            offset,
+        },
+        BpfInsn::StMem { src, .. } => BpfInsn::StMem {
+            src: *src,
+            base: 10,
+            offset,
+        },
         BpfInsn::Jeq { dst, src, .. } => BpfInsn::Jeq {
             dst: *dst,
             src: *src,
@@ -446,12 +454,14 @@ fn replace_reg(insn: &BpfInsn, reg: u8) -> BpfInsn {
             dst: reg,
             src: *src,
         },
-        BpfInsn::LdStack { offset, .. } => BpfInsn::LdStack {
+        BpfInsn::LdMem { offset, .. } => BpfInsn::LdMem {
             dst: reg,
+            base: 10,
             offset: *offset,
         },
-        BpfInsn::StStack { offset, .. } => BpfInsn::StStack {
+        BpfInsn::StMem { offset, .. } => BpfInsn::StMem {
             src: reg,
+            base: 10,
             offset: *offset,
         },
         BpfInsn::Jeq { src, offset, .. } => BpfInsn::Jeq {

@@ -214,11 +214,19 @@ mod tests {
         assert_eq!(decoded.len(), 5);
         assert!(matches!(
             decoded[1],
-            BpfInsn::StStack { src: 1, offset: -8 }
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8
+            }
         ));
         assert!(matches!(
             decoded[2],
-            BpfInsn::LdStack { dst: 0, offset: -8 }
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }
         ));
         assert!(matches!(decoded[3], BpfInsn::Call { imm: 1 }));
     }

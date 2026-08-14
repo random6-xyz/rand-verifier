@@ -270,7 +270,11 @@ mod tests {
         // r0 = 1; r0 = [r10-8]; exit — uninitialized stack slot at insn 1
         let program = vec![
             BpfInsn::MovImm { dst: 0, imm: 1 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Exit,
         ];
         let err = verify_mini(&program, &[]).unwrap_err();
@@ -408,7 +412,11 @@ mod tests {
         let program = vec![
             BpfInsn::AddImm { dst: 10, imm: -8 },
             BpfInsn::MovImm { dst: 2, imm: 7 },
-            BpfInsn::StStack { src: 2, offset: -8 },
+            BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::MovImm { dst: 1, imm: 1 },
             BpfInsn::MovImm { dst: 3, imm: 1 },
             BpfInsn::Jeq {
@@ -416,9 +424,17 @@ mod tests {
                 src: 3,
                 offset: 2,
             },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Jmp { offset: 1 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Exit,
         ];
         assert!(verify_mini(&program, &[]).is_ok());
