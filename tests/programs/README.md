@@ -106,6 +106,12 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | unsigned_then_signed_refine | `call 7; r1 = 100; jle r0, r1, +1; exit; r2 = -1; jsgt r0, r2, +1; exit; exit` | unsigned refine then signed prune    |
 | jeq_fall_exclusion          | `call 7; r3 = 42; jle r0, r3, +1; exit; r4 = 42; jeq r0, r4, +1; exit; exit` | equality fall-through exclusion     |
 | computed_offset_access      | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset in-frame + aligned   |
+| computed_ptr_access         | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; [r6] = r2; r0 = [r6]; exit` | computed pointer in-frame aligned access (variable store/load) |
+| computed_pointer_no_access  | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed pointer never dereferenced (reduced mseed-5-99, #86/#87) |
+| computed_offset_misaligned  | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment tracked, not rejected (#87) |
+| computed_offset_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed out-of-frame offset without access (#87) |
+| overflowed_range_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | saturated offset interval without access (#87) |
+| pointer_reg_arith            | `r0 = 1; r0 += r10; exit`                           | scalar += pointer inherits pointer state (#87) |
 | bounded_loop                | `r0 = 0; r2 = 100; r1 = 0; r1 += 1; jlt r1, r2, -2; exit`            | bounded counter loop (100 iterations) |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
@@ -129,7 +135,6 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | stack_misaligned              | `r2 = 1; [r10-4] = r2; exit`                        | misaligned offset                   |
 | pointer_out_of_frame          | `r10 += 8; exit`                                    | stack pointer out of frame          |
 | ctx_arith                     | `r1 += 8; exit`                                     | arithmetic on context pointer       |
-| pointer_reg_arith             | `r0 = 1; r0 += r10; exit`                           | register-offset pointer arithmetic  |
 | initialized_on_one_path_only  | `jeq r10, r10, +1; r0 = 1; exit`                    | R0 unset on one path                |
 | uninit_register_on_path       | `jeq r10, r10, +1; r2 = 5; r0 = r2; exit`           | uninitialized register on a path    |
 | invalid_helper_argument       | `call 1; exit`                                     | helper argument type mismatch       |
@@ -139,10 +144,11 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
 | alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |
 | jsgt_must_be_signed            | `r1 = -1; r2 = 0; jsgt r1, r2, +1; exit; r0 = 1; exit`          | signed compare must prune the taken path |
-| computed_offset_misaligned     | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment not provable    |
-| computed_offset_out_of_frame   | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset can leave the frame       |
+| computed_ptr_out_of_frame_access | `r6 = r10; r6 += -8; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = [r6]; exit` | computed pointer out-of-frame *access* rejected (#87) |
+| computed_ptr_misaligned_access | `r6 = r10; r6 += -8; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = [r6]; exit` | computed pointer access alignment not provable (#87) |
+| computed_ptr_indirect_read_uninit | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = [r6]; exit` | variable-offset read over uninitialized slots (#87) |
+| computed_ptr_indirect_read_spill | `[r10-8] = r1; r6 = r10; r6 += -16; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 8; r6 += r2; r0 = [r6]; exit` | variable-offset read over a spilled pointer (#87) |
 | non_converging_loop            | `r0 = 0; r1 = 0; r1 += 1; jeq r1, r1, -2; exit`                    | non-converging loop (loop budget)         |
 | alu32_uninit                   | `w2 += 5; exit`                                     | ALU32 read of an uninitialized register   |
 | loop_no_exit                   | `jmp -1`                                           | loop whose subprogram does not end with exit |
-| overflowed_range_out_of_frame   | `r6 = r10; r6 += -32; call 7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | overflowed range cannot be in-frame       |
 | immediate_compare_uninit | `jeq r2, 5, +2; r0 = 1; exit; r0 = 0; exit`                     | immediate compare reads an uninitialized register (#57) |

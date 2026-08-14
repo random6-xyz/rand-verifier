@@ -31,10 +31,20 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
     } else if msg.contains("arithmetic")
         || msg.contains("invalid comparison")
         || msg.contains("comparing pointers")
+        || msg.contains("non-stack pointer")
+        || msg.contains("through a scalar")
     {
+        // "... pointer arithmetic ...", "stack access through a
+        // non-stack pointer / a scalar ..." — the kernel says
+        // "invalid mem access"
         ReasonCategory::PointerArith
+    } else if msg.contains("indirect read") {
+        // "invalid indirect read from stack ... spilled ..." — the
+        // kernel rejects variable-offset reads over spilled registers
+        ReasonCategory::UninitRead
     } else if msg.contains("stack access") || msg.contains("stack pointer") {
         // "stack access at r10 ... exceeds/points away",
+        // "stack access at r6+0 with base offsets ...",
         // "stack pointer ... may leave/are out of the frame"
         ReasonCategory::StackBounds
     } else if msg.contains("helper") || msg.contains("expected") {
@@ -203,12 +213,20 @@ mod tests {
                 ReasonCategory::StackBounds,
             ),
             (
-                "stack pointer r5 offsets -600..-600 are out of the 512 byte frame",
+                "stack access at r6+0 with base offsets -8..240 exceeds the 512 byte frame",
                 ReasonCategory::StackBounds,
             ),
             (
-                "stack pointer r5 may leave the 512 byte frame (computed offsets)",
-                ReasonCategory::StackBounds,
+                "stack access through a non-stack pointer r1 is not supported",
+                ReasonCategory::PointerArith,
+            ),
+            (
+                "stack access through a scalar r2 is not supported",
+                ReasonCategory::PointerArith,
+            ),
+            (
+                "invalid indirect read from stack at r6+0: spilled PTR_CTX at offset -8",
+                ReasonCategory::UninitRead,
             ),
             (
                 "stack access at r10-4 is not 8-byte aligned",
