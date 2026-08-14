@@ -377,10 +377,10 @@ mod tests {
             let insns = gen_idiom(seed, Idiom::SpillFill);
             let st = insns
                 .iter()
-                .position(|i| matches!(i, BpfInsn::StStack { .. }));
+                .position(|i| matches!(i, BpfInsn::StMem { .. }));
             let ld = insns
                 .iter()
-                .position(|i| matches!(i, BpfInsn::LdStack { .. }));
+                .position(|i| matches!(i, BpfInsn::LdMem { .. }));
             assert!(
                 matches!((st, ld), (Some(s), Some(l)) if s < l),
                 "spill/fill seed {seed}"

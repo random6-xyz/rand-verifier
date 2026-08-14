@@ -127,8 +127,8 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // v0.6 kernel-accepts fixtures are design behaviour
                 // (e.g. stack_write_before_read under privilege)
                 SideVerdict::Accept => {
-                    if whitelisted(name, mini, kernel).is_some()
-                        || is_privileged_uninit_stack(mini, *mini_reason)
+                    if whitelisted(name, mini, kernel, *mini_reason).is_some()
+                        || crate::diff::privileged_stack_leniency(mini, *mini_reason)
                     {
                         Finding::Whitelisted
                     } else {
@@ -143,7 +143,7 @@ pub fn classify(input: &OracleInput) -> Finding {
             SideVerdict::Skipped => Finding::Skipped,
             SideVerdict::Accept => match mini {
                 SideVerdict::Reject { .. } => {
-                    if whitelisted(name, mini, kernel).is_some() {
+                    if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                         Finding::Whitelisted
                     } else {
                         Finding::RvPrecisionGap
@@ -153,7 +153,7 @@ pub fn classify(input: &OracleInput) -> Finding {
             },
             SideVerdict::Reject { category } => {
                 // name-based diff whitelist (kernel-accepts fixtures)
-                if whitelisted(name, mini, kernel).is_some() {
+                if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                     return Finding::Whitelisted;
                 }
                 // strict mode: unprivileged-equivalent kernel rules are
@@ -182,23 +182,15 @@ pub fn classify(input: &OracleInput) -> Finding {
 }
 
 /// Privileged loads allow uninit stack reads by design
-/// (`allow_uninit_stack`; `bpf_ns_capable` treats CAP_SYS_ADMIN as a
-/// superset of every BPF cap — verified against kernel/bpf/token.c in
-/// v0.6). mini rejects those with "stack slot ... is uninitialized",
-/// while the kernel accepts under privilege — the same design
-/// difference as the v0.6 `stack_write_before_read` whitelist, applied
-/// by category so it also covers fuzzer-generated programs (found
-/// empirically as mseed-5-19 in the first kernel-backed campaign,
-/// #73). Uninit *register* reads stay soundness candidates — the
-/// kernel rejects those too, so a kernel accept would be a real bug.
-fn is_privileged_uninit_stack(mini: &SideVerdict, mini_reason: Option<&str>) -> bool {
-    matches!(
-        mini,
-        SideVerdict::Reject {
-            category: ReasonCategory::UninitRead
-        }
-    ) && mini_reason.is_some_and(|r| r.contains("stack slot"))
-}
+/// Privileged-load stack leniency, shared with the diff whitelist
+/// (#90): mini rejects uninitialized stack reads and indirect reads
+/// over spilled pointers that the kernel accepts under privilege
+/// (allow_uninit_stack / allow_ptr_leaks; CAP_SYS_ADMIN superset rule,
+/// kernel/bpf/token.c). Applied by category so it covers fuzzer-
+/// generated programs (found empirically as mseed-5-19 in the first
+/// kernel-backed campaign, #73). Uninit *register* reads stay
+/// soundness candidates — the kernel rejects those too.
+pub use crate::diff::privileged_stack_leniency as is_privileged_uninit_stack;
 
 /// Classify a verified program from its environment — the binary-
 /// facing wrapper for the campaign runner (#69): reads the concrete
@@ -363,7 +355,9 @@ mod tests {
             ),
             Finding::Whitelisted
         );
-        // the same pair under a fuzzer-generated name is a finding
+        // the same pair under a fuzzer-generated name is whitelisted
+        // too — mini's exploration budget is a category-based design
+        // difference (#90)
         assert_eq!(
             classify_with(
                 rej(ReasonCategory::Complexity),
@@ -372,7 +366,7 @@ mod tests {
                 "seed-1-3",
                 false
             ),
-            Finding::RvPrecisionGap
+            Finding::Whitelisted
         );
         // strict mode whitelists the !root kernel rules even when mini
         // rejects for a different reason...
@@ -406,13 +400,9 @@ mod tests {
     /// unprivileged too.
     #[test]
     fn corpus_reproduction_v06() {
-        let kernel_accepts = [
-            "complexity_limit",
-            "computed_offset_misaligned",
-            "computed_offset_out_of_frame",
-            "pointer_reg_arith",
-            "stack_write_before_read",
-        ];
+        // remaining kernel-accepts reject fixtures (the computed-offset
+        // and pointer-arith fixtures moved to accept in #87)
+        let kernel_accepts = ["complexity_limit", "stack_write_before_read"];
         for dir in ["tests/programs/accept", "tests/programs/reject"] {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -429,8 +419,11 @@ mod tests {
                     Verdict::Safe => acc(),
                     Verdict::Unsafe(failure) => rej(crate::diff::categorize_mini_reason(failure)),
                 };
-                let concrete =
-                    concrete_side(env.concrete_report.as_ref().expect("concrete report"));
+                let concrete = match env.concrete_report.as_ref() {
+                    Some(report) => concrete_side(report),
+                    // decode-error rejects have no concrete run
+                    None => continue,
+                };
 
                 // kernel verdict from the v0.6 privileged run: all
                 // accept fixtures accepted; the five kernel-accepts

@@ -18,8 +18,9 @@ use std::process;
 
 use rand_verifier::diff::{DiffClass, SideVerdict, categorize_mini_reason, classify, whitelisted};
 use rand_verifier::env::BpfVerifierEnv;
+use rand_verifier::env::parse_maps_sidecar;
 use rand_verifier::error::Verdict;
-use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel};
+use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel_maps};
 
 /// One compared program: the two verdicts plus the classification.
 struct DiffEntry {
@@ -55,7 +56,8 @@ fn run_one(path: &Path) -> DiffEntry {
 
     // kernel side
     let data = fs::read(path).unwrap();
-    let (kernel, kernel_message) = match load_with_kernel(&data) {
+    let maps = parse_maps_sidecar(path.to_str().unwrap());
+    let (kernel, kernel_message) = match load_with_kernel_maps(&data, &maps) {
         KernelOutcome::Accept => (SideVerdict::Accept, None),
         KernelOutcome::Reject {
             message, category, ..
@@ -69,7 +71,7 @@ fn run_one(path: &Path) -> DiffEntry {
     };
 
     let class = classify(&mini, &kernel);
-    let whitelist = whitelisted(&name, &mini, &kernel);
+    let whitelist = whitelisted(&name, &mini, &kernel, mini_reason.as_deref());
     DiffEntry {
         name,
         mini,

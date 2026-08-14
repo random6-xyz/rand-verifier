@@ -219,12 +219,27 @@ pub(crate) enum RegState {
         align_off: u8,
     },
     PtrToCtx,
-    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP). Never
-    /// constructed yet — program loading that injects it lands in Meso.
-    #[allow(dead_code)] // constructed only by program loading (Meso)
-    PtrToMap,
-    PtrToMapValue,
-    PtrToMapValueOrNull,
+    /// A fixed map pointer (kernel's CONST_PTR_TO_MAP) carrying the
+    /// map metadata resolved at load time (#89).
+    PtrToMap {
+        key_size: u32,
+        value_size: u32,
+    },
+    /// A pointer into a map value (non-null) — an offset interval
+    /// within the value; bounds are validated at access time against
+    /// `value_size` (#89, kernel check_map_access).
+    PtrToMapValue {
+        min_offset: i32,
+        max_offset: i32,
+        /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
+        align_off: u8,
+        value_size: u32,
+    },
+    /// Nullable map value pointer; must pass a NULL check before use
+    /// (#27). Carries the map's value size for the refinement (#89).
+    PtrToMapValueOrNull {
+        value_size: u32,
+    },
 }
 
 impl std::fmt::Display for RegState {
@@ -248,9 +263,29 @@ impl std::fmt::Display for RegState {
                 }
             }
             RegState::PtrToCtx => write!(f, "PTR_CTX"),
-            RegState::PtrToMap => write!(f, "PTR_MAP"),
-            RegState::PtrToMapValue => write!(f, "PTR_MAP_VALUE"),
-            RegState::PtrToMapValueOrNull => write!(f, "PTR_MAP_VALUE_OR_NULL"),
+            RegState::PtrToMap {
+                key_size,
+                value_size,
+            } => write!(f, "PTR_MAP(k:{},v:{})", key_size, value_size),
+            RegState::PtrToMapValue {
+                min_offset,
+                max_offset,
+                value_size,
+                ..
+            } => {
+                if min_offset == max_offset {
+                    write!(f, "PTR_MAP_VALUE({},sz:{})", min_offset, value_size)
+                } else {
+                    write!(
+                        f,
+                        "PTR_MAP_VALUE({}..{},sz:{})",
+                        min_offset, max_offset, value_size
+                    )
+                }
+            }
+            RegState::PtrToMapValueOrNull { value_size } => {
+                write!(f, "PTR_MAP_VALUE_OR_NULL(sz:{})", value_size)
+            }
         }
     }
 }
@@ -289,6 +324,10 @@ pub(crate) const STACK_SLOTS: usize = STACK_SIZE / STACK_SLOT_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StackSlot {
     Uninit,
+    /// Written by a variable-offset store: initialized, but the spilled
+    /// register state is lost (kernel: variable-offset writes destroy
+    /// spilled pointers; loads yield an unknown scalar, #87).
+    Initialized,
     Spilled(RegState),
 }
 
@@ -296,6 +335,7 @@ impl std::fmt::Display for StackSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StackSlot::Uninit => write!(f, "UNINIT"),
+            StackSlot::Initialized => write!(f, "INITIALIZED"),
             StackSlot::Spilled(state) => write!(f, "SPILLED({})", state),
         }
     }
@@ -314,42 +354,6 @@ impl StackState {
             slots: [StackSlot::Uninit; STACK_SLOTS],
         }
     }
-}
-
-/// Map an r10-relative stack offset to a slot index.
-///
-/// Offsets must point into the frame (r10-512..r10-8) and be 8-byte
-/// aligned: -8 → slot 0, -16 → slot 1, ..., -512 → slot 63. Each kind
-/// of bounds violation is reported with its own message (#19).
-pub(crate) fn stack_slot_index(pc: u32, offset: i32) -> Result<usize, VerificationFailure> {
-    // wrong direction: r10 + N, or the frame pointer itself (r10 + 0)
-    if offset >= 0 {
-        return Err(VerificationFailure::new(
-            pc,
-            format!(
-                "stack access at r10{:+} points away from the frame (valid: r10-512..r10-8)",
-                offset
-            ),
-        ));
-    }
-    // beyond the frame
-    if offset < -(STACK_SIZE as i32) {
-        return Err(VerificationFailure::new(
-            pc,
-            format!(
-                "stack access at r10{:+} exceeds the {} byte frame",
-                offset, STACK_SIZE
-            ),
-        ));
-    }
-    // slot alignment
-    if offset % (STACK_SLOT_SIZE as i32) != 0 {
-        return Err(VerificationFailure::new(
-            pc,
-            format!("stack access at r10{:+} is not 8-byte aligned", offset),
-        ));
-    }
-    Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
 }
 
 // ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
@@ -437,9 +441,9 @@ pub(crate) fn read_scalar(
         RegState::Scalar(bounds) => Ok(bounds),
         RegState::PtrToStack { .. }
         | RegState::PtrToCtx
-        | RegState::PtrToMap
-        | RegState::PtrToMapValue
-        | RegState::PtrToMapValueOrNull => Err(VerificationFailure::new(
+        | RegState::PtrToMap { .. }
+        | RegState::PtrToMapValue { .. }
+        | RegState::PtrToMapValueOrNull { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
@@ -500,11 +504,27 @@ mod tests {
         );
         assert_eq!(ptr_stack(-8).to_string(), "PTR_STACK(-8)");
         assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
-        assert_eq!(RegState::PtrToMap.to_string(), "PTR_MAP");
-        assert_eq!(RegState::PtrToMapValue.to_string(), "PTR_MAP_VALUE");
         assert_eq!(
-            RegState::PtrToMapValueOrNull.to_string(),
-            "PTR_MAP_VALUE_OR_NULL"
+            RegState::PtrToMap {
+                key_size: 4,
+                value_size: 8,
+            }
+            .to_string(),
+            "PTR_MAP(k:4,v:8)"
+        );
+        assert_eq!(
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            }
+            .to_string(),
+            "PTR_MAP_VALUE(0,sz:8)"
+        );
+        assert_eq!(
+            RegState::PtrToMapValueOrNull { value_size: 8 }.to_string(),
+            "PTR_MAP_VALUE_OR_NULL(sz:8)"
         );
     }
 
@@ -651,7 +671,16 @@ mod tests {
     fn st_stack_writes_scalar_slot() {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
-        let next = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
         // the full scalar range is spilled, not just an initialized marker
         assert_eq!(
             next.stack.slots[0],
@@ -669,8 +698,9 @@ mod tests {
         let next = step(
             0,
             &state,
-            &BpfInsn::StStack {
+            &BpfInsn::StMem {
                 src: 2,
+                base: 10,
                 offset: -512,
             },
         )
@@ -686,7 +716,16 @@ mod tests {
     fn st_stack_rejects_uninit_src() {
         // storing r0 before it is written → #14 error
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap_err();
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 0,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
 
@@ -694,7 +733,16 @@ mod tests {
     fn st_stack_spills_pointer() {
         // pointers are now spilled with their full state (#30)
         let state = VerifierState::initial();
-        let next = step(0, &state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
         assert_eq!(next.stack.slots[0], StackSlot::Spilled(RegState::PtrToCtx));
     }
 
@@ -702,8 +750,26 @@ mod tests {
     fn ld_stack_restores_pointer() {
         // spill r1 (PtrToCtx), then restore it into r5
         let state = VerifierState::initial();
-        let state = step(0, &state, &BpfInsn::StStack { src: 1, offset: -8 }).unwrap();
-        let next = step(0, &state, &BpfInsn::LdStack { dst: 5, offset: -8 }).unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 5,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
         assert_eq!(next.regs[5], RegState::PtrToCtx);
     }
 
@@ -712,18 +778,57 @@ mod tests {
         // an OrNull pointer survives spill/fill — the NULL check is still
         // required after the fill
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull;
-        let state = step(0, &state, &BpfInsn::StStack { src: 0, offset: -8 }).unwrap();
-        let next = step(0, &state, &BpfInsn::LdStack { dst: 5, offset: -8 }).unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToMapValueOrNull);
+        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 0,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 5,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next.regs[5],
+            RegState::PtrToMapValueOrNull { value_size: 8 }
+        );
     }
 
     #[test]
     fn ld_stack_after_store() {
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
-        let state = step(0, &state, &BpfInsn::StStack { src: 2, offset: -8 }).unwrap();
-        let next = step(0, &state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap();
+        let state = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap();
         // the spilled range is restored exactly (#30)
         assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(10)));
     }
@@ -732,7 +837,16 @@ mod tests {
     fn ld_stack_before_store_rejected() {
         // issue example: load [r10 - 8] with no prior store → REJECT
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap_err();
         assert!(err.message.contains("uninitialized"));
         assert!(err.message.contains("write before read"));
     }
@@ -745,13 +859,23 @@ mod tests {
         let state = step(
             0,
             &state,
-            &BpfInsn::StStack {
+            &BpfInsn::StMem {
                 src: 2,
+                base: 10,
                 offset: -16,
             },
         )
         .unwrap();
-        let err = step(0, &state, &BpfInsn::LdStack { dst: 0, offset: -8 }).unwrap_err();
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
+        )
+        .unwrap_err();
         assert!(err.message.contains("write before read"));
     }
 
@@ -760,15 +884,25 @@ mod tests {
         let state = VerifierState::initial();
         // wrong direction: r10 + N (positive) and the frame pointer itself (0)
         for offset in [8, 0] {
-            let err = step(0, &state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+            let err = step(
+                0,
+                &state,
+                &BpfInsn::LdMem {
+                    dst: 0,
+                    base: 10,
+                    offset,
+                },
+            )
+            .unwrap_err();
             assert!(err.message.contains("points away"), "offset {}", offset);
         }
         // beyond the 512-byte frame
         let err = step(
             0,
             &state,
-            &BpfInsn::LdStack {
+            &BpfInsn::LdMem {
                 dst: 0,
+                base: 10,
                 offset: -520,
             },
         )
@@ -776,7 +910,16 @@ mod tests {
         assert!(err.message.contains("exceeds"));
         // not 8-byte aligned
         for offset in [-7, -4] {
-            let err = step(0, &state, &BpfInsn::LdStack { dst: 0, offset }).unwrap_err();
+            let err = step(
+                0,
+                &state,
+                &BpfInsn::LdMem {
+                    dst: 0,
+                    base: 10,
+                    offset,
+                },
+            )
+            .unwrap_err();
             assert!(
                 err.message.contains("not 8-byte aligned"),
                 "offset {}",
@@ -784,7 +927,16 @@ mod tests {
             );
         }
         // a store with a wrong-direction offset is rejected too
-        let err = step(0, &state, &BpfInsn::StStack { src: 1, offset: 8 }).unwrap_err();
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: 8,
+            },
+        )
+        .unwrap_err();
         assert!(err.message.contains("points away"));
     }
 
@@ -794,8 +946,17 @@ mod tests {
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         // both frame edges are valid
         for offset in [-8, -512] {
-            let next = step(0, &state, &BpfInsn::StStack { src: 2, offset }).unwrap();
-            let idx = stack_slot_index(0, offset as i32).unwrap();
+            let next = step(
+                0,
+                &state,
+                &BpfInsn::StMem {
+                    src: 2,
+                    base: 10,
+                    offset,
+                },
+            )
+            .unwrap();
+            let idx = ((-offset) as usize - 8) / 8;
             assert_eq!(
                 next.stack.slots[idx],
                 StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(10)))
@@ -804,18 +965,20 @@ mod tests {
         // one byte beyond each edge is rejected
         for offset in [-7, -513] {
             assert!(
-                step(0, &state, &BpfInsn::StStack { src: 2, offset }).is_err(),
+                step(
+                    0,
+                    &state,
+                    &BpfInsn::StMem {
+                        src: 2,
+                        base: 10,
+                        offset,
+                    }
+                )
+                .is_err(),
                 "offset {}",
                 offset
             );
         }
-    }
-
-    #[test]
-    fn stack_slot_index_mapping() {
-        assert_eq!(stack_slot_index(0, -8).unwrap(), 0);
-        assert_eq!(stack_slot_index(0, -16).unwrap(), 1);
-        assert_eq!(stack_slot_index(0, -512).unwrap(), 63);
     }
 
     // ── step (v0.2) ──────────────────────────────────────────────────────────

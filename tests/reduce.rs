@@ -4,9 +4,12 @@
 //!
 //! Fixtures under `tests/data/reduce/`:
 //! - `verdict-flip-mseed-5-3` — a real mutation-mode flip (kernel-
-//!   independent; reduces unprivileged);
-//! - `rv-precision-gap-mseed-5-99` — the v0.7 kernel-backed gap
-//!   (kernel-dependent; used by the privileged CI job with --kernel).
+//!   independent; reduces unprivileged).
+//!
+//! The former kernel-dependent fixture (`rv-precision-gap-mseed-5-99`)
+//! was absorbed into the accept corpus as `computed_pointer_no_access`
+//! once #87 moved pointer validation to access time — there is no
+//! kernel-dependent finding left to pin.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,7 +18,6 @@ use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::reduce::{ReduceConfig, evaluate_bytes, reduce_finding};
 
 const VERDICT_FLIP: &str = "tests/data/reduce/verdict-flip-mseed-5-3";
-const RV_GAP: &str = "tests/data/reduce/rv-precision-gap-mseed-5-99";
 
 fn reduce_bin() -> &'static str {
     env!("CARGO_BIN_EXE_reduce")
@@ -83,22 +85,6 @@ fn cli_success_reduces_fixture_exit_0() {
 }
 
 #[test]
-fn cli_kernel_dependent_without_kernel_exits_2() {
-    let out = Command::new(reduce_bin())
-        .args([RV_GAP, "--out-dir"])
-        .arg(scratch("kern"))
-        .output()
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a kernel-dependent finding must refuse to reduce without --kernel"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("kernel column required"), "{stderr}");
-}
-
-#[test]
 fn cli_reduces_all_groups() {
     // build a groups root with one copied group
     let root = scratch("groups");
@@ -148,27 +134,6 @@ fn fixture_verdict_flip_reduces_and_preserves() {
     assert!(counts.windows(2).all(|w| w[0] >= w[1]), "{counts:?}");
 }
 
-#[test]
-fn fixture_kernel_dependent_refuses_unprivileged() {
-    let err = reduce_finding(
-        PathBuf::from(RV_GAP).as_path(),
-        &scratch("lib-k"),
-        &ReduceConfig {
-            budget: 0,
-            kernel: false,
-            strict: false,
-        },
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            rand_verifier::fuzz::reduce::ReduceError::KernelRequired(_)
-        ),
-        "{err:?}"
-    );
-}
-
 // ── determinism ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -194,25 +159,24 @@ fn fixture_reduction_is_deterministic() {
 fn fixture_replay_matches_meta() {
     // the mini side recorded in meta.json must reproduce — the
     // fixtures stay meaningful across verifier changes (#76 contract)
-    for dir in [VERDICT_FLIP, RV_GAP] {
-        let bytes = std::fs::read(format!("{dir}/prog.bin")).unwrap();
-        let mut env = rand_verifier::env::BpfVerifierEnv::new();
-        env.setup_prog_bytes(&bytes).unwrap();
-        match env.verify().unwrap() {
-            Verdict::Safe => panic!("{dir}: fixture must reject"),
-            Verdict::Unsafe(failure) => {
-                let category = rand_verifier::diff::categorize_mini_reason(&failure);
-                let meta = std::fs::read_to_string(format!("{dir}/meta.json")).unwrap();
-                // the recorded mini line, e.g. "mini": "REJECT(UninitRead)"
-                let recorded = meta
-                    .lines()
-                    .find(|l| l.contains("\"mini\""))
-                    .unwrap_or_else(|| panic!("{dir}: meta.json without a mini line"));
-                assert!(
-                    recorded.contains(&format!("{category:?}")),
-                    "{dir}: mini {category:?} not in {recorded}"
-                );
-            }
+    let dir = VERDICT_FLIP;
+    let bytes = std::fs::read(format!("{dir}/prog.bin")).unwrap();
+    let mut env = rand_verifier::env::BpfVerifierEnv::new();
+    env.setup_prog_bytes(&bytes).unwrap();
+    match env.verify().unwrap() {
+        Verdict::Safe => panic!("{dir}: fixture must reject"),
+        Verdict::Unsafe(failure) => {
+            let category = rand_verifier::diff::categorize_mini_reason(&failure);
+            let meta = std::fs::read_to_string(format!("{dir}/meta.json")).unwrap();
+            // the recorded mini line, e.g. "mini": "REJECT(UninitRead)"
+            let recorded = meta
+                .lines()
+                .find(|l| l.contains("\"mini\""))
+                .unwrap_or_else(|| panic!("{dir}: meta.json without a mini line"));
+            assert!(
+                recorded.contains(&format!("{category:?}")),
+                "{dir}: mini {category:?} not in {recorded}"
+            );
         }
     }
 }

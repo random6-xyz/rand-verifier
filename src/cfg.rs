@@ -63,6 +63,7 @@ pub(crate) fn visit_insn(
                     ),
                 ));
             }
+            check_ldimm64_target(idx, target, insns)?;
             vec![target]
         }
         // conditional branches — branch target + fall-through
@@ -97,6 +98,7 @@ pub(crate) fn visit_insn(
                     ),
                 ));
             }
+            check_ldimm64_target(idx, target, insns)?;
             vec![target, idx + 1]
         }
         // helper calls (imm = helper id, kernel convention) fall
@@ -115,6 +117,28 @@ pub(crate) fn visit_insn(
     }
 
     Ok(nexts)
+}
+
+/// Reject branch targets that land on the second slot of an ldimm64
+/// (kernel: "jump into the middle of ldimm64 insn", #89).
+fn check_ldimm64_target(
+    idx: u32,
+    target: u32,
+    insns: &[BpfInsn],
+) -> Result<(), VerificationFailure> {
+    if matches!(
+        insns.get(target as usize),
+        Some(BpfInsn::LdImm64Second { .. })
+    ) {
+        return Err(VerificationFailure::new(
+            idx,
+            format!(
+                "jump target {} lands in the middle of an ldimm64 instruction",
+                target
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Check the control flow graph with an iterative DFS:
@@ -195,6 +219,80 @@ pub(crate) fn check_cfg(
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
+
+/// The set of instructions that lie on a cycle (#90): a revisited
+/// state at one of these pcs is an infinite loop (the kernel rejects
+/// with "infinite loop detected", states.c). Computed as the union,
+/// over every back edge (a -> b), of the nodes reachable from the head
+/// `b` that can still reach the back edge's source `a`.
+pub(crate) fn compute_loop_pcs(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+    loop_heads: &[u32],
+) -> Vec<u32> {
+    // the back-edge sources: every jump/branch whose target is a loop head
+    let mut back_sources = Vec::new();
+    for (idx, _insn) in insns.iter().enumerate() {
+        let idx = idx as u32;
+        let nexts = match visit_insn(idx, insns, subprogs) {
+            Ok(nexts) => nexts,
+            Err(_) => continue,
+        };
+        for nxt in nexts {
+            if loop_heads.contains(&nxt) {
+                back_sources.push(idx);
+            }
+        }
+    }
+    let mut in_loop = vec![false; insns.len()];
+    for &head in loop_heads {
+        // nodes forward-reachable from the head
+        let mut fwd = vec![false; insns.len()];
+        let mut stack = vec![head];
+        fwd[head as usize] = true;
+        while let Some(v) = stack.pop() {
+            if let Ok(nexts) = visit_insn(v, insns, subprogs) {
+                for nxt in nexts {
+                    if !fwd[nxt as usize] {
+                        fwd[nxt as usize] = true;
+                        stack.push(nxt);
+                    }
+                }
+            }
+        }
+        // nodes backward-reachable to some back-edge source of this head
+        for &src in &back_sources {
+            let mut bwd = vec![false; insns.len()];
+            let mut stack = vec![src];
+            bwd[src as usize] = true;
+            while let Some(v) = stack.pop() {
+                for (idx, _) in insns.iter().enumerate() {
+                    let idx = idx as u32;
+                    if bwd[idx as usize] {
+                        continue;
+                    }
+                    if let Ok(nexts) = visit_insn(idx, insns, subprogs)
+                        && nexts.contains(&v)
+                    {
+                        bwd[idx as usize] = true;
+                        stack.push(idx);
+                    }
+                }
+            }
+            for (i, f) in fwd.iter().enumerate() {
+                if *f && bwd[i] {
+                    in_loop[i] = true;
+                }
+            }
+        }
+    }
+    in_loop
+        .iter()
+        .enumerate()
+        .filter(|(_, in_loop)| **in_loop)
+        .map(|(i, _)| i as u32)
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -356,6 +454,34 @@ mod tests {
             BpfInsn::Exit,
         ];
         assert!(check_cfg(&insns, &[0]).is_ok());
+    }
+
+    #[test]
+    fn check_cfg_ldimm64_pairs_are_transparent() {
+        // an ldimm64 pair (instruction + second-slot marker) falls
+        // through normally; a branch may target the instruction but
+        // never the marker (#89)
+        let insns = vec![
+            BpfInsn::LdImm64 { dst: 0, imm: 7 },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        assert!(check_cfg(&insns, &[0]).is_ok());
+        // a branch into the marker is rejected
+        let insns = vec![
+            BpfInsn::Jmp { offset: 1 }, // target = 2 (the marker)
+            BpfInsn::LdImm64 { dst: 0, imm: 7 },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let err = check_cfg(&insns, &[0]).unwrap_err();
+        assert!(
+            err.message.contains("middle of an ldimm64"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

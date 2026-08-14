@@ -30,7 +30,9 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
         // BPF_FUNC_map_lookup_elem: map_lookup(map, key)
         1 => Some(&HelperPrototype {
             args: &[ArgType::PtrToMap, ArgType::PtrToStack],
-            return_type: RegState::PtrToMapValueOrNull,
+            // the value size is filled from R1's map metadata at the
+            // call site (the kernel builds the return from the map)
+            return_type: RegState::PtrToMapValueOrNull { value_size: 0 },
         }),
         // BPF_FUNC_map_update_elem: map_update(map, key, value, flags)
         2 => Some(&HelperPrototype {
@@ -78,7 +80,7 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
 fn arg_matches(expected: ArgType, actual: RegState) -> bool {
     matches!(
         (expected, actual),
-        (ArgType::PtrToMap, RegState::PtrToMap)
+        (ArgType::PtrToMap, RegState::PtrToMap { .. })
             | (ArgType::PtrToStack, RegState::PtrToStack { .. })
             | (ArgType::Scalar, RegState::Scalar(_))
     )

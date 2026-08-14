@@ -127,8 +127,16 @@ mod tests {
         // registers, stack, and pointers all visible in one trace
         let program = vec![
             BpfInsn::MovImm { dst: 2, imm: 10 },
-            BpfInsn::StStack { src: 2, offset: -8 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::AddImm { dst: 10, imm: -8 },
             BpfInsn::Exit,
         ];

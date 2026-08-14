@@ -1,7 +1,0 @@
-{
-  "label": "rv-precision-gap",
-  "name": "mseed-5-99",
-  "finding": "rv-precision-gap",
-  "mini": "REJECT(StackBounds)",
-  "kernel": "ACCEPT"
-}

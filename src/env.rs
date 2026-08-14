@@ -1,16 +1,72 @@
 // ── BPF program loading and the verification environment ────────────────────
 
+use std::collections::HashMap;
 use std::fs;
 
 use anyhow::Result;
 
 use crate::cfg::{add_subprog, check_cfg};
 use crate::concrete::{
-    ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report, run_concrete,
+    ConcreteLimits, ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report,
+    run_concrete_with_maps,
 };
 use crate::error::{Verdict, VerificationFailure};
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::{BpfInsn, decode_program};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
+
+/// Parse a `<name>.maps` JSON sidecar into a map registry (fd → info).
+pub fn parse_maps_sidecar(name: &str) -> HashMap<u32, MapInfo> {
+    let sidecar = format!("{}.maps", name);
+    let Ok(text) = fs::read_to_string(&sidecar) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<HashMap<String, MapInfo>>(&text) else {
+        eprintln!("warning: ignoring unparseable maps sidecar {}", sidecar);
+        return HashMap::new();
+    };
+    let mut maps = HashMap::new();
+    for (fd, info) in entries {
+        if let Ok(fd) = fd.parse::<u32>() {
+            maps.insert(fd, info);
+        }
+    }
+    maps
+}
+
+/// Map metadata carried by `PtrToMap` and needed for key/value argument
+/// validation and map-value access bounds (#89). Mirrors the kernel's
+/// `struct bpf_map` attributes relevant to verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct MapInfo {
+    /// Kernel map type (only ARRAY is implemented so far).
+    pub map_type: MapType,
+    /// The key size in bytes.
+    pub key_size: u32,
+    /// The value size in bytes.
+    pub value_size: u32,
+    /// Maximum number of entries.
+    pub max_entries: u32,
+}
+
+/// The subset of kernel `enum bpf_map_type` supported by the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MapType {
+    #[default]
+    Array,
+}
+
+impl MapInfo {
+    /// The default test map: ARRAY, 4-byte key, 8-byte value, one entry.
+    pub fn array_default() -> Self {
+        Self {
+            map_type: MapType::Array,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        }
+    }
+}
 
 /// A loaded BPF program: raw bytecode plus decoded instructions and
 /// subprogram entry points.
@@ -36,6 +92,10 @@ pub struct BpfVerifierEnv {
     pub(crate) prog: BpfProg, // BPF program data
     /// The concrete-side report of the last `verify()` call (v0.5).
     pub(crate) concrete_report: Option<ConcreteReport>,
+    /// Map fd → metadata, resolved at load time for ldimm64 pseudo
+    /// instructions (#89; kernel: check_ld_imm64 resolves the fd
+    /// against the loader's table).
+    pub(crate) maps: HashMap<u32, MapInfo>,
 }
 
 impl BpfVerifierEnv {
@@ -44,10 +104,26 @@ impl BpfVerifierEnv {
     }
 
     /// Load a BPF program from a binary file and return the instruction count.
+    /// A sibling `<name>.maps` JSON sidecar ({"<fd>": {"map_type": "array",
+    /// "key_size": 4, "value_size": 8, "max_entries": 1}}) registers the
+    /// maps referenced by ldimm64 pseudo instructions (#89).
     pub fn setup_prog(&mut self, name: String) -> Result<u32> {
+        self.load_maps_sidecar(&name);
         let raw_data =
             fs::read(&name).map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", name, e))?;
         self.load_raw(raw_data, &name)
+    }
+
+    /// Register a map in the environment (kernel: the loader's fd table).
+    pub fn register_map(&mut self, fd: u32, info: MapInfo) {
+        self.maps.insert(fd, info);
+    }
+
+    /// Load map metadata from a `<name>.maps` JSON sidecar, if present.
+    pub fn load_maps_sidecar(&mut self, name: &str) {
+        for (fd, info) in parse_maps_sidecar(name) {
+            self.register_map(fd, info);
+        }
     }
 
     /// Load a BPF program from an in-memory byte buffer (the raw
@@ -80,17 +156,63 @@ impl BpfVerifierEnv {
         let insn_cnt = (raw_data.len() / 8) as u32;
 
         // decode every 8-byte instruction; the first decode error stops
-        // the decode (like the kernel's per-instruction check loop)
+        // the decode (like the kernel's per-instruction check loop).
+        // ldimm64 (0x18) occupies two slots and is decoded as the
+        // instruction plus a transparent marker entry (#89).
         let mut insns = Vec::with_capacity(insn_cnt as usize);
         let mut decode_error = None;
-        for (idx, chunk) in raw_data.chunks_exact(8).enumerate() {
-            match parse_insn(chunk) {
-                Ok(insn) => insns.push(insn),
-                Err(e) => {
-                    decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
-                    insns.clear();
-                    break;
+        match decode_program(&raw_data) {
+            Ok(decoded) => insns = decoded,
+            Err((idx, e)) => {
+                decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
+            }
+        }
+        // resolve map fds from the registry at load time (kernel:
+        // check_ld_imm64 resolves the fd against the loader's table)
+        if decode_error.is_none() {
+            for (i, insn) in insns.iter_mut().enumerate() {
+                match insn {
+                    BpfInsn::LdMapFd {
+                        fd,
+                        key_size,
+                        value_size,
+                        ..
+                    } => match self.maps.get(fd) {
+                        Some(info) => {
+                            *key_size = info.key_size;
+                            *value_size = info.value_size;
+                        }
+                        None => {
+                            decode_error = Some(VerificationFailure::new(
+                                i as u32,
+                                format!("unknown map fd {}", fd),
+                            ));
+                            break;
+                        }
+                    },
+                    BpfInsn::LdMapValue {
+                        fd,
+                        key_size,
+                        value_size,
+                        ..
+                    } => match self.maps.get(fd) {
+                        Some(info) => {
+                            *key_size = info.key_size;
+                            *value_size = info.value_size;
+                        }
+                        None => {
+                            decode_error = Some(VerificationFailure::new(
+                                i as u32,
+                                format!("unknown map fd {}", fd),
+                            ));
+                            break;
+                        }
+                    },
+                    _ => {}
                 }
+            }
+            if decode_error.is_some() {
+                insns.clear();
             }
         }
 
@@ -141,7 +263,12 @@ impl BpfVerifierEnv {
                 // soundness question (every concrete visited state must
                 // be covered by an abstract state at the same pc)
                 let mut report = ConcreteReport::default();
-                match run_concrete(&self.prog.insns, &loop_heads) {
+                match run_concrete_with_maps(
+                    &self.prog.insns,
+                    &loop_heads,
+                    &ConcreteLimits::default(),
+                    &self.maps,
+                ) {
                     Err(failure) => {
                         report.unexpected_failure = Some(failure);
                         report.verdict = ConcreteVerdict::Unsafe;
@@ -176,7 +303,12 @@ impl BpfVerifierEnv {
         loop_heads: &[u32],
     ) -> Result<Verdict> {
         let mut report = ConcreteReport::default();
-        match run_concrete(&self.prog.insns, loop_heads) {
+        match run_concrete_with_maps(
+            &self.prog.insns,
+            loop_heads,
+            &ConcreteLimits::default(),
+            &self.maps,
+        ) {
             Err(concrete_failure) => {
                 report.reject_note = Some(format!(
                     "concrete cross-check: also fails {}",
@@ -332,8 +464,10 @@ mod tests {
                     .unwrap();
                 let v_file = env_file.verify().unwrap();
 
-                // byte array
+                // byte array (maps sidecar registered the same way the
+                // file path does, #89)
                 let mut env_bytes = BpfVerifierEnv::new();
+                env_bytes.load_maps_sidecar(path.to_str().unwrap());
                 env_bytes.setup_prog_bytes(&bytes).unwrap();
                 let v_bytes = env_bytes.verify().unwrap();
 
@@ -500,7 +634,11 @@ mod tests {
                 "reject program {:?} was accepted",
                 path
             );
-            let report = env.concrete_report.as_ref().expect("concrete report");
+            // decode-error rejects (e.g. ldimm64_bad_pseudo) have no
+            // concrete run — nothing to cross-check
+            let Some(report) = env.concrete_report.as_ref() else {
+                continue;
+            };
             let note = report
                 .reject_note
                 .as_deref()

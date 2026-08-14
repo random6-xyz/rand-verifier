@@ -116,7 +116,11 @@ fn campaign_invariants() {
             let mini = SideVerdict::Reject {
                 category: categorize_mini_reason(failure),
             };
-            let concrete = concrete_side(env.concrete_report.as_ref().expect("concrete report"));
+            // decode-error rejects have no concrete run
+            let Some(report) = env.concrete_report.as_ref() else {
+                continue;
+            };
+            let concrete = concrete_side(report);
             if concrete == ConcreteSide::Safe {
                 let name = path.file_stem().unwrap().to_string_lossy().into_owned();
                 let f = classify_env(&env, &name, &mini, None, &kernel_accept, false);

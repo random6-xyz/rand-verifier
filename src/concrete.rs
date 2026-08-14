@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::env::MapInfo;
 use crate::exec::{AluOp, AluWidth, CondOp, alu_const32, alu_const64, branch_target};
 use crate::helper::{ArgType, HelperPrototype, helper_prototype};
 use crate::insn::{BpfInsn, disassemble};
@@ -28,6 +29,40 @@ pub(crate) const STACK_BASE: u64 = 0x1000;
 /// Fixed virtual address of the program context (R1 at entry).
 pub(crate) const CTX_BASE: u64 = 0x2000;
 
+/// Fixed virtual base of the map-value regions (#89). Each map fd owns
+/// a `MAP_REGION`-sized address window: `region_base(fd) = MAP_BASE +
+/// (fd - 1) * MAP_REGION` — fd 1 lives right at `MAP_BASE` so the
+/// default test map's value offsets equal the abstract offsets.
+pub(crate) const MAP_BASE: u64 = 0x3000;
+
+/// Address window per map fd.
+pub(crate) const MAP_REGION: u64 = 0x100;
+
+/// The value-region base address of a map fd.
+pub(crate) fn map_region_base(fd: u32) -> u64 {
+    MAP_BASE + (fd as u64 - 1) * MAP_REGION
+}
+
+/// The map fd owning a concrete map address (1-based).
+pub(crate) fn map_fd_of_addr(v: u64) -> u64 {
+    (v - MAP_BASE) / MAP_REGION + 1
+}
+
+/// The offset of a concrete map address inside its fd's value region
+/// (the abstract `PtrToMapValue` offsets are relative to the region
+/// base).
+pub(crate) fn map_value_offset(v: u64) -> i64 {
+    let fd = map_fd_of_addr(v);
+    v as i64 - (MAP_BASE as i64 + ((fd - 1) * MAP_REGION) as i64)
+}
+
+/// Concrete map memory (#89): 8-byte cells keyed by absolute address.
+/// ARRAY values are zero-initialized — an absent cell reads as 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MapMem {
+    pub(crate) cells: HashMap<u64, u64>,
+}
+
 /// A concrete register value, with the pointer-ness the abstract side
 /// tracks as a type. The kind is preserved by register moves and stack
 /// spill/fill, so pointer arithmetic is rejected like the abstract
@@ -40,6 +75,11 @@ pub(crate) enum ConcreteValue {
     StackPtr(u64),
     /// The context pointer, the concrete counterpart of `RegState::PtrToCtx`.
     CtxPtr(u64),
+    /// A map pointer or map-value pointer (#89): the concrete
+    /// counterpart of `PtrToMap` / `PtrToMapValue` /
+    /// `PtrToMapValueOrNull`. NULL is `Scalar(0)` — matching the
+    /// abstract null refinement.
+    MapPtr(u64),
 }
 
 /// Concrete register/stack state: `None` = uninitialized, mirroring the
@@ -89,8 +129,8 @@ pub(crate) enum ConcreteFailure {
     UninitializedStackRead { pc: u32, offset: i32 },
     /// Arithmetic on a pointer-typed register (#20).
     PointerArithmetic { pc: u32, reg: u8 },
-    /// Stack pointer arithmetic that leaves the frame (#19).
-    StackPointerOutOfFrame { pc: u32, reg: u8 },
+    /// A memory access through a non-stack-pointer base (#87).
+    NonStackBase { pc: u32, reg: u8 },
     /// A shift amount outside the accepted range (mirrors the abstract
     /// 0..64 check for both widths, `check_shift_amount`).
     InvalidShiftAmount { pc: u32, amount: u64 },
@@ -105,6 +145,9 @@ pub(crate) enum ConcreteFailure {
     /// An immediate-form comparison the abstract rejects: a pointer
     /// compared to an immediate (mirrors `cond_branch_imm`).
     InvalidComparisonImm { pc: u32, dst: u8 },
+    /// A memory access outside the map value (mirrors the abstract
+    /// "invalid access to map value", #89).
+    MapValueOutOfBounds { pc: u32, offset: i64 },
     /// A helper whose abstract return type has no concrete counterpart
     /// yet (pointer returns). Unreachable for the current corpus —
     /// map_lookup fixtures fail at argument validation.
@@ -141,9 +184,11 @@ impl std::fmt::Display for ConcreteFailure {
             Self::PointerArithmetic { pc, reg } => {
                 write!(f, "at insn {}: arithmetic on pointer r{}", pc, reg)
             }
-            Self::StackPointerOutOfFrame { pc, reg } => {
-                write!(f, "at insn {}: stack pointer r{} left the frame", pc, reg)
-            }
+            Self::NonStackBase { pc, reg } => write!(
+                f,
+                "at insn {}: stack access through a non-stack pointer r{} is not supported",
+                pc, reg
+            ),
             Self::InvalidShiftAmount { pc, amount } => {
                 write!(f, "at insn {}: invalid shift amount {}", pc, amount)
             }
@@ -176,6 +221,11 @@ impl std::fmt::Display for ConcreteFailure {
                     pc, imm
                 )
             }
+            Self::MapValueOutOfBounds { pc, offset } => write!(
+                f,
+                "at insn {}: invalid access to map value at offset {}",
+                pc, offset
+            ),
             Self::InternalError { pc } => write!(f, "at insn {}: internal error", pc),
         }
     }
@@ -206,6 +256,15 @@ fn stack_ptr_covers(min_offset: i32, max_offset: i32, align_off: u8, value: u64)
         && (align_off == ALIGN_UNKNOWN || offset.rem_euclid(8) as u8 == align_off)
 }
 
+/// The value-level part of `abstract_covers` for map value pointers
+/// (#89): the concrete address maps to an offset inside the tracked
+/// range with a matching alignment.
+fn map_value_ptr_covers(min_offset: i32, max_offset: i32, align_off: u8, value: u64) -> bool {
+    let offset = map_value_offset(value);
+    (min_offset as i64..=max_offset as i64).contains(&offset)
+        && (align_off == ALIGN_UNKNOWN || offset.rem_euclid(8) as u8 == align_off)
+}
+
 /// Does the abstract register state contain the concrete value?
 ///
 /// The reverse direction of `reg_subsumes`: the abstract side must be at
@@ -227,13 +286,32 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
             ConcreteValue::StackPtr(v),
         ) => stack_ptr_covers(min_offset, max_offset, align_off, v),
         (RegState::PtrToCtx, ConcreteValue::CtxPtr(v)) => v == CTX_BASE,
+        // map pointers (#89): CONST_PTR_TO_MAP lives in a map region;
+        // a value pointer covers when its offset lies in the interval;
+        // a nullable value pointer also covers the NULL scalar
+        (RegState::PtrToMap { .. }, ConcreteValue::MapPtr(v)) => {
+            v >= MAP_BASE && map_fd_of_addr(v) >= 1
+        }
+        (
+            RegState::PtrToMapValue {
+                min_offset,
+                max_offset,
+                align_off,
+                ..
+            },
+            ConcreteValue::MapPtr(v),
+        ) => map_value_ptr_covers(min_offset, max_offset, align_off, v),
+        (RegState::PtrToMapValueOrNull { .. }, ConcreteValue::MapPtr(v)) => {
+            map_value_offset(v) >= 0
+        }
+        (RegState::PtrToMapValueOrNull { .. }, ConcreteValue::Scalar(0)) => true,
         // type mismatches are never covered
         (RegState::Scalar(_), _)
         | (RegState::PtrToStack { .. }, _)
         | (RegState::PtrToCtx, _)
-        | (RegState::PtrToMap, _)
-        | (RegState::PtrToMapValue, _)
-        | (RegState::PtrToMapValueOrNull, _) => false,
+        | (RegState::PtrToMap { .. }, _)
+        | (RegState::PtrToMapValue { .. }, _)
+        | (RegState::PtrToMapValueOrNull { .. }, _) => false,
     }
 }
 
@@ -259,6 +337,11 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
             .zip(&concrete.stack)
             .all(|(abstract_slot, value)| match (abstract_slot, value) {
                 (StackSlot::Uninit, None) => true,
+                // a variable-offset store marks slots initialized
+                // without a value — any concrete value written into
+                // them (or nothing at all, on a path that did not hit
+                // the store) is covered (unknown scalar, #87)
+                (StackSlot::Initialized, _) => true,
                 (StackSlot::Spilled(reg), Some(value)) => abstract_covers(*reg, *value),
                 _ => false,
             })
@@ -312,10 +395,26 @@ fn alu_value(op: AluOp, width: AluWidth, a: u64, b: u64) -> u64 {
     }
 }
 
+/// Resolve a memory access `[base + off]` to an r10-relative offset
+/// (#87): the base must be a stack pointer; the access-time frame and
+/// alignment checks happen in `concrete_stack_slot`.
+fn stack_ptr_access_offset(
+    pc: u32,
+    reg: u8,
+    base: ConcreteValue,
+    off: i32,
+) -> Result<i32, ConcreteFailure> {
+    match base {
+        ConcreteValue::StackPtr(v) => Ok((v as i64 - STACK_BASE as i64 + off as i64) as i32),
+        _ => Err(ConcreteFailure::NonStackBase { pc, reg }),
+    }
+}
+
 /// The frame-validity check shared by both pointer-ADD paths: the new
 /// offset must stay within `r10-512..=r10` (mirrors the abstract
 /// `add_scalar_to_stack_ptr` frame check). Overflowing the addition
 /// means the offset is certainly out of the frame.
+#[allow(dead_code)] // kept for access-time checks (P2); see #87
 fn stack_ptr_offset_ok(offset: i64) -> bool {
     (-(STACK_SIZE as i64)..=0).contains(&offset)
 }
@@ -354,32 +453,47 @@ fn concrete_alu_imm(
             next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
             Ok(next)
         }
-        // stack pointer + immediate: only ADD is allowed (#20), and the
-        // result must stay within the frame (#19)
+        // stack pointer + immediate: only ADD is allowed (#20); the
+        // result offset is exact, frame bounds are validated at access
+        // time (#87, mirroring the abstract side and the kernel)
         ConcreteValue::StackPtr(v) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
-            let offset = v as i64 - STACK_BASE as i64 + imm as i64;
-            if !stack_ptr_offset_ok(offset) {
-                return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst });
-            }
+            let offset = (v as i64 - STACK_BASE as i64).saturating_add(imm as i64);
             let mut next = *state;
             next.regs[dst as usize] =
                 Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
             Ok(next)
         }
-        ConcreteValue::CtxPtr(_) => Err(ConcreteFailure::PointerArithmetic { pc, reg: dst }),
+        // map value pointer + immediate: only ADD (the address just
+        // moves; bounds are checked at access time, #89)
+        ConcreteValue::MapPtr(v) => {
+            if op != AluOp::Add || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            let mut next = *state;
+            next.regs[dst as usize] = Some(ConcreteValue::MapPtr((v as i64 + imm as i64) as u64));
+            Ok(next)
+        }
+        // context pointer + immediate: ADD/SUB keeps the pointer (the
+        // kernel allows ctx arithmetic with a sane offset, #90)
+        ConcreteValue::CtxPtr(_) => {
+            if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            Ok(*state)
+        }
     }
 }
 
 /// Execute an ALU operation with a register operand.
 ///
-/// Mirrors the abstract `alu_reg`: both operands must be scalars, except
-/// that a stack pointer plus a scalar ADD is allowed when the computed
-/// offset provably stays in the frame (#45). Concrete offsets are exact,
-/// so the abstract #45 provable-alignment condition (a range-only
-/// requirement) is trivially satisfied here.
+/// Mirrors the abstract `alu_reg`: scalar operands compute the exact
+/// bit result; a stack pointer plus a scalar ADD widens the pointer
+/// value (exact offset in the concrete world); scalar + stack pointer
+/// makes the destination inherit the pointer value. Frame bounds are
+/// validated at access time (#87).
 fn concrete_alu_reg(
     pc: u32,
     state: &ConcreteState,
@@ -408,25 +522,56 @@ fn concrete_alu_reg(
             next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
             Ok(next)
         }
-        // computed stack pointer arithmetic (#45): only ADD, and the
-        // result must stay within the frame
+        // computed stack pointer arithmetic (#87): only ADD; the exact
+        // offset result is computed by wrapping arithmetic — frame
+        // bounds are validated at access time
         (ConcreteValue::StackPtr(v), ConcreteValue::Scalar(s)) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
-            let offset = match (v as i64)
-                .checked_sub(STACK_BASE as i64)
-                .and_then(|o| o.checked_add(s as i64))
-            {
-                Some(offset) => offset,
-                None => return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst }),
-            };
-            if !stack_ptr_offset_ok(offset) {
-                return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst });
-            }
+            let offset = (v as i64)
+                .wrapping_sub(STACK_BASE as i64)
+                .wrapping_add(s as i64);
             let mut next = *state;
             next.regs[dst as usize] =
                 Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            Ok(next)
+        }
+        // scalar += stack pointer: the destination inherits the pointer
+        // value (kernel: "dst_reg inherits the complete pointer register
+        // state")
+        (ConcreteValue::Scalar(d), ConcreteValue::StackPtr(v)) => {
+            if op != AluOp::Add || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            let offset = (v as i64)
+                .wrapping_sub(STACK_BASE as i64)
+                .wrapping_add(d as i64);
+            let mut next = *state;
+            next.regs[dst as usize] =
+                Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            Ok(next)
+        }
+        // map value pointer + scalar / scalar + map value pointer:
+        // only ADD moves the address (#89)
+        (ConcreteValue::MapPtr(v), ConcreteValue::Scalar(s))
+        | (ConcreteValue::Scalar(s), ConcreteValue::MapPtr(v)) => {
+            if op != AluOp::Add || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            let mut next = *state;
+            next.regs[dst as usize] = Some(ConcreteValue::MapPtr((v as i64 + s as i64) as u64));
+            Ok(next)
+        }
+        // context pointer + scalar / scalar + context pointer:
+        // ADD/SUB keeps (or inherits) the context pointer (#90)
+        (ConcreteValue::CtxPtr(_), ConcreteValue::Scalar(_))
+        | (ConcreteValue::Scalar(_), ConcreteValue::CtxPtr(_)) => {
+            if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            let mut next = *state;
+            next.regs[dst as usize] = Some(ConcreteValue::CtxPtr(CTX_BASE));
             Ok(next)
         }
         // every other combination is pointer arithmetic (#20)
@@ -591,26 +736,55 @@ pub(crate) fn concrete_step(
         BpfInsn::Arsh32Reg { dst, src } => {
             concrete_alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
-        // r10[offset] = rY → spill the value and its pointer kind (#30)
-        BpfInsn::StStack { src, offset } => {
-            let slot = concrete_stack_slot(pc, *offset as i32)?;
+        // ldimm64 (#89): a plain 64-bit constant
+        BpfInsn::LdImm64 { dst, imm } => {
+            check_concrete_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::Scalar(*imm));
+            Ok(next)
+        }
+        // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE (#89): a map pointer
+        // at the fd's region base, a map value pointer at base + offset
+        BpfInsn::LdMapFd { dst, fd, .. } => {
+            check_concrete_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::MapPtr(map_region_base(*fd)));
+            Ok(next)
+        }
+        BpfInsn::LdMapValue {
+            dst, fd, offset, ..
+        } => {
+            check_concrete_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] =
+                Some(ConcreteValue::MapPtr(map_region_base(*fd) + *offset as u64));
+            Ok(next)
+        }
+        // the second slot of an ldimm64 is transparent
+        BpfInsn::LdImm64Second { .. } => Ok(*state),
+        // [base + off] = rY → spill the value and its pointer kind
+        // (#30); the base must be a stack pointer and the access is
+        // validated at access time (#87)
+        BpfInsn::StMem { src, base, offset } => {
+            let base_value = read_concrete_reg(pc, state, *base)?;
+            let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
+            let slot = concrete_stack_slot(pc, offset)?;
             let value = read_concrete_reg(pc, state, *src)?;
             let mut next = *state;
             next.stack[slot] = Some(value);
             Ok(next)
         }
-        // rX = r10[offset] → load a stack slot; a slot must have been
+        // rX = [base + off] → load a stack slot; a slot must have been
         // written before it is read (write-before-read, #18). The value
         // and its pointer kind are restored (#30).
-        BpfInsn::LdStack { dst, offset } => {
+        BpfInsn::LdMem { dst, base, offset } => {
             check_concrete_reg(pc, *dst)?;
-            let slot = concrete_stack_slot(pc, *offset as i32)?;
+            let base_value = read_concrete_reg(pc, state, *base)?;
+            let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
+            let slot = concrete_stack_slot(pc, offset)?;
             let value = match state.stack[slot] {
                 None => {
-                    return Err(ConcreteFailure::UninitializedStackRead {
-                        pc,
-                        offset: *offset as i32,
-                    });
+                    return Err(ConcreteFailure::UninitializedStackRead { pc, offset });
                 }
                 Some(value) => value,
             };
@@ -667,8 +841,9 @@ pub(crate) struct ConcreteRun {
     pub(crate) inconclusive: bool,
 }
 
-/// Explore a program with the default limits. `loop_heads` are the
-/// targets of back edges from the structural pass (like `verify_mini`).
+/// Explore a program with the default limits (no maps). `loop_heads`
+/// are the targets of back edges from the structural pass.
+#[cfg_attr(not(test), allow(dead_code))] // used by tests
 pub(crate) fn run_concrete(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -676,18 +851,31 @@ pub(crate) fn run_concrete(
     run_concrete_with_limits(program, loop_heads, &ConcreteLimits::default())
 }
 
-/// `run_concrete` with explicit exploration limits.
+/// `run_concrete` with explicit exploration limits (no maps).
 ///
 /// Mirrors `verify_mini_with_limits`: a worklist of `(pc, state)` pairs,
 /// processed LIFO. Concrete states are exact, so deduplication is state
 /// equality (the abstract side uses subsumption); a deterministic loop
 /// converges by reaching its exit, and a loop that never converges hits
 /// the loop-head budget → inconclusive.
+#[cfg_attr(not(test), allow(dead_code))] // used by tests
 pub(crate) fn run_concrete_with_limits(
     program: &[BpfInsn],
     loop_heads: &[u32],
     limits: &ConcreteLimits,
 ) -> Result<ConcreteRun, ConcreteFailure> {
+    run_concrete_with_maps(program, loop_heads, limits, &HashMap::new())
+}
+
+/// `run_concrete_with_limits` with the map registry (#89). Map values
+/// live in a per-run memory; ARRAY values are zero-initialized.
+pub(crate) fn run_concrete_with_maps(
+    program: &[BpfInsn],
+    loop_heads: &[u32],
+    limits: &ConcreteLimits,
+    maps: &HashMap<u32, MapInfo>,
+) -> Result<ConcreteRun, ConcreteFailure> {
+    let mut mem = MapMem::default();
     let mut worklist = vec![(0u32, ConcreteState::initial())];
     // states already visited at each pc, for exact-state deduplication
     let mut visited: HashMap<u32, Vec<ConcreteState>> = HashMap::new();
@@ -758,7 +946,7 @@ pub(crate) fn run_concrete_with_limits(
             continue;
         }
 
-        for (next_pc, next_state) in concrete_successors(pc, insn, &state)? {
+        for (next_pc, next_state) in concrete_successors(pc, insn, &state, maps, &mut mem)? {
             worklist.push((next_pc, next_state));
         }
     }
@@ -771,11 +959,15 @@ pub(crate) fn run_concrete_with_limits(
 
 /// Expand the successors of one instruction, mirroring the abstract
 /// `successors()`: terminal, jumps and compares are expanded here;
-/// everything else falls through via `concrete_step`.
+/// everything else falls through via `concrete_step`. Map-value
+/// accesses and map helpers need the registry and the map memory, so
+/// they are expanded here too (#89).
 fn concrete_successors(
     pc: u32,
     insn: &BpfInsn,
     state: &ConcreteState,
+    maps: &HashMap<u32, MapInfo>,
+    mem: &mut MapMem,
 ) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
     match insn {
         BpfInsn::Exit => Ok(vec![]),
@@ -840,7 +1032,58 @@ fn concrete_successors(
         BpfInsn::JsleImm { dst, imm, offset } => {
             concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Sle, state)
         }
-        BpfInsn::Call { imm } => concrete_call(pc, *imm, state),
+        BpfInsn::Call { imm } => {
+            if matches!(*imm, 1 | 2) {
+                concrete_map_call(pc, *imm, state, maps, mem)
+            } else {
+                concrete_call(pc, *imm, state)
+            }
+        }
+        // ldimm64 map forms and map-value accesses (the state decides
+        // whether a base is a map pointer)
+        BpfInsn::LdMapFd { dst, fd, .. } => {
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::MapPtr(map_region_base(*fd)));
+            Ok(vec![(pc + 1, next)])
+        }
+        BpfInsn::LdMapValue {
+            dst, fd, offset, ..
+        } => {
+            let mut next = *state;
+            next.regs[*dst as usize] =
+                Some(ConcreteValue::MapPtr(map_region_base(*fd) + *offset as u64));
+            Ok(vec![(pc + 1, next)])
+        }
+        BpfInsn::LdMem { dst, base, offset } => {
+            if let Some(ConcreteValue::MapPtr(_)) = state.regs[*base as usize] {
+                concrete_map_access(
+                    pc,
+                    MapAccess::Load { dst: *dst },
+                    *base,
+                    *offset,
+                    state,
+                    maps,
+                    mem,
+                )
+            } else {
+                Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)])
+            }
+        }
+        BpfInsn::StMem { src, base, offset } => {
+            if let Some(ConcreteValue::MapPtr(_)) = state.regs[*base as usize] {
+                concrete_map_access(
+                    pc,
+                    MapAccess::Store { src: *src },
+                    *base,
+                    *offset,
+                    state,
+                    maps,
+                    mem,
+                )
+            } else {
+                Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)])
+            }
+        }
         // everything else falls through via concrete_step()
         _ => Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)]),
     }
@@ -877,9 +1120,18 @@ fn concrete_cond(
         },
         // same-kind pointers: equality comparisons only
         (ConcreteValue::StackPtr(d), ConcreteValue::StackPtr(s))
-        | (ConcreteValue::CtxPtr(d), ConcreteValue::CtxPtr(s)) => match op {
+        | (ConcreteValue::CtxPtr(d), ConcreteValue::CtxPtr(s))
+        | (ConcreteValue::MapPtr(d), ConcreteValue::MapPtr(s)) => match op {
             CondOp::Eq => d == s,
             CondOp::Ne => d != s,
+            _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
+        },
+        // a NULL map value pointer is the scalar 0 (the abstract null
+        // refinement) — equality against 0 is decidable
+        (ConcreteValue::MapPtr(_), ConcreteValue::Scalar(0))
+        | (ConcreteValue::Scalar(0), ConcreteValue::MapPtr(_)) => match op {
+            CondOp::Eq => false,
+            CondOp::Ne => true,
             _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
         },
         // mixed pointer/scalar types are never comparable
@@ -919,6 +1171,14 @@ fn concrete_cond_imm(
             CondOp::Sge => (d as i64) >= (imm as i64),
             CondOp::Slt => (d as i64) < (imm as i64),
             CondOp::Sle => (d as i64) <= (imm as i64),
+        },
+        // a NULL map value pointer is the scalar 0 — equality against
+        // the constant 0 is decidable (#89); other pointer/immediate
+        // comparisons are never comparable
+        ConcreteValue::MapPtr(_) if imm == 0 => match op {
+            CondOp::Eq => false,
+            CondOp::Ne => true,
+            _ => return Err(ConcreteFailure::InvalidComparisonImm { pc, dst }),
         },
         // a pointer compared to an immediate is never comparable
         // (mirror of the abstract cond_branch_impl)
@@ -982,6 +1242,158 @@ fn check_concrete_helper_args(
         }
     }
     Ok(())
+}
+
+/// Model a map helper call (#89): `map_lookup_elem` forks over the
+/// value pointer / NULL (the key's concrete value selects the entry;
+/// out-of-range keys yield NULL), and `map_update_elem` writes the
+/// value buffer into the map memory and returns 0.
+fn concrete_map_call(
+    pc: u32,
+    imm: i32,
+    state: &ConcreteState,
+    maps: &HashMap<u32, MapInfo>,
+    mem: &mut MapMem,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    // R1 must be a map pointer inside a registered region
+    let Some(ConcreteValue::MapPtr(base)) = state.regs[1] else {
+        return Err(ConcreteFailure::HelperArgMismatch { pc, arg: 1 });
+    };
+    let fd = map_fd_of_addr(base) as u32;
+    let Some(info) = maps.get(&fd) else {
+        return Err(ConcreteFailure::HelperArgMismatch { pc, arg: 1 });
+    };
+    // the key buffer: R2 = stack pointer with key_size readable bytes
+    let key = concrete_map_buffer(pc, state, 2, info.key_size, "key")?;
+    // argument registers are scratch (mirror of concrete_call)
+    let mut base_state = *state;
+    for reg in 1..=5 {
+        base_state.regs[reg] = None;
+    }
+    let index = key;
+    let region = map_region_base(fd);
+    match imm {
+        // map_lookup_elem: value pointer / NULL fork
+        1 => {
+            let seeds = if index < info.max_entries as u64 {
+                vec![
+                    ConcreteValue::MapPtr(region + index * info.value_size as u64),
+                    ConcreteValue::Scalar(0), // NULL
+                ]
+            } else {
+                vec![ConcreteValue::Scalar(0)] // out-of-range key → NULL
+            };
+            Ok(seeds
+                .into_iter()
+                .map(|seed| {
+                    let mut next = base_state;
+                    next.regs[0] = Some(seed);
+                    (pc + 1, next)
+                })
+                .collect())
+        }
+        // map_update_elem: write the value buffer into the map memory
+        2 => {
+            if index < info.max_entries as u64 {
+                let value = concrete_map_buffer(pc, state, 3, info.value_size, "value")?;
+                if !matches!(state.regs[4], Some(ConcreteValue::Scalar(_))) {
+                    return Err(ConcreteFailure::HelperArgMismatch { pc, arg: 4 });
+                }
+                mem.cells
+                    .insert(region + index * info.value_size as u64, value);
+            }
+            let mut next = base_state;
+            next.regs[0] = Some(ConcreteValue::Scalar(0));
+            Ok(vec![(pc + 1, next)])
+        }
+        _ => unreachable!("the caller routes 1|2 only"),
+    }
+}
+
+/// Read a stack buffer of `size` bytes into a u64 (key/value sizes ≤ 8
+/// — one cell). The register must be an aligned stack pointer with an
+/// initialized scalar cell (spilled pointers are not readable as
+/// buffer bytes, mirroring the abstract check).
+fn concrete_map_buffer(
+    pc: u32,
+    state: &ConcreteState,
+    reg: u8,
+    size: u32,
+    _what: &str,
+) -> Result<u64, ConcreteFailure> {
+    let Some(ConcreteValue::StackPtr(addr)) = state.regs[reg as usize] else {
+        return Err(ConcreteFailure::HelperArgMismatch { pc, arg: reg });
+    };
+    if size > 8 {
+        return Err(ConcreteFailure::UnsupportedHelperReturn { pc, imm: 0 });
+    }
+    let offset = (addr as i64 - STACK_BASE as i64) as i32;
+    let slot = concrete_stack_slot(pc, offset)?;
+    match state.stack[slot] {
+        None => Err(ConcreteFailure::UninitializedStackRead { pc, offset }),
+        Some(ConcreteValue::Scalar(v)) => Ok(match size {
+            8 => v,
+            _ => v & ((1u64 << (size * 8)) - 1),
+        }),
+        Some(_) => Err(ConcreteFailure::PointerArithmetic { pc, reg }),
+    }
+}
+
+/// A memory access through a map value pointer (#89): bounds against
+/// `value_size`, alignment, and the read/write on the concrete map
+/// memory. `store_src` is the value register for stores.
+/// A load or a store through a map value pointer (#89).
+enum MapAccess {
+    Load { dst: u8 },
+    Store { src: u8 },
+}
+
+fn concrete_map_access(
+    pc: u32,
+    access: MapAccess,
+    base: u8,
+    off: i16,
+    state: &ConcreteState,
+    maps: &HashMap<u32, MapInfo>,
+    mem: &mut MapMem,
+) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
+    let Some(ConcreteValue::MapPtr(v)) = state.regs[base as usize] else {
+        return Err(ConcreteFailure::HelperArgMismatch { pc, arg: base });
+    };
+    let fd = map_fd_of_addr(v) as u32;
+    let Some(info) = maps.get(&fd) else {
+        return Err(ConcreteFailure::HelperArgMismatch { pc, arg: base });
+    };
+    let region = map_region_base(fd);
+    let offset = map_value_offset(v) + off as i64;
+    if offset < 0 || offset + 8 > info.value_size as i64 {
+        return Err(ConcreteFailure::MapValueOutOfBounds { pc, offset });
+    }
+    if offset % 8 != 0 {
+        return Err(ConcreteFailure::MisalignedStackAccess {
+            pc,
+            offset: offset as i32,
+        });
+    }
+    let addr = (region as i64 + offset) as u64;
+    let mut next = *state;
+    match access {
+        MapAccess::Store { src } => {
+            let value = read_concrete_reg(pc, state, src)?;
+            let ConcreteValue::Scalar(v) = value else {
+                // the kernel rejects pointer stores into map values
+                // ("R%d leaks addr into map")
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: src });
+            };
+            mem.cells.insert(addr, v);
+            Ok(vec![(pc + 1, next)])
+        }
+        MapAccess::Load { dst } => {
+            let value = mem.cells.get(&addr).copied().unwrap_or(0);
+            next.regs[dst as usize] = Some(ConcreteValue::Scalar(value));
+            Ok(vec![(pc + 1, next)])
+        }
+    }
 }
 
 /// The return seeds for a helper call, derived from the abstract return
@@ -1121,6 +1533,7 @@ fn render_concrete_value(value: &ConcreteValue) -> String {
         ConcreteValue::Scalar(v) => format!("Scalar({})", v),
         ConcreteValue::StackPtr(v) => format!("StackPtr({:#x})", v),
         ConcreteValue::CtxPtr(v) => format!("CtxPtr({:#x})", v),
+        ConcreteValue::MapPtr(v) => format!("MapPtr({:#x})", v),
     }
 }
 
@@ -1350,20 +1763,72 @@ mod tests {
 
     #[test]
     fn map_ptr_family_not_covered() {
-        // no concrete address class exists for map pointers yet
-        for reg in [
-            RegState::PtrToMap,
-            RegState::PtrToMapValue,
-            RegState::PtrToMapValueOrNull,
-        ] {
+        // map pointers cover no concrete class other than the map
+        // family (and NULL for the nullable form)
+        let regs = [
+            RegState::PtrToMap {
+                key_size: 4,
+                value_size: 8,
+            },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+            RegState::PtrToMapValueOrNull { value_size: 8 },
+        ];
+        for reg in regs {
             for value in [
-                ConcreteValue::Scalar(0),
+                ConcreteValue::Scalar(1),
                 ConcreteValue::StackPtr(0),
                 ConcreteValue::CtxPtr(0),
             ] {
                 assert!(!abstract_covers(reg, value));
             }
         }
+        // the nullable form covers the NULL scalar 0 (#89)
+        assert!(abstract_covers(
+            RegState::PtrToMapValueOrNull { value_size: 8 },
+            ConcreteValue::Scalar(0)
+        ));
+    }
+
+    #[test]
+    fn map_ptr_family_covered() {
+        // map pointers live in the fd regions; value pointers cover by
+        // offset interval + alignment; the nullable form covers valid
+        // pointers and NULL
+        let region = map_region_base(1);
+        assert!(abstract_covers(
+            RegState::PtrToMap {
+                key_size: 4,
+                value_size: 8,
+            },
+            ConcreteValue::MapPtr(region)
+        ));
+        assert!(abstract_covers(
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+            ConcreteValue::MapPtr(region)
+        ));
+        assert!(!abstract_covers(
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+            ConcreteValue::MapPtr(region + 8)
+        ));
+        assert!(abstract_covers(
+            RegState::PtrToMapValueOrNull { value_size: 8 },
+            ConcreteValue::MapPtr(region + 8)
+        ));
     }
 
     #[test]
@@ -1395,6 +1860,21 @@ mod tests {
             &VerifierState::initial(),
             &ConcreteState::initial()
         ));
+    }
+
+    #[test]
+    fn state_covers_initialized_slot() {
+        // a variable-offset store marks abstract slots Initialized;
+        // they cover both an untouched (None) and a written (Some)
+        // concrete slot (#87)
+        let mut abstract_state = VerifierState::initial();
+        abstract_state.stack.slots[3] = StackSlot::Initialized;
+        let mut concrete = ConcreteState::initial();
+        assert!(state_covers(&abstract_state, &concrete));
+        concrete.stack[3] = Some(ConcreteValue::Scalar(0));
+        assert!(state_covers(&abstract_state, &concrete));
+        concrete.stack[3] = Some(ConcreteValue::StackPtr(STACK_BASE - 24));
+        assert!(state_covers(&abstract_state, &concrete));
     }
 
     #[test]
@@ -1458,6 +1938,128 @@ mod tests {
             state = concrete_step(pc as u32, &state, insn).expect("concrete step failed");
         }
         state
+    }
+
+    // ── map model (#89) ──────────────────────────────────────────────────
+
+    fn map_env() -> HashMap<u32, MapInfo> {
+        HashMap::from([(1, MapInfo::array_default())])
+    }
+
+    #[test]
+    fn concrete_map_lookup_null_check_load() {
+        // r1 = map_fd(1); r2 = r10; r2 += -8; r3 = 0; [r10-8] = r3;
+        // call 1; if r0 == 0 goto +2; r4 = [r0]; r0 = 1; exit; exit
+        let program = [
+            BpfInsn::LdMapFd {
+                dst: 1,
+                fd: 1,
+                key_size: 4,
+                value_size: 8,
+            },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovReg { dst: 2, src: 10 },
+            BpfInsn::AddImm { dst: 2, imm: -8 },
+            BpfInsn::MovImm { dst: 3, imm: 0 },
+            BpfInsn::StMem {
+                src: 3,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::Call { imm: 1 },
+            BpfInsn::JeqImm {
+                dst: 0,
+                imm: 0,
+                offset: 2,
+            },
+            BpfInsn::LdMem {
+                dst: 4,
+                base: 0,
+                offset: 0,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete_with_maps(&program, &[], &ConcreteLimits::default(), &map_env())
+            .expect("concrete run");
+        assert!(!run.inconclusive);
+        // both the non-null path (exit with r0 = 1) and the null path
+        // (exit with r0 = 0) terminate
+        assert_eq!(run.outcomes.len(), 2);
+        for outcome in &run.outcomes {
+            let Some(ConcreteValue::Scalar(v)) = outcome.state.regs[0] else {
+                panic!("exit r0 must be a scalar");
+            };
+            assert!(v == 0 || v == 1);
+        }
+    }
+
+    #[test]
+    fn concrete_map_value_store_load_roundtrip() {
+        // ... call 1; if r0 == 0 goto +4; r4 = 42; [r0] = r4;
+        // r4 = [r0]; r0 = r4; exit; exit
+        let program = [
+            BpfInsn::LdMapFd {
+                dst: 1,
+                fd: 1,
+                key_size: 4,
+                value_size: 8,
+            },
+            BpfInsn::LdImm64Second { imm_hi: 0 },
+            BpfInsn::MovReg { dst: 2, src: 10 },
+            BpfInsn::AddImm { dst: 2, imm: -8 },
+            BpfInsn::MovImm { dst: 3, imm: 0 },
+            BpfInsn::StMem {
+                src: 3,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::Call { imm: 1 },
+            BpfInsn::JeqImm {
+                dst: 0,
+                imm: 0,
+                offset: 4,
+            },
+            BpfInsn::MovImm { dst: 4, imm: 42 },
+            BpfInsn::StMem {
+                src: 4,
+                base: 0,
+                offset: 0,
+            },
+            BpfInsn::LdMem {
+                dst: 4,
+                base: 0,
+                offset: 0,
+            },
+            BpfInsn::MovReg { dst: 0, src: 4 },
+            BpfInsn::Exit,
+            BpfInsn::Exit,
+        ];
+        let run = run_concrete_with_maps(&program, &[], &ConcreteLimits::default(), &map_env())
+            .expect("concrete run");
+        // the non-null path reads back the stored 42
+        assert!(
+            run.outcomes
+                .iter()
+                .any(|o| { matches!(o.state.regs[0], Some(ConcreteValue::Scalar(42))) })
+        );
+    }
+
+    #[test]
+    fn concrete_map_value_out_of_bounds() {
+        // r0 = map value fd 1 + 8 → [r0] exceeds value_size 8
+        let state = ConcreteState::initial();
+        let mut state = state;
+        state.regs[0] = Some(ConcreteValue::MapPtr(map_region_base(1) + 8));
+        let maps = map_env();
+        let mut mem = MapMem::default();
+        let err = concrete_map_access(0, MapAccess::Load { dst: 4 }, 0, 0, &state, &maps, &mut mem)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConcreteFailure::MapValueOutOfBounds { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1752,17 +2354,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 0, reg: 10 });
-        // immediate arithmetic on the context pointer
-        let err = concrete_step(
+        // immediate arithmetic on the context pointer is allowed for
+        // ADD/SUB (mirror of the abstract, #90); other ops stay rejected
+        let next = concrete_step(
             0,
             &ConcreteState::initial(),
             &BpfInsn::AddImm { dst: 1, imm: 8 },
         )
+        .unwrap();
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        let err = concrete_step(
+            0,
+            &ConcreteState::initial(),
+            &BpfInsn::XorImm { dst: 1, imm: 8 },
+        )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 0, reg: 1 });
-        // register arithmetic on the context pointer
+        // register ADD on the context pointer is allowed (mirror of
+        // the abstract, #90); SUB keeps it too, other ops stay rejected
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
-        let err = concrete_step(1, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        let err = concrete_step(1, &state, &BpfInsn::XorReg { dst: 1, src: 2 }).unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 1, reg: 1 });
         // stack pointer + stack pointer
         let err = concrete_step(
@@ -1784,32 +2397,26 @@ mod tests {
     }
 
     #[test]
-    fn stack_ptr_add_imm_out_of_frame() {
-        let err = concrete_step(
-            0,
-            &ConcreteState::initial(),
-            &BpfInsn::AddImm { dst: 10, imm: 100 },
-        )
-        .unwrap_err();
+    fn stack_ptr_add_imm_widens_without_frame_check() {
+        // #87: arithmetic no longer rejects out-of-frame results — the
+        // concrete pointer value just moves; access-time checks reject
+        // any later out-of-frame access
+        let state = run(&[BpfInsn::AddImm { dst: 10, imm: 100 }]);
         assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 0, reg: 10 }
+            state.regs[10],
+            Some(ConcreteValue::StackPtr(STACK_BASE + 100))
         );
-        let err = concrete_step(
-            0,
-            &ConcreteState::initial(),
-            &BpfInsn::AddImm { dst: 10, imm: -520 },
-        )
-        .unwrap_err();
+        let state = run(&[BpfInsn::AddImm { dst: 10, imm: -520 }]);
         assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 0, reg: 10 }
+            state.regs[10],
+            Some(ConcreteValue::StackPtr(STACK_BASE - 520))
         );
     }
 
     #[test]
     fn stack_ptr_add_reg_computed() {
-        // computed pointer arithmetic (#45): in-frame scalar ADD
+        // computed pointer arithmetic (#87): scalar ADD widens the
+        // pointer value without a frame check at arithmetic time
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: -8 },
             BpfInsn::AddReg { dst: 10, src: 2 },
@@ -1818,13 +2425,10 @@ mod tests {
             state.regs[10],
             Some(ConcreteValue::StackPtr(STACK_BASE - 8))
         );
-        // out-of-frame scalar ADD
+        // out-of-frame scalar ADD is fine at arithmetic time
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
-        let err = concrete_step(1, &state, &BpfInsn::AddReg { dst: 10, src: 2 }).unwrap_err();
-        assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 1, reg: 10 }
-        );
+        let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 10, src: 2 }).unwrap();
+        assert_eq!(next.regs[10], Some(ConcreteValue::StackPtr(STACK_BASE + 8)));
     }
 
     #[test]
@@ -1832,19 +2436,29 @@ mod tests {
         // scalar round-trip
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: 42 },
-            BpfInsn::StStack { src: 2, offset: -8 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
         ]);
         assert_eq!(state.regs[0], Some(ConcreteValue::Scalar(42)));
         // pointer round-trip: the kind survives spill/fill (#30)
         let state = run(&[
             BpfInsn::AddImm { dst: 10, imm: -8 },
-            BpfInsn::StStack {
+            BpfInsn::StMem {
                 src: 10,
+                base: 10,
                 offset: -16,
             },
-            BpfInsn::LdStack {
+            BpfInsn::LdMem {
                 dst: 0,
+                base: 10,
                 offset: -16,
             },
         ]);
@@ -1856,7 +2470,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::LdStack { dst: 0, offset: -8 },
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
         )
         .unwrap_err();
         assert_eq!(
@@ -1867,7 +2485,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 3, offset: -8 },
+            &BpfInsn::StMem {
+                src: 3,
+                base: 10,
+                offset: -8,
+            },
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::UninitializedRead { pc: 0, reg: 3 });
@@ -1879,7 +2501,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 1, offset: 0 },
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: 0,
+            },
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::StackOutOfFrame { pc: 0, offset: 0 });
@@ -1887,8 +2513,9 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack {
+            &BpfInsn::StMem {
                 src: 1,
+                base: 10,
                 offset: -520,
             },
         )
@@ -1904,7 +2531,11 @@ mod tests {
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
-            &BpfInsn::StStack { src: 1, offset: -7 },
+            &BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -7,
+            },
         )
         .unwrap_err();
         assert_eq!(

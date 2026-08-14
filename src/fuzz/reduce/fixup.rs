@@ -11,7 +11,7 @@
 //! `None` — the caller's oracle decides what to do next.
 
 use crate::fuzz::insn_lib::encode;
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::BpfInsn;
 
 /// Delete a set of instructions from a raw bytecode stream, re-basing
 /// branch offsets (`pc + 1 + off`, kernel convention).
@@ -30,10 +30,7 @@ pub fn delete_insns(bytes: &[u8], remove: &[u32]) -> Option<Vec<u8>> {
 
     // decode (the caller's programs are replay-valid, so a decode
     // failure is a defensive None)
-    let mut insns = Vec::with_capacity(len as usize);
-    for chunk in bytes.chunks_exact(8) {
-        insns.push(parse_insn(chunk).ok()?);
-    }
+    let insns = crate::insn::decode_program(bytes).ok()?;
 
     // normalize the removal set
     let mut remove: Vec<u32> = remove.to_vec();
@@ -121,10 +118,7 @@ mod tests {
     use crate::testutil::{insn_bytes, prog_bytes};
 
     fn insns(bytes: &[u8]) -> Vec<BpfInsn> {
-        bytes
-            .chunks_exact(8)
-            .map(|c| parse_insn(c).unwrap())
-            .collect()
+        crate::insn::decode_program(bytes).unwrap()
     }
 
     /// The decoded jump target of every branch: `(src, target)` pairs.
@@ -214,11 +208,19 @@ mod tests {
         assert_eq!(decoded.len(), 5);
         assert!(matches!(
             decoded[1],
-            BpfInsn::StStack { src: 1, offset: -8 }
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8
+            }
         ));
         assert!(matches!(
             decoded[2],
-            BpfInsn::LdStack { dst: 0, offset: -8 }
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }
         ));
         assert!(matches!(decoded[3], BpfInsn::Call { imm: 1 }));
     }

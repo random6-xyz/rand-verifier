@@ -81,7 +81,15 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
         || msg.contains("subtraction from stack pointer")
         || msg.contains("frame pointer is read only")
         || msg.contains("unbounded min value")
+        || msg.contains("math between")
+        || msg.contains("out of bounds")
+        || msg.contains("pointer offset")
     {
+        // "... pointer arithmetic ... prohibited", "R%d invalid mem
+        // access", "math between fp pointer and N is not allowed",
+        // "value N makes fp pointer be out of bounds", "fp pointer
+        // offset N is not allowed" (adjust_ptr_min_max_vals /
+        // check_reg_sane_offset_* family)
         ReasonCategory::PointerArith
     } else if msg.contains("variable stack access") {
         // "... variable stack access prohibited for !root"
@@ -316,6 +324,18 @@ mod tests {
             categorize_reason(
                 "math between fp pointer and register with unbounded min value is not allowed"
             ),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason("math between fp pointer and 2147483647 is not allowed"),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason("value -9223372035854775808 makes fp pointer be out of bounds"),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason("fp pointer offset 2147483648 is not allowed"),
             ReasonCategory::PointerArith
         );
         assert_eq!(

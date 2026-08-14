@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::cfg::compute_loop_pcs;
 use crate::error::VerificationFailure;
 use crate::exec::{WorkItem, successors};
 use crate::insn::BpfInsn;
@@ -47,11 +48,29 @@ pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
             },
         ) => old_min == new_min && old_max == new_max && old_align == new_align,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
-        (RegState::PtrToMap, RegState::PtrToMap) => true,
-        (RegState::PtrToMapValue, RegState::PtrToMapValue) => true,
-        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValueOrNull) => true,
+        (RegState::PtrToMap { .. }, RegState::PtrToMap { .. }) => true,
+        (
+            RegState::PtrToMapValue { .. },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+        ) => true,
+        (RegState::PtrToMapValueOrNull { .. }, RegState::PtrToMapValueOrNull { value_size: 8 }) => {
+            true
+        }
         // a nullable pointer is a superset of the non-null one
-        (RegState::PtrToMapValueOrNull, RegState::PtrToMapValue) => true,
+        (
+            RegState::PtrToMapValueOrNull { .. },
+            RegState::PtrToMapValue {
+                min_offset: 0,
+                max_offset: 0,
+                align_off: 0,
+                value_size: 8,
+            },
+        ) => true,
         // different types are never comparable
         _ => false,
     }
@@ -149,6 +168,12 @@ fn verify_mini_core(
     loop_heads: &[u32],
     limits: &VerifierLimits,
 ) -> Result<(usize, HashMap<u32, Vec<VerifierState>>), VerificationFailure> {
+    // the instructions lying on a cycle (#90): an exactly-equal state
+    // revisit at one of them is an infinite loop (kernel states.c —
+    // the kernel's read/precision marks keep loop-body states distinct,
+    // so its EXACT comparison fires where mini's dedup would otherwise
+    // prune the revisit before it reaches the loop head)
+    let loop_pcs: Vec<u32> = compute_loop_pcs(program, &[0], loop_heads);
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
@@ -178,6 +203,17 @@ fn verify_mini_core(
 
         // skip states subsumed by an already-analyzed state at this pc
         let seen = visited.entry(item.pc).or_default();
+        // the kernel rejects a loop head revisited with an IDENTICAL
+        // state — the loop can never make progress (kernel/bpf/states.c:
+        // "infinite loop detected at insn %d", states_equal EXACT).
+        // A bounded loop's head state changes every iteration, so it
+        // never trips this rule.
+        if loop_pcs.contains(&item.pc) && seen.contains(&item.state) {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!("infinite loop detected at insn {}", item.pc),
+            ));
+        }
         if seen.iter().any(|old| subsumes(old, &item.state)) {
             continue;
         }
@@ -270,7 +306,11 @@ mod tests {
         // r0 = 1; r0 = [r10-8]; exit — uninitialized stack slot at insn 1
         let program = vec![
             BpfInsn::MovImm { dst: 0, imm: 1 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Exit,
         ];
         let err = verify_mini(&program, &[]).unwrap_err();
@@ -408,7 +448,11 @@ mod tests {
         let program = vec![
             BpfInsn::AddImm { dst: 10, imm: -8 },
             BpfInsn::MovImm { dst: 2, imm: 7 },
-            BpfInsn::StStack { src: 2, offset: -8 },
+            BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::MovImm { dst: 1, imm: 1 },
             BpfInsn::MovImm { dst: 3, imm: 1 },
             BpfInsn::Jeq {
@@ -416,9 +460,17 @@ mod tests {
                 src: 3,
                 offset: 2,
             },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Jmp { offset: 1 },
-            BpfInsn::LdStack { dst: 0, offset: -8 },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
             BpfInsn::Exit,
         ];
         assert!(verify_mini(&program, &[]).is_ok());
@@ -777,9 +829,14 @@ mod tests {
     fn subsumes_nullable_pointer() {
         // OrNull = {valid} ∪ {NULL} subsumes the non-null pointer
         let mut or_null = VerifierState::initial();
-        or_null.regs[0] = RegState::PtrToMapValueOrNull;
+        or_null.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
         let mut valid = VerifierState::initial();
-        valid.regs[0] = RegState::PtrToMapValue;
+        valid.regs[0] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+        };
         assert!(subsumes(&or_null, &valid));
         assert!(!subsumes(&valid, &or_null));
         // same types subsume themselves
@@ -905,7 +962,10 @@ mod tests {
     #[test]
     fn subsumes_ptr_to_map() {
         let mut map = VerifierState::initial();
-        map.regs[1] = RegState::PtrToMap;
+        map.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+        };
         let ctx = VerifierState::initial();
         // same type subsumes itself; a map pointer never subsumes a ctx
         // pointer (or vice versa)

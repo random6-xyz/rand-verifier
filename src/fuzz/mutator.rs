@@ -198,8 +198,16 @@ fn replace_imm(insn: &BpfInsn, imm: i32) -> BpfInsn {
 /// other instructions are returned unchanged).
 fn replace_off(insn: &BpfInsn, offset: i16) -> BpfInsn {
     match insn {
-        BpfInsn::LdStack { dst, .. } => BpfInsn::LdStack { dst: *dst, offset },
-        BpfInsn::StStack { src, .. } => BpfInsn::StStack { src: *src, offset },
+        BpfInsn::LdMem { dst, .. } => BpfInsn::LdMem {
+            dst: *dst,
+            base: 10,
+            offset,
+        },
+        BpfInsn::StMem { src, .. } => BpfInsn::StMem {
+            src: *src,
+            base: 10,
+            offset,
+        },
         BpfInsn::Jeq { dst, src, .. } => BpfInsn::Jeq {
             dst: *dst,
             src: *src,
@@ -446,12 +454,14 @@ fn replace_reg(insn: &BpfInsn, reg: u8) -> BpfInsn {
             dst: reg,
             src: *src,
         },
-        BpfInsn::LdStack { offset, .. } => BpfInsn::LdStack {
+        BpfInsn::LdMem { offset, .. } => BpfInsn::LdMem {
             dst: reg,
+            base: 10,
             offset: *offset,
         },
-        BpfInsn::StStack { offset, .. } => BpfInsn::StStack {
+        BpfInsn::StMem { offset, .. } => BpfInsn::StMem {
             src: reg,
+            base: 10,
             offset: *offset,
         },
         BpfInsn::Jeq { src, offset, .. } => BpfInsn::Jeq {
@@ -580,10 +590,10 @@ mod tests {
                     continue;
                 }
                 let bytes = std::fs::read(&path).unwrap();
-                let insns: Vec<BpfInsn> = bytes
-                    .chunks_exact(8)
-                    .map(|c| crate::insn::parse_insn(c).unwrap())
-                    .collect();
+                // skip decode-invalid fixtures (e.g. ldimm64_bad_pseudo)
+                let Some(insns) = crate::insn::decode_program(&bytes).ok() else {
+                    continue;
+                };
                 seeds.push((
                     path.file_stem().unwrap().to_string_lossy().into_owned(),
                     insns,

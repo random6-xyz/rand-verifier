@@ -24,7 +24,7 @@
 //! `MOV64 imm`; any other write clears the known value).
 
 use crate::fuzz::insn_lib::encode;
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::BpfInsn;
 
 /// The interesting-values pool (v0.7 #65), in preference order.
 const VALUE_POOL: [i32; 5] = [0, 1, -1, i32::MIN, i32::MAX];
@@ -171,8 +171,8 @@ fn apply_def(known: &mut [Option<i32>; 11], insn: &BpfInsn) {
                 *slot = None;
             }
         }
-        BpfInsn::LdStack { dst, .. } => known[*dst as usize] = None,
-        BpfInsn::StStack { .. } => {}
+        BpfInsn::LdMem { dst, .. } => known[*dst as usize] = None,
+        BpfInsn::StMem { .. } => {}
         // every ALU write and the exit produce/require non-constants
         insn if has_alu_dst(insn) => {
             if let Some(dst) = alu_dst(insn) {
@@ -187,7 +187,7 @@ fn apply_def(known: &mut [Option<i32>; 11], insn: &BpfInsn) {
 fn has_alu_dst(insn: &BpfInsn) -> bool {
     !matches!(
         insn,
-        BpfInsn::Call { .. } | BpfInsn::Exit | BpfInsn::Jmp { .. } | BpfInsn::StStack { .. }
+        BpfInsn::Call { .. } | BpfInsn::Exit | BpfInsn::Jmp { .. } | BpfInsn::StMem { .. }
     ) && !insn.is_conditional_branch()
 }
 
@@ -228,7 +228,7 @@ fn alu_dst(insn: &BpfInsn) -> Option<u8> {
         | BpfInsn::Rsh32Reg { dst, .. }
         | BpfInsn::Arsh32Imm { dst, .. }
         | BpfInsn::Arsh32Reg { dst, .. }
-        | BpfInsn::LdStack { dst, .. } => Some(*dst),
+        | BpfInsn::LdMem { dst, .. } => Some(*dst),
         _ => None,
     }
 }
@@ -236,7 +236,7 @@ fn alu_dst(insn: &BpfInsn) -> Option<u8> {
 /// The stack offset of a stack load/store — `None` for everything else.
 fn stack_offset(insn: &BpfInsn) -> Option<i16> {
     match insn {
-        BpfInsn::LdStack { offset, .. } | BpfInsn::StStack { offset, .. } => Some(*offset),
+        BpfInsn::LdMem { offset, .. } | BpfInsn::StMem { offset, .. } => Some(*offset),
         _ => None,
     }
 }
@@ -276,7 +276,11 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::Lsh32Imm { dst, .. }
         | BpfInsn::Rsh32Imm { dst, .. }
         | BpfInsn::Arsh32Imm { dst, .. }
-        | BpfInsn::LdStack { dst, .. } => used[*dst as usize] = true,
+        | BpfInsn::LdMem { dst, .. }
+        | BpfInsn::LdImm64 { dst, .. }
+        | BpfInsn::LdMapFd { dst, .. }
+        | BpfInsn::LdMapValue { dst, .. } => used[*dst as usize] = true,
+        BpfInsn::LdImm64Second { .. } => {}
         BpfInsn::MovReg { dst, src }
         | BpfInsn::AddReg { dst, src }
         | BpfInsn::SubReg { dst, src }
@@ -297,7 +301,7 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
             used[*dst as usize] = true;
             used[*src as usize] = true;
         }
-        BpfInsn::StStack { src, .. } => used[*src as usize] = true,
+        BpfInsn::StMem { src, .. } => used[*src as usize] = true,
         BpfInsn::Jeq { dst, src, .. }
         | BpfInsn::Jne { dst, src, .. }
         | BpfInsn::Jgt { dst, src, .. }
@@ -347,11 +351,7 @@ fn decode(bytes: &[u8]) -> Option<Vec<BpfInsn>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(8) {
         return None;
     }
-    bytes
-        .chunks_exact(8)
-        .map(parse_insn)
-        .collect::<Result<_, _>>()
-        .ok()
+    crate::insn::decode_program(bytes).ok()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -509,11 +509,19 @@ mod tests {
             .expect("expected a reg-lower candidate");
         for insn in decode_all(&lower.1) {
             match insn {
-                BpfInsn::StStack { src, offset } => {
+                BpfInsn::StMem {
+                    src,
+                    base: 10,
+                    offset,
+                } => {
                     assert_eq!(offset, -8);
                     assert_ne!(src, 10);
                 }
-                BpfInsn::LdStack { dst, offset } => {
+                BpfInsn::LdMem {
+                    dst,
+                    base: 10,
+                    offset,
+                } => {
                     assert_eq!(offset, -8);
                     assert_eq!(dst, 0);
                 }
@@ -554,7 +562,7 @@ mod tests {
                 continue;
             }
             for insn in decode_all(c) {
-                if let BpfInsn::StStack { offset, .. } | BpfInsn::LdStack { offset, .. } = insn
+                if let BpfInsn::StMem { offset, .. } | BpfInsn::LdMem { offset, .. } = insn
                     && offset != -80
                 {
                     offsets.push(offset); // the patched one

@@ -12,6 +12,11 @@
 pub(crate) mod opcode {
     // ALU64 (class 0x07) — BPF_K (0x00) / BPF_X (0x08) source forms
     pub const MOV_IMM: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
+    pub const LD_IMM64: u8 = 0x18; // BPF_LD | BPF_DW | BPF_IMM (two slots)
+    // pseudo classes in the src_reg of an ldimm64 first slot (kernel:
+    // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE)
+    pub const PSEUDO_MAP_FD: u8 = 1;
+    pub const PSEUDO_MAP_VALUE: u8 = 2;
     pub const MOV_REG: u8 = 0xbf; // BPF_ALU64 | BPF_MOV | BPF_X
     pub const ADD_IMM: u8 = 0x07; // BPF_ALU64 | BPF_ADD | BPF_K
     pub const ADD_REG: u8 = 0x0f; // BPF_ALU64 | BPF_ADD | BPF_X
@@ -85,68 +90,300 @@ pub(crate) mod opcode {
 #[derive(Debug, Clone, PartialEq)]
 // register fields (dst/src/imm/offset) are consumed by state tracking (v0.2)
 pub enum BpfInsn {
-    MovImm { dst: u8, imm: i32 },
-    MovReg { dst: u8, src: u8 },
+    MovImm {
+        dst: u8,
+        imm: i32,
+    },
+    MovReg {
+        dst: u8,
+        src: u8,
+    },
     // ALU64
-    AddImm { dst: u8, imm: i32 },
-    AddReg { dst: u8, src: u8 },
-    SubImm { dst: u8, imm: i32 },
-    SubReg { dst: u8, src: u8 },
-    AndImm { dst: u8, imm: i32 },
-    AndReg { dst: u8, src: u8 },
-    OrImm { dst: u8, imm: i32 },
-    OrReg { dst: u8, src: u8 },
-    XorImm { dst: u8, imm: i32 },
-    XorReg { dst: u8, src: u8 },
-    LshImm { dst: u8, imm: i32 },
-    LshReg { dst: u8, src: u8 },
-    RshImm { dst: u8, imm: i32 },
-    RshReg { dst: u8, src: u8 },
-    ArshImm { dst: u8, imm: i32 },
-    ArshReg { dst: u8, src: u8 },
+    AddImm {
+        dst: u8,
+        imm: i32,
+    },
+    AddReg {
+        dst: u8,
+        src: u8,
+    },
+    SubImm {
+        dst: u8,
+        imm: i32,
+    },
+    SubReg {
+        dst: u8,
+        src: u8,
+    },
+    AndImm {
+        dst: u8,
+        imm: i32,
+    },
+    AndReg {
+        dst: u8,
+        src: u8,
+    },
+    OrImm {
+        dst: u8,
+        imm: i32,
+    },
+    OrReg {
+        dst: u8,
+        src: u8,
+    },
+    XorImm {
+        dst: u8,
+        imm: i32,
+    },
+    XorReg {
+        dst: u8,
+        src: u8,
+    },
+    LshImm {
+        dst: u8,
+        imm: i32,
+    },
+    LshReg {
+        dst: u8,
+        src: u8,
+    },
+    RshImm {
+        dst: u8,
+        imm: i32,
+    },
+    RshReg {
+        dst: u8,
+        src: u8,
+    },
+    ArshImm {
+        dst: u8,
+        imm: i32,
+    },
+    ArshReg {
+        dst: u8,
+        src: u8,
+    },
     // ALU32 (#39): truncating, zero-extended forms of every ALU op
-    Add32Imm { dst: u8, imm: i32 },
-    Add32Reg { dst: u8, src: u8 },
-    Sub32Imm { dst: u8, imm: i32 },
-    Sub32Reg { dst: u8, src: u8 },
-    And32Imm { dst: u8, imm: i32 },
-    And32Reg { dst: u8, src: u8 },
-    Or32Imm { dst: u8, imm: i32 },
-    Or32Reg { dst: u8, src: u8 },
-    Xor32Imm { dst: u8, imm: i32 },
-    Xor32Reg { dst: u8, src: u8 },
-    Lsh32Imm { dst: u8, imm: i32 },
-    Lsh32Reg { dst: u8, src: u8 },
-    Rsh32Imm { dst: u8, imm: i32 },
-    Rsh32Reg { dst: u8, src: u8 },
-    Arsh32Imm { dst: u8, imm: i32 },
-    Arsh32Reg { dst: u8, src: u8 },
-    LdStack { dst: u8, offset: i16 },
-    StStack { src: u8, offset: i16 },
+    Add32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Add32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Sub32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Sub32Reg {
+        dst: u8,
+        src: u8,
+    },
+    And32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    And32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Or32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Or32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Xor32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Xor32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Lsh32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Lsh32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Rsh32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Rsh32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Arsh32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Arsh32Reg {
+        dst: u8,
+        src: u8,
+    },
+    // 8-byte memory access through a base register (any register; the
+    // verifier requires a stack pointer base, #87). `base` is the
+    // kernel's src_reg for loads and dst_reg for stores.
+    LdMem {
+        dst: u8,
+        base: u8,
+        offset: i16,
+    },
+    StMem {
+        src: u8,
+        base: u8,
+        offset: i16,
+    },
+    // BPF_LD|BPF_DW|BPF_IMM (ldimm64, #89): two 8-byte slots in the
+    // kernel encoding, decoded as TWO entries — the real instruction
+    // plus a transparent `LdImm64Second` marker so every pc-relative
+    // offset stays in kernel slot units (branch targets count both
+    // slots; jumping into the marker is rejected like the kernel's
+    // "jump into the middle of ldimm64 insn").
+    LdImm64 {
+        dst: u8,
+        imm: u64,
+    },
+    /// `BPF_PSEUDO_MAP_FD`: `key_size`/`value_size` are filled at load
+    /// time from the map registry (decode yields 0).
+    LdMapFd {
+        dst: u8,
+        fd: u32,
+        key_size: u32,
+        value_size: u32,
+    },
+    /// `BPF_PSEUDO_MAP_VALUE`: second-slot imm is the offset into the
+    /// value; sizes filled at load time.
+    LdMapValue {
+        dst: u8,
+        fd: u32,
+        offset: u32,
+        key_size: u32,
+        value_size: u32,
+    },
+    /// The second slot of a decoded ldimm64 — never executed; jumps
+    /// into it are rejected by the CFG checks. Carries the slot's imm
+    /// (the high 32 bits of a plain constant, or the value offset for
+    /// BPF_PSEUDO_MAP_VALUE) so the pair roundtrips through the
+    /// encoder (#89).
+    LdImm64Second {
+        imm_hi: u32,
+    },
     // compares: equality, unsigned family, signed family (#39)
-    Jeq { dst: u8, src: u8, offset: i16 },
-    Jne { dst: u8, src: u8, offset: i16 },
-    Jgt { dst: u8, src: u8, offset: i16 },
-    Jge { dst: u8, src: u8, offset: i16 },
-    Jlt { dst: u8, src: u8, offset: i16 },
-    Jle { dst: u8, src: u8, offset: i16 },
-    Jsgt { dst: u8, src: u8, offset: i16 },
-    Jsge { dst: u8, src: u8, offset: i16 },
-    Jslt { dst: u8, src: u8, offset: i16 },
-    Jsle { dst: u8, src: u8, offset: i16 },
+    Jeq {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jne {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jgt {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jge {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jlt {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jle {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jsgt {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jsge {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jslt {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    Jsle {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
     // immediate forms of every compare (BPF_J*_K, #57)
-    JeqImm { dst: u8, imm: i32, offset: i16 },
-    JneImm { dst: u8, imm: i32, offset: i16 },
-    JgtImm { dst: u8, imm: i32, offset: i16 },
-    JgeImm { dst: u8, imm: i32, offset: i16 },
-    JltImm { dst: u8, imm: i32, offset: i16 },
-    JleImm { dst: u8, imm: i32, offset: i16 },
-    JsgtImm { dst: u8, imm: i32, offset: i16 },
-    JsgeImm { dst: u8, imm: i32, offset: i16 },
-    JsltImm { dst: u8, imm: i32, offset: i16 },
-    JsleImm { dst: u8, imm: i32, offset: i16 },
-    Jmp { offset: i16 },
-    Call { imm: i32 },
+    JeqImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JneImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JgtImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JgeImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JltImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JleImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JsgtImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JsgeImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JsltImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    JsleImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    Jmp {
+        offset: i16,
+    },
+    Call {
+        imm: i32,
+    },
     Exit,
 }
 
@@ -200,6 +437,9 @@ pub enum DecodeError {
     InvalidRegister { reg: u8 },
     /// Non-zero reserved fields (kernel's check_*_fields messages).
     ReservedFields { message: &'static str },
+    /// A `BPF_LD|BPF_DW|BPF_IMM` first slot without its second slot
+    /// (kernel: "invalid bpf_ldimm64 insn").
+    LdImm64Truncated,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -211,6 +451,9 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::InvalidRegister { reg } => write!(f, "R{} is invalid", reg),
             DecodeError::ReservedFields { message } => f.write_str(message),
+            DecodeError::LdImm64Truncated => {
+                write!(f, "invalid bpf_ldimm64 insn (missing second slot)")
+            }
         }
     }
 }
@@ -262,8 +505,9 @@ fn is_supported_alu(op: u8) -> bool {
 /// instruction table at all (`unknown opcode`).
 fn unsupported_reason(op: u8) -> Option<&'static str> {
     match op & 0x07 {
-        // BPF_LD: 64-bit immediates (0x18) and the legacy loads
-        0x00 => Some("BPF_LD (ldimm64 and legacy absolute/indirect loads) is not implemented"),
+        // BPF_LD: the legacy absolute/indirect loads (0x00-0x0f);
+        // ldimm64 (0x18) is decoded by parse_ldimm64 (#89)
+        0x00 => Some("BPF_LD legacy absolute/indirect loads are not implemented"),
         // BPF_ST: store-immediate
         0x02 => Some("BPF_ST (store-immediate) is not implemented"),
         // BPF_JMP32: 32-bit compares
@@ -463,35 +707,35 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
             }
             Ok(BpfInsn::Exit)
         }
-        // BPF_LDX|BPF_MEM|BPF_DW with R10 as the base register
+        // ldimm64 is two slots: the first slot alone is truncated. The
+        // full two-slot decode happens in `parse_ldimm64` (driven by the
+        // program loader, which owns the chunk stream).
+        opcode::LD_IMM64 => Err(DecodeError::LdImm64Truncated),
+        // BPF_LDX|BPF_MEM|BPF_DW — 8-byte load from [base + off]
         opcode::LD_STACK => {
             if imm != 0 {
                 return Err(DecodeError::ReservedFields {
                     message: "BPF_LDX uses reserved fields",
                 });
             }
-            if src != 10 {
-                return Err(DecodeError::Unsupported {
-                    op,
-                    reason: "loads from a non-stack base register are not implemented",
-                });
-            }
-            Ok(BpfInsn::LdStack { dst, offset })
+            Ok(BpfInsn::LdMem {
+                dst,
+                base: src,
+                offset,
+            })
         }
-        // BPF_STX|BPF_MEM|BPF_DW with R10 as the base register
+        // BPF_STX|BPF_MEM|BPF_DW — 8-byte store to [base + off]
         opcode::ST_STACK => {
             if imm != 0 {
                 return Err(DecodeError::ReservedFields {
                     message: "BPF_STX uses reserved fields",
                 });
             }
-            if dst != 10 {
-                return Err(DecodeError::Unsupported {
-                    op,
-                    reason: "stores to a non-stack base register are not implemented",
-                });
-            }
-            Ok(BpfInsn::StStack { src, offset })
+            Ok(BpfInsn::StMem {
+                src,
+                base: dst,
+                offset,
+            })
         }
         _ => {
             if let Some(reason) = unsupported_reason(op) {
@@ -503,10 +747,106 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
     }
 }
 
+/// Decode a whole program (kernel slot stream) into instructions (#89).
+/// ldimm64 (0x18) consumes two slots and decodes to the instruction
+/// plus a transparent `LdImm64Second` marker, so branch offsets stay in
+/// kernel slot units. The first decode error stops the decode; the
+/// error carries the failing slot index.
+pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)> {
+    let mut insns = Vec::new();
+    let mut idx = 0usize;
+    let chunks: Vec<&[u8]> = bytes.chunks_exact(8).collect();
+    while idx < chunks.len() {
+        if chunks[idx][0] == opcode::LD_IMM64 {
+            let second = chunks
+                .get(idx + 1)
+                .ok_or((idx, DecodeError::LdImm64Truncated))?;
+            insns.push(parse_ldimm64(chunks[idx], second).map_err(|e| (idx, e))?);
+            insns.push(BpfInsn::LdImm64Second {
+                imm_hi: u32::from_le_bytes([second[4], second[5], second[6], second[7]]),
+            });
+            idx += 2;
+        } else {
+            insns.push(parse_insn(chunks[idx]).map_err(|e| (idx, e))?);
+            idx += 1;
+        }
+    }
+    Ok(insns)
+}
+
+/// Decode a two-slot `BPF_LD|BPF_DW|BPF_IMM` (ldimm64, #89). `first` is
+/// the instruction slot, `second` its 64-bit continuation. The pseudo
+/// classes (kernel `BPF_PSEUDO_*` in `src_reg`) select the meaning:
+/// 0 = plain 64-bit constant, 1 = `BPF_PSEUDO_MAP_FD`, 2 =
+/// `BPF_PSEUDO_MAP_VALUE` (second-slot imm = offset into the value).
+/// The map fd forms carry `key_size`/`value_size` filled by the program
+/// loader from the map registry (decode yields 0).
+pub fn parse_ldimm64(first: &[u8], second: &[u8]) -> Result<BpfInsn, DecodeError> {
+    debug_assert_eq!(first.len(), 8);
+    debug_assert_eq!(second.len(), 8);
+    let regs = first[1];
+    let dst = regs & 0x0F;
+    let src = (regs >> 4) & 0x0F;
+    let offset = i16::from_le_bytes([first[2], first[3]]);
+    let imm_lo = u32::from_le_bytes([first[4], first[5], first[6], first[7]]);
+    let imm_hi = u32::from_le_bytes([second[4], second[5], second[6], second[7]]);
+
+    if dst > 10 {
+        return Err(DecodeError::InvalidRegister { reg: dst });
+    }
+    // first slot: off is reserved; second slot: code/src/off reserved
+    if offset != 0 {
+        return Err(DecodeError::ReservedFields {
+            message: "BPF_LD uses reserved fields",
+        });
+    }
+    if second[0] != 0 || second[1] != 0 || i16::from_le_bytes([second[2], second[3]]) != 0 {
+        return Err(DecodeError::ReservedFields {
+            message: "invalid second part of bpf_ldimm64 insn",
+        });
+    }
+    match src {
+        0 => Ok(BpfInsn::LdImm64 {
+            dst,
+            imm: (imm_hi as u64) << 32 | imm_lo as u64,
+        }),
+        opcode::PSEUDO_MAP_FD => {
+            if imm_hi != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_PSEUDO_MAP_FD uses the second slot as a reserved field",
+                });
+            }
+            Ok(BpfInsn::LdMapFd {
+                dst,
+                fd: imm_lo,
+                key_size: 0,
+                value_size: 0,
+            })
+        }
+        opcode::PSEUDO_MAP_VALUE => Ok(BpfInsn::LdMapValue {
+            dst,
+            fd: imm_lo,
+            offset: imm_hi,
+            key_size: 0,
+            value_size: 0,
+        }),
+        _ => Err(DecodeError::Unsupported {
+            op: 0x18,
+            reason: "unknown ldimm64 pseudo class",
+        }),
+    }
+}
+
 /// Render a single instruction in a readable eBPF-like syntax.
 pub fn disassemble(insn: &BpfInsn) -> String {
     match insn {
         BpfInsn::MovImm { dst, imm } => format!("r{} = {}", dst, imm),
+        BpfInsn::LdImm64 { dst, imm } => format!("r{} = 0x{:016x}", dst, imm),
+        BpfInsn::LdMapFd { dst, fd, .. } => format!("r{} = map_fd({})", dst, fd),
+        BpfInsn::LdMapValue {
+            dst, fd, offset, ..
+        } => format!("r{} = map_value_fd({})+{}", dst, fd, offset),
+        BpfInsn::LdImm64Second { imm_hi } => format!("(second slot of ldimm64, imm_hi={})", imm_hi),
         BpfInsn::MovReg { dst, src } => format!("r{} = r{}", dst, src),
         BpfInsn::AddImm { dst, imm } => format!("r{} += {}", dst, imm),
         BpfInsn::AddReg { dst, src } => format!("r{} += r{}", dst, src),
@@ -542,8 +882,8 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         BpfInsn::Rsh32Reg { dst, src } => format!("w{} >>= r{}", dst, src),
         BpfInsn::Arsh32Imm { dst, imm } => format!("w{} s>>= {}", dst, imm),
         BpfInsn::Arsh32Reg { dst, src } => format!("w{} s>>= r{}", dst, src),
-        BpfInsn::LdStack { dst, offset } => format!("r{} = [r10{:+}]", dst, offset),
-        BpfInsn::StStack { src, offset } => format!("[r10{:+}] = r{}", offset, src),
+        BpfInsn::LdMem { dst, base, offset } => format!("r{} = [r{}{:+}]", dst, base, offset),
+        BpfInsn::StMem { src, base, offset } => format!("[r{}{:+}] = r{}", base, offset, src),
         BpfInsn::Jeq { dst, src, offset } => {
             format!("if r{} == r{} goto {:+}", dst, src, offset)
         }
@@ -646,18 +986,49 @@ mod tests {
 
     #[test]
     fn parse_insn_ld_stack() {
-        // BPF_LDX|BPF_MEM|BPF_DW: the base register field (src_reg)
-        // must name R10 (the frame pointer)
+        // BPF_LDX|BPF_MEM|BPF_DW: src_reg is the base register (#87 —
+        // any register; the verifier requires a stack pointer at exec)
         let insn = parse(opcode::LD_STACK, 0, 10, -8, 0);
-        assert!(matches!(insn, BpfInsn::LdStack { dst: 0, offset: -8 }));
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }
+        ));
+        let insn = parse(opcode::LD_STACK, 0, 6, -8, 0);
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 6,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
     fn parse_insn_st_stack() {
-        // BPF_STX|BPF_MEM|BPF_DW: the base register field (dst_reg)
-        // must name R10 (the frame pointer)
+        // BPF_STX|BPF_MEM|BPF_DW: dst_reg is the base register (#87)
         let insn = parse(opcode::ST_STACK, 10, 1, -8, 0);
-        assert!(matches!(insn, BpfInsn::StStack { src: 1, offset: -8 }));
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8
+            }
+        ));
+        let insn = parse(opcode::ST_STACK, 6, 1, -8, 0);
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 1,
+                base: 6,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
@@ -670,6 +1041,54 @@ mod tests {
                 src: 2,
                 offset: 4
             }
+        ));
+    }
+
+    #[test]
+    fn parse_ldimm64_variants() {
+        // plain 64-bit constant: imm64 = low | high << 32
+        let first = insn_bytes(opcode::LD_IMM64, 2, 0, 0, 0x90abcdef_u32 as i32);
+        let second = insn_bytes(0x00, 0, 0, 0, 0x12345678_u32 as i32);
+        assert_eq!(
+            parse_ldimm64(&first, &second).unwrap(),
+            BpfInsn::LdImm64 {
+                dst: 2,
+                imm: 0x1234567890abcdef,
+            }
+        );
+        // BPF_PSEUDO_MAP_FD: fd in the low imm, the high imm is reserved
+        let first = insn_bytes(opcode::LD_IMM64, 1, opcode::PSEUDO_MAP_FD, 0, 3);
+        let insn = parse_ldimm64(&first, &[0u8; 8]).unwrap();
+        assert!(matches!(insn, BpfInsn::LdMapFd { dst: 1, fd: 3, .. }));
+        let err = parse_ldimm64(&first, &insn_bytes(0x00, 0, 0, 0, 7)).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+        // BPF_PSEUDO_MAP_VALUE: the high imm is the value offset
+        let first = insn_bytes(opcode::LD_IMM64, 4, opcode::PSEUDO_MAP_VALUE, 0, 3);
+        let second = insn_bytes(0x00, 0, 0, 0, 8);
+        let insn = parse_ldimm64(&first, &second).unwrap();
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMapValue {
+                dst: 4,
+                fd: 3,
+                offset: 8,
+                ..
+            }
+        ));
+        // unknown pseudo classes are unsupported
+        let first = insn_bytes(opcode::LD_IMM64, 1, 9, 0, 3);
+        assert!(matches!(
+            parse_ldimm64(&first, &[0u8; 8]).unwrap_err(),
+            DecodeError::Unsupported { .. }
+        ));
+        // reserved fields in the second slot
+        let first = insn_bytes(opcode::LD_IMM64, 1, 0, 0, 3);
+        let err = parse_ldimm64(&first, &insn_bytes(0x01, 0, 0, 0, 0)).unwrap_err();
+        assert!(err.to_string().contains("second part"), "{err}");
+        // a lone first slot is truncated
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::LD_IMM64, 1, 0, 0, 3)),
+            Err(DecodeError::LdImm64Truncated)
         ));
     }
 
@@ -989,13 +1408,26 @@ mod tests {
 
     #[test]
     fn parse_insn_ld_st_base_register() {
-        // LDX with a base other than R10 and STX with a base other than
-        // R10 are valid kernel instructions the verifier does not
-        // implement (map/ctx access) — explicit unsupported errors
-        let err = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 1, -8, 0)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x79, .. }));
-        let err = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x7b, .. }));
+        // LDX/STX accept any base register at decode (#87); the
+        // verifier requires a stack pointer at exec time
+        let insn = parse_insn(&insn_bytes(opcode::LD_STACK, 0, 1, -8, 0)).unwrap();
+        assert!(matches!(
+            insn,
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 1,
+                offset: -8
+            }
+        ));
+        let insn = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap();
+        assert!(matches!(
+            insn,
+            BpfInsn::StMem {
+                src: 2,
+                base: 1,
+                offset: -8
+            }
+        ));
     }
 
     #[test]
@@ -1021,8 +1453,6 @@ mod tests {
         // every unimplemented kernel opcode class gets a structured
         // Unsupported error with a reason
         let unsupported = [
-            // BPF_LD|BPF_IMM|BPF_DW (ldimm64)
-            (0x18u8, "ldimm64"),
             // BPF_ST|BPF_MEM|BPF_DW (store-immediate)
             (0x7a, "BPF_ST"),
             // BPF_JMP32|BPF_JA
@@ -1177,15 +1607,28 @@ mod tests {
         assert_eq!(disassemble(&BpfInsn::AddImm { dst: 2, imm: 5 }), "r2 += 5");
         assert_eq!(disassemble(&BpfInsn::AddReg { dst: 1, src: 2 }), "r1 += r2");
         assert_eq!(
-            disassemble(&BpfInsn::LdStack { dst: 0, offset: -8 }),
+            disassemble(&BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8
+            }),
             "r0 = [r10-8]"
         );
         assert_eq!(
-            disassemble(&BpfInsn::StStack {
+            disassemble(&BpfInsn::StMem {
                 src: 2,
+                base: 10,
                 offset: -16
             }),
             "[r10-16] = r2"
+        );
+        assert_eq!(
+            disassemble(&BpfInsn::LdMem {
+                dst: 0,
+                base: 6,
+                offset: 0
+            }),
+            "r0 = [r6+0]"
         );
         assert_eq!(
             disassemble(&BpfInsn::Jeq {

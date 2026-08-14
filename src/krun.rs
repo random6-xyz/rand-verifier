@@ -1,9 +1,16 @@
 // ── Kernel-side loading via the raw bpf() syscall (issues #59/#60) ──────────
 
+use std::collections::HashMap;
+
+use crate::env::{MapInfo, MapType};
 use crate::klog::{ReasonCategory, categorize_reason, parse_verifier_log};
 
+const BPF_MAP_CREATE: u32 = 0;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_PSEUDO_MAP_FD: u8 = 1;
+const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 /// 1 MiB verifier log buffer, like libbpf's default.
 pub const LOG_BUF_SIZE: usize = 1 << 20;
 
@@ -55,6 +62,141 @@ struct BpfProgLoadAttr {
     log_level: u32,
     log_size: u32,
     log_buf: u64,
+}
+
+/// Raw `bpf(BPF_MAP_CREATE, ...)` syscall (#89): creates a real map so
+/// ldimm64 pseudo instructions can reference a live fd, like libbpf
+/// does before the load. Returns the map fd, or the errno.
+fn bpf_map_create(info: &MapInfo) -> Result<i32, i32> {
+    let map_type = match info.map_type {
+        MapType::Array => BPF_MAP_TYPE_ARRAY,
+    };
+    #[repr(C)]
+    #[derive(Default)]
+    struct BpfMapCreateAttr {
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+        inner_map_fd: u32,
+        numa_node: u32,
+        map_name: [u8; 16],
+        map_ifindex: u32,
+        btf_fd: u32,
+        btf_key_type_id: u32,
+        btf_value_type_id: u32,
+        btf_vmlinux_value_type_id: u32,
+        map_extra: u64,
+    }
+    let attr = BpfMapCreateAttr {
+        map_type,
+        key_size: info.key_size,
+        value_size: info.value_size,
+        max_entries: info.max_entries,
+        ..Default::default()
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_CREATE,
+            &attr as *const BpfMapCreateAttr,
+            std::mem::size_of::<BpfMapCreateAttr>(),
+        )
+    };
+    if rc < 0 {
+        Err(rc as i32)
+    } else {
+        Ok(rc as i32)
+    }
+}
+
+/// Replace the map-fd immediates of every ldimm64 pseudo instruction
+/// with the real kernel fds (#89): for `BPF_PSEUDO_MAP_FD` the first
+/// slot's imm is the fd; for `BPF_PSEUDO_MAP_VALUE` the second slot's
+/// imm is the value offset and the first slot's imm is the fd. The
+/// offset is preserved.
+fn patch_map_fds(insns: &[u8], fds: &HashMap<u32, i32>) -> Vec<u8> {
+    let mut out = insns.to_vec();
+    let mut i = 0usize;
+    while i + 16 <= out.len() {
+        if out[i] == 0x18 {
+            let pseudo = (out[i + 1] >> 4) & 0x0F;
+            if pseudo == BPF_PSEUDO_MAP_FD || pseudo == BPF_PSEUDO_MAP_VALUE {
+                let fd = u32::from_le_bytes([out[i + 4], out[i + 5], out[i + 6], out[i + 7]]);
+                if let Some(real) = fds.get(&fd) {
+                    out[i + 4..i + 8].copy_from_slice(&real.to_le_bytes());
+                }
+            }
+            i += 16;
+        } else {
+            i += 8;
+        }
+    }
+    out
+}
+
+/// Collect the map fds referenced by ldimm64 pseudo instructions.
+fn referenced_map_fds(insns: &[u8]) -> Vec<u32> {
+    let mut fds = Vec::new();
+    let mut i = 0usize;
+    while i + 16 <= insns.len() {
+        if insns[i] == 0x18 {
+            let pseudo = (insns[i + 1] >> 4) & 0x0F;
+            if pseudo == BPF_PSEUDO_MAP_FD || pseudo == BPF_PSEUDO_MAP_VALUE {
+                let fd =
+                    u32::from_le_bytes([insns[i + 4], insns[i + 5], insns[i + 6], insns[i + 7]]);
+                if !fds.contains(&fd) {
+                    fds.push(fd);
+                }
+            }
+            i += 16;
+        } else {
+            i += 8;
+        }
+    }
+    fds
+}
+
+/// [`load_with_kernel`] with a map registry (#89): every referenced map
+/// fd is created as a real kernel map (BPF_MAP_CREATE, ARRAY) and the
+/// ldimm64 immediates are patched with the live fds before the load,
+/// like libbpf does. The maps are closed afterwards.
+pub fn load_with_kernel_maps(insns: &[u8], maps: &HashMap<u32, MapInfo>) -> KernelOutcome {
+    load_with_kernel_maps_level(insns, maps, 1).0
+}
+
+/// [`load_with_kernel_maps`] with a log level (1 = errors only,
+/// 2 = full state dumps kept on accept).
+pub fn load_with_kernel_maps_level(
+    insns: &[u8],
+    maps: &HashMap<u32, MapInfo>,
+    log_level: u32,
+) -> (KernelOutcome, String) {
+    // create the referenced maps first
+    let mut live: HashMap<u32, i32> = HashMap::new();
+    for fd in referenced_map_fds(insns) {
+        let Some(info) = maps.get(&fd) else {
+            continue;
+        };
+        match bpf_map_create(info) {
+            Ok(real) => {
+                live.insert(fd, real);
+            }
+            Err(errno) => {
+                if errno == -libc::EPERM {
+                    return (KernelOutcome::Privilege, String::new());
+                }
+                return (KernelOutcome::NoErrorLine { errno }, String::new());
+            }
+        }
+    }
+    let patched = patch_map_fds(insns, &live);
+    let (outcome, log) = load_with_level(&patched, log_level);
+    for real in live.values() {
+        unsafe { libc::close(*real) };
+    }
+    (outcome, log)
 }
 
 /// Raw `bpf(BPF_PROG_LOAD, ...)` syscall. `log_buf` receives the

@@ -328,13 +328,11 @@ fn load_corpus_seeds() -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str
                 continue;
             }
             let bytes = fs::read(&path)?;
-            let mut insns = Vec::new();
-            for chunk in bytes.chunks_exact(8) {
-                insns.push(
-                    rand_verifier::insn::parse_insn(chunk)
-                        .map_err(|e| anyhow::anyhow!("{}: decode: {e}", path.display()))?,
-                );
-            }
+            // skip decode-invalid fixtures (e.g. ldimm64_bad_pseudo):
+            // there is no instruction stream to mutate from
+            let Ok(insns) = rand_verifier::insn::decode_program(&bytes) else {
+                continue;
+            };
             seeds.push((
                 path.file_stem().unwrap().to_string_lossy().into_owned(),
                 insns,
@@ -529,11 +527,13 @@ fn save_finding(dir: &Path, env: &BpfVerifierEnv, result: &ProgramResult) -> any
     fs::write(dir.join("prog.bin"), result.bytes)?;
 
     let mut dump = String::new();
-    for (idx, chunk) in result.bytes.chunks_exact(8).enumerate() {
-        match rand_verifier::insn::parse_insn(chunk) {
-            Ok(insn) => dump.push_str(&format!("{idx:4}: {insn:?}\n")),
-            Err(e) => dump.push_str(&format!("{idx:4}: decode error: {e}\n")),
+    match rand_verifier::insn::decode_program(result.bytes) {
+        Ok(decoded) => {
+            for (idx, insn) in decoded.iter().enumerate() {
+                dump.push_str(&format!("{idx:4}: {insn:?}\n"));
+            }
         }
+        Err((idx, e)) => dump.push_str(&format!("{idx:4}: decode error: {e}\n")),
     }
     fs::write(dir.join("prog.dump"), dump)?;
 

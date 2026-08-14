@@ -19,7 +19,7 @@
 
 use crate::fuzz::insn_lib::encode;
 use crate::fuzz::reduce::fixup::{branch_offset, delete_insns};
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::BpfInsn;
 
 /// The successors of one instruction in the decoded CFG. Both sides of
 /// a conditional branch are explored (like the verifier); out-of-range
@@ -207,11 +207,7 @@ fn decode(bytes: &[u8]) -> Option<Vec<BpfInsn>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(8) {
         return None;
     }
-    bytes
-        .chunks_exact(8)
-        .map(parse_insn)
-        .collect::<Result<_, _>>()
-        .ok()
+    crate::insn::decode_program(bytes).ok()
 }
 
 fn encode_all(insns: &[BpfInsn]) -> Vec<u8> {

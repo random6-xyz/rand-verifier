@@ -59,9 +59,25 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         BpfInsn::Rsh32Reg { dst, src } => (opcode::RSH32_REG, *dst, *src, 0, 0),
         BpfInsn::Arsh32Imm { dst, imm } => (opcode::ARSH32_IMM, *dst, 0, 0, *imm),
         BpfInsn::Arsh32Reg { dst, src } => (opcode::ARSH32_REG, *dst, *src, 0, 0),
-        // stack accesses — DW only, frame-pointer relative (R10)
-        BpfInsn::LdStack { dst, offset } => (opcode::LD_STACK, *dst, 10, *offset, 0),
-        BpfInsn::StStack { src, offset } => (opcode::ST_STACK, 10, *src, *offset, 0),
+        // stack accesses — DW only, any base register (#87; the
+        // verifier requires a stack pointer at exec time)
+        BpfInsn::LdMem { dst, base, offset } => (opcode::LD_STACK, *dst, *base, *offset, 0),
+        BpfInsn::StMem { src, base, offset } => (opcode::ST_STACK, *base, *src, *offset, 0),
+        // ldimm64 (#89): each entry encodes one 8-byte slot — the
+        // instruction pair [LdImm64/LdMap*, LdImm64Second] roundtrips
+        // to the kernel's two-slot encoding
+        BpfInsn::LdImm64 { dst, imm } => (opcode::LD_IMM64, *dst, 0, 0, *imm as u32 as i32),
+        BpfInsn::LdMapFd { dst, fd, .. } => {
+            (opcode::LD_IMM64, *dst, opcode::PSEUDO_MAP_FD, 0, *fd as i32)
+        }
+        BpfInsn::LdMapValue { dst, fd, .. } => (
+            opcode::LD_IMM64,
+            *dst,
+            opcode::PSEUDO_MAP_VALUE,
+            0,
+            *fd as i32,
+        ),
+        BpfInsn::LdImm64Second { imm_hi } => (0x00, 0, 0, 0, *imm_hi as i32),
         // compares — register and immediate forms
         BpfInsn::Jeq { dst, src, offset } => (opcode::JEQ, *dst, *src, *offset, 0),
         BpfInsn::Jne { dst, src, offset } => (opcode::JNE, *dst, *src, *offset, 0),
@@ -188,12 +204,20 @@ alu32_x_builder!(arsh32_reg => Arsh32Reg);
 
 /// Load an 8-byte stack slot into `dst`: `dst = *(u64 *)(r10 + offset)`.
 pub fn ld_stack(dst: u8, offset: i16) -> BpfInsn {
-    BpfInsn::LdStack { dst, offset }
+    BpfInsn::LdMem {
+        dst,
+        base: 10,
+        offset,
+    }
 }
 
 /// Store `src` into an 8-byte stack slot: `*(u64 *)(r10 + offset) = src`.
 pub fn st_stack(src: u8, offset: i16) -> BpfInsn {
-    BpfInsn::StStack { src, offset }
+    BpfInsn::StMem {
+        src,
+        base: 10,
+        offset,
+    }
 }
 
 // compares — X forms (dst, src, offset)
@@ -328,7 +352,11 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::JsltImm { .. }
         | BpfInsn::Jsle { .. }
         | BpfInsn::JsleImm { .. } => "cmp_signed",
-        BpfInsn::LdStack { .. } | BpfInsn::StStack { .. } => "stack",
+        BpfInsn::LdMem { .. } | BpfInsn::StMem { .. } => "stack",
+        BpfInsn::LdImm64 { .. }
+        | BpfInsn::LdMapFd { .. }
+        | BpfInsn::LdMapValue { .. }
+        | BpfInsn::LdImm64Second { .. } => "ldimm64",
         BpfInsn::Call { .. } => "helper",
         BpfInsn::Jmp { .. } => "jmp",
         BpfInsn::Exit => "exit",
