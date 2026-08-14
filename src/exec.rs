@@ -4,8 +4,8 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    ALIGN_UNKNOWN, RegState, STACK_SIZE, ScalarBounds, StackSlot, VerifierState, check_reg,
-    read_reg, read_scalar, stack_slot_index,
+    ALIGN_UNKNOWN, RegState, ScalarBounds, StackSlot, VerifierState, check_reg, read_reg,
+    read_scalar, stack_slot_index,
 };
 use crate::tnum::Tnum;
 
@@ -218,9 +218,12 @@ fn alu_imm(
             next.regs[dst as usize] = RegState::Scalar(next_bounds);
             Ok(next)
         }
-        // PtrToStack + imm => PtrToStack at the shifted offset; the
-        // pointer must stay within the frame (cf. #19). Only ADD is
-        // allowed on stack pointers — like the kernel's check_alu_op.
+        // PtrToStack + imm => PtrToStack at the shifted offset; only
+        // ADD is allowed on stack pointers — like the kernel's
+        // check_alu_op. The offset interval is widened unconditionally:
+        // frame bounds and alignment are validated at access time
+        // (#87, kernel adjust_ptr_min_max_vals — no arithmetic-time
+        // bounds check for privileged loads).
         RegState::PtrToStack {
             min_offset,
             max_offset,
@@ -235,17 +238,11 @@ fn alu_imm(
                     ),
                 ));
             }
-            let new_min = min_offset.wrapping_add(imm);
-            let new_max = max_offset.wrapping_add(imm);
-            if new_min < -(STACK_SIZE as i32) || new_max > 0 {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "stack pointer r{} offsets {}..{} are out of the {} byte frame",
-                        dst, new_min, new_max, STACK_SIZE
-                    ),
-                ));
-            }
+            // saturating add keeps the interval inside i32; anything
+            // beyond is far out of the 512-byte frame and rejected by
+            // any later access
+            let new_min = min_offset.saturating_add(imm);
+            let new_max = max_offset.saturating_add(imm);
             let mut next = *state;
             next.regs[dst as usize] = RegState::PtrToStack {
                 min_offset: new_min,
@@ -282,9 +279,11 @@ fn alu_imm(
 
 /// Execute an ALU operation with a register operand.
 ///
-/// Both operands must be scalars; register-offset pointer arithmetic is
-/// not supported yet (only immediate offsets, #20) — the real bounds and
-/// alignment checks for `PtrToStack + ScalarRange` land in #45.
+/// Scalar operands get the (possibly over-approximated) result range;
+/// `PtrToStack + ScalarRange` widens the pointer's offset interval, and
+/// `Scalar + PtrToStack` (ADD only) makes the destination inherit the
+/// pointer state — both mirror the kernel's adjust_ptr_min_max_vals
+/// (no arithmetic-time bounds check, #87).
 fn alu_reg(
     pc: u32,
     state: &VerifierState,
@@ -328,6 +327,20 @@ fn alu_reg(
             ));
         }
     };
+    // scalar += stack pointer: the destination inherits the complete
+    // pointer state and shifts by the scalar range (kernel
+    // adjust_ptr_min_max_vals: "dst_reg inherits the complete pointer
+    // register state") — #87
+    if op == AluOp::Add
+        && width == AluWidth::W64
+        && let RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } = read_reg(pc, state, src)?
+    {
+        return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, d, state);
+    }
     let s = read_scalar(pc, state, src)?;
     // shifts require a provable amount below the width (kernel
     // check_alu_op: "< 64 range, for 32-bit < 32 range")
@@ -340,23 +353,14 @@ fn alu_reg(
     Ok(next)
 }
 
-/// The out-of-frame error for computed pointer arithmetic.
-fn out_of_frame_error(pc: u32, dst: u8) -> VerificationFailure {
-    VerificationFailure::new(
-        pc,
-        format!(
-            "stack pointer r{} may leave the {} byte frame (computed offsets)",
-            dst, STACK_SIZE
-        ),
-    )
-}
-
-/// `PtrToStack + ScalarRange` (#45): the resulting offsets must provably
-/// stay within the frame, and a computed (non-exact) offset must be
-/// provably 8-byte aligned (the scalar's tnum determines the low three
-/// bits of the added amount).
+/// `PtrToStack + ScalarRange` (#87): the offset interval is widened by
+/// the scalar's signed range (saturated to i32) and the alignment is
+/// tracked when the scalar's tnum determines the low three bits. Frame
+/// bounds and alignment are validated at access time, mirroring the
+/// kernel's adjust_ptr_min_max_vals (no arithmetic-time checks for
+/// privileged loads).
 fn add_scalar_to_stack_ptr(
-    pc: u32,
+    _pc: u32,
     dst: u8,
     min_offset: i32,
     max_offset: i32,
@@ -364,45 +368,28 @@ fn add_scalar_to_stack_ptr(
     s: ScalarBounds,
     state: &VerifierState,
 ) -> Result<VerifierState, VerificationFailure> {
-    // the offset range shifts by the scalar's signed range; a sum that
-    // overflows i64 means some resulting offset is far out of the frame
-    let new_min = match (min_offset as i64).checked_add(s.smin) {
-        Some(v) => v,
-        None => return Err(out_of_frame_error(pc, dst)),
-    };
-    let new_max = match (max_offset as i64).checked_add(s.smax) {
-        Some(v) => v,
-        None => return Err(out_of_frame_error(pc, dst)),
-    };
-    if new_min < -(STACK_SIZE as i64) || new_max > 0 {
-        return Err(out_of_frame_error(pc, dst));
-    }
+    let new_min = clamp_offset((min_offset as i64).saturating_add(s.smin));
+    let new_max = clamp_offset((max_offset as i64).saturating_add(s.smax));
     // alignment: the low three bits of the scalar's tnum, when known
     let new_align = if s.tnum.mask & 7 == 0 {
         (align_off as i32 + (s.tnum.value & 7) as i32).rem_euclid(8) as u8
     } else {
         ALIGN_UNKNOWN
     };
-    // a computed (non-exact) offset must be provably 8-byte aligned —
-    // this is the model's access-time requirement: every stack access
-    // is an 8-byte slot access, so every possible concrete offset must
-    // be aligned
-    if new_min != new_max && new_align == ALIGN_UNKNOWN {
-        return Err(VerificationFailure::new(
-            pc,
-            format!(
-                "stack pointer r{} alignment is not provable (computed offsets must be 8-byte aligned)",
-                dst
-            ),
-        ));
-    }
     let mut next = *state;
     next.regs[dst as usize] = RegState::PtrToStack {
-        min_offset: new_min as i32,
-        max_offset: new_max as i32,
+        min_offset: new_min,
+        max_offset: new_max,
         align_off: new_align,
     };
     Ok(next)
+}
+
+/// Clamp an i64 offset into the i32 interval representation. Anything
+/// beyond i32 range is far out of the 512-byte frame either way, so the
+/// access-time bounds check still rejects it.
+fn clamp_offset(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 /// Apply an ALU operation to scalar bounds: both interpretations are
@@ -1705,13 +1692,24 @@ mod tests {
         let state = VerifierState::initial();
         let err = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap_err();
         assert!(err.message.contains("context pointer"));
-        // r0 += r10 with R10 = PtrToStack → register-offset pointer arithmetic is rejected
+        // r10 += r1 with R1 = PtrToCtx → a pointer destination with a
+        // non-scalar source is rejected
         let state = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
-        let err = step(0, &state, &BpfInsn::AddReg { dst: 0, src: 10 }).unwrap_err();
-        assert!(err.message.contains("register-offset"));
-        // r10 += r1 with R1 = PtrToCtx → a pointer destination is rejected too
         let err = step(0, &state, &BpfInsn::AddReg { dst: 10, src: 1 }).unwrap_err();
         assert!(err.message.contains("register-offset"));
+    }
+
+    #[test]
+    fn step_add_scalar_plus_ptr_inherits_pointer_state() {
+        // r0 = 1; r0 += r10 → the destination inherits the stack pointer
+        // state shifted by the scalar (#87; kernel adjust_ptr_min_max_vals:
+        // "dst_reg inherits the complete pointer register state")
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 0, src: 10 }).unwrap();
+        assert_eq!(next.regs[0], ptr_stack(1));
+        // the source pointer is untouched
+        assert_eq!(next.regs[10], ptr_stack(0));
     }
 
     // ── ALU extension (Meso #39) ─────────────────────────────────────────────
@@ -2713,8 +2711,9 @@ mod tests {
     }
 
     #[test]
-    fn step_add_reg_stack_ptr_out_of_frame() {
-        // the range can exceed the frame → REJECT with a bounds message
+    fn step_add_reg_stack_ptr_widens_interval() {
+        // #87: out-of-frame arithmetic is no longer rejected — the
+        // interval widens; access-time checks reject any later access
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToStack {
             min_offset: -32,
@@ -2732,21 +2731,38 @@ mod tests {
             u32_max: 1000,
             tnum: Tnum::unknown(),
         });
-        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
-        assert!(err.message.contains("may leave the"), "{}", err.message);
-        // r1 = r10 (offset 0) + [0, 8] includes offset 8 → REJECT too
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        let RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } = next.regs[1]
+        else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!((min_offset, max_offset), (-32, 968));
+        assert_eq!(align_off, ALIGN_UNKNOWN);
+        // r1 = r10 (offset 0) + [0, 8] → interval [0, 8]
         let mut state = VerifierState::initial();
         state.regs[1] = ptr_stack(0);
         state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 8));
-        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
-        assert!(err.message.contains("may leave the"), "{}", err.message);
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        let RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            ..
+        } = next.regs[1]
+        else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!((min_offset, max_offset), (0, 8));
     }
 
     #[test]
-    fn step_add_reg_stack_ptr_misaligned() {
-        // the scalar's low three bits are unknown → the computed offset
-        // is not provably 8-byte aligned → REJECT with an alignment
-        // message (#45)
+    fn step_add_reg_stack_ptr_tracks_unknown_align() {
+        // the scalar's low three bits are unknown → the pointer tracks
+        // ALIGN_UNKNOWN without rejecting; the alignment requirement
+        // moves to access time (#87)
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToStack {
             min_offset: -32,
@@ -2767,8 +2783,17 @@ mod tests {
                 mask: 0b101,
             },
         });
-        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
-        assert!(err.message.contains("alignment"), "{}", err.message);
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        let RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } = next.regs[1]
+        else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!((min_offset, max_offset), (-32, -24));
+        assert_eq!(align_off, ALIGN_UNKNOWN);
     }
 
     #[test]
@@ -2815,9 +2840,10 @@ mod tests {
     }
 
     #[test]
-    fn step_add_reg_stack_ptr_overflow_safe() {
-        // a scalar whose signed range reaches i64::MIN cannot overflow
-        // the offset arithmetic: it is rejected as out of frame (#47)
+    fn step_add_reg_stack_ptr_overflow_clamped() {
+        // #87: a scalar whose signed range reaches i64::MIN/MAX cannot
+        // overflow the offset arithmetic — the interval saturates to
+        // the i32 bounds and any later access is rejected out of frame
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToStack {
             min_offset: -32,
@@ -2825,8 +2851,17 @@ mod tests {
             align_off: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
-        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
-        assert!(err.message.contains("may leave the"), "{}", err.message);
+        let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        let RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } = next.regs[1]
+        else {
+            panic!("expected stack pointer");
+        };
+        assert_eq!((min_offset, max_offset), (i32::MIN, i32::MAX));
+        assert_eq!(align_off, ALIGN_UNKNOWN);
     }
 
     #[test]
@@ -2867,23 +2902,24 @@ mod tests {
 
     #[test]
     fn step_add_imm_ptr_stack_out_of_frame() {
-        // r10 += 8 → offset 8 points above the frame → REJECT
+        // #87: r10 += 8 / r10 += -520 widen the interval without
+        // rejecting — access-time checks reject any later access
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: 8 }).unwrap_err();
-        assert!(err.message.contains("out of the"));
-        // r10 += -520 → offset -520 exceeds the frame → REJECT
-        let err = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -520 }).unwrap_err();
-        assert!(err.message.contains("out of the"));
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: 8 }).unwrap();
+        assert_eq!(next.regs[10], ptr_stack(8));
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -520 }).unwrap();
+        assert_eq!(next.regs[10], ptr_stack(-520));
     }
 
     #[test]
     fn step_add_imm_ptr_stack_bounds_edges() {
-        // offset -512 is the last valid slot; one step past it → REJECT
+        // offset -512 is the last valid slot; one step past it widens
+        // the interval without rejecting (#87)
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -512 }).unwrap();
         assert_eq!(state.regs[10], ptr_stack(-512));
-        let err = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap_err();
-        assert!(err.message.contains("out of the"));
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 10, imm: -1 }).unwrap();
+        assert_eq!(next.regs[10], ptr_stack(-513));
     }
 
     #[test]

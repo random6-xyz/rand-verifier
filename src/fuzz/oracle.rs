@@ -406,13 +406,9 @@ mod tests {
     /// unprivileged too.
     #[test]
     fn corpus_reproduction_v06() {
-        let kernel_accepts = [
-            "complexity_limit",
-            "computed_offset_misaligned",
-            "computed_offset_out_of_frame",
-            "pointer_reg_arith",
-            "stack_write_before_read",
-        ];
+        // remaining kernel-accepts reject fixtures (the computed-offset
+        // and pointer-arith fixtures moved to accept in #87)
+        let kernel_accepts = ["complexity_limit", "stack_write_before_read"];
         for dir in ["tests/programs/accept", "tests/programs/reject"] {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();

@@ -61,19 +61,6 @@ jobs:
           path: /tmp/diff.json
           if-no-files-found: error
 
-      - name: Reduce the kernel-dependent v0.7 finding
-        # the rv-precision-gap fixture (mseed-5-99) needs the kernel
-        # column — a privileged run; exits 1 when the reduced program
-        # no longer re-classifies to the finding (reducer bug) (#83)
-        run: sudo ./target/debug/reduce tests/data/reduce/rv-precision-gap-mseed-5-99 --kernel --out-dir /tmp/reduce-kernel
-
-      - name: Upload the reduced kernel-dependent artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: reduce-kernel
-          path: /tmp/reduce-kernel/
-          if-no-files-found: error
-
       - name: Run a short kernel-backed fuzz campaign
         # same exit contract as the diff harness: a non-whitelisted
         # finding (precision/soundness candidate, rv gap/bug) fails CI

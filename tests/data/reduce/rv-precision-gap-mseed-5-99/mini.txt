@@ -1,2 +1,0 @@
-mini: REJECT
-reason: stack pointer r6 may leave the 512 byte frame (computed offsets)

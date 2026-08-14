@@ -89,8 +89,6 @@ pub(crate) enum ConcreteFailure {
     UninitializedStackRead { pc: u32, offset: i32 },
     /// Arithmetic on a pointer-typed register (#20).
     PointerArithmetic { pc: u32, reg: u8 },
-    /// Stack pointer arithmetic that leaves the frame (#19).
-    StackPointerOutOfFrame { pc: u32, reg: u8 },
     /// A shift amount outside the accepted range (mirrors the abstract
     /// 0..64 check for both widths, `check_shift_amount`).
     InvalidShiftAmount { pc: u32, amount: u64 },
@@ -140,9 +138,6 @@ impl std::fmt::Display for ConcreteFailure {
             ),
             Self::PointerArithmetic { pc, reg } => {
                 write!(f, "at insn {}: arithmetic on pointer r{}", pc, reg)
-            }
-            Self::StackPointerOutOfFrame { pc, reg } => {
-                write!(f, "at insn {}: stack pointer r{} left the frame", pc, reg)
             }
             Self::InvalidShiftAmount { pc, amount } => {
                 write!(f, "at insn {}: invalid shift amount {}", pc, amount)
@@ -316,6 +311,7 @@ fn alu_value(op: AluOp, width: AluWidth, a: u64, b: u64) -> u64 {
 /// offset must stay within `r10-512..=r10` (mirrors the abstract
 /// `add_scalar_to_stack_ptr` frame check). Overflowing the addition
 /// means the offset is certainly out of the frame.
+#[allow(dead_code)] // kept for access-time checks (P2); see #87
 fn stack_ptr_offset_ok(offset: i64) -> bool {
     (-(STACK_SIZE as i64)..=0).contains(&offset)
 }
@@ -354,16 +350,14 @@ fn concrete_alu_imm(
             next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
             Ok(next)
         }
-        // stack pointer + immediate: only ADD is allowed (#20), and the
-        // result must stay within the frame (#19)
+        // stack pointer + immediate: only ADD is allowed (#20); the
+        // result offset is exact, frame bounds are validated at access
+        // time (#87, mirroring the abstract side and the kernel)
         ConcreteValue::StackPtr(v) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
-            let offset = v as i64 - STACK_BASE as i64 + imm as i64;
-            if !stack_ptr_offset_ok(offset) {
-                return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst });
-            }
+            let offset = (v as i64 - STACK_BASE as i64).saturating_add(imm as i64);
             let mut next = *state;
             next.regs[dst as usize] =
                 Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
@@ -375,11 +369,11 @@ fn concrete_alu_imm(
 
 /// Execute an ALU operation with a register operand.
 ///
-/// Mirrors the abstract `alu_reg`: both operands must be scalars, except
-/// that a stack pointer plus a scalar ADD is allowed when the computed
-/// offset provably stays in the frame (#45). Concrete offsets are exact,
-/// so the abstract #45 provable-alignment condition (a range-only
-/// requirement) is trivially satisfied here.
+/// Mirrors the abstract `alu_reg`: scalar operands compute the exact
+/// bit result; a stack pointer plus a scalar ADD widens the pointer
+/// value (exact offset in the concrete world); scalar + stack pointer
+/// makes the destination inherit the pointer value. Frame bounds are
+/// validated at access time (#87).
 fn concrete_alu_reg(
     pc: u32,
     state: &ConcreteState,
@@ -408,22 +402,31 @@ fn concrete_alu_reg(
             next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
             Ok(next)
         }
-        // computed stack pointer arithmetic (#45): only ADD, and the
-        // result must stay within the frame
+        // computed stack pointer arithmetic (#87): only ADD; the exact
+        // offset result is computed by wrapping arithmetic — frame
+        // bounds are validated at access time
         (ConcreteValue::StackPtr(v), ConcreteValue::Scalar(s)) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
-            let offset = match (v as i64)
-                .checked_sub(STACK_BASE as i64)
-                .and_then(|o| o.checked_add(s as i64))
-            {
-                Some(offset) => offset,
-                None => return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst }),
-            };
-            if !stack_ptr_offset_ok(offset) {
-                return Err(ConcreteFailure::StackPointerOutOfFrame { pc, reg: dst });
+            let offset = (v as i64)
+                .wrapping_sub(STACK_BASE as i64)
+                .wrapping_add(s as i64);
+            let mut next = *state;
+            next.regs[dst as usize] =
+                Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            Ok(next)
+        }
+        // scalar += stack pointer: the destination inherits the pointer
+        // value (kernel: "dst_reg inherits the complete pointer register
+        // state")
+        (ConcreteValue::Scalar(d), ConcreteValue::StackPtr(v)) => {
+            if op != AluOp::Add || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
+            let offset = (v as i64)
+                .wrapping_sub(STACK_BASE as i64)
+                .wrapping_add(d as i64);
             let mut next = *state;
             next.regs[dst as usize] =
                 Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
@@ -1784,32 +1787,26 @@ mod tests {
     }
 
     #[test]
-    fn stack_ptr_add_imm_out_of_frame() {
-        let err = concrete_step(
-            0,
-            &ConcreteState::initial(),
-            &BpfInsn::AddImm { dst: 10, imm: 100 },
-        )
-        .unwrap_err();
+    fn stack_ptr_add_imm_widens_without_frame_check() {
+        // #87: arithmetic no longer rejects out-of-frame results — the
+        // concrete pointer value just moves; access-time checks reject
+        // any later out-of-frame access
+        let state = run(&[BpfInsn::AddImm { dst: 10, imm: 100 }]);
         assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 0, reg: 10 }
+            state.regs[10],
+            Some(ConcreteValue::StackPtr(STACK_BASE + 100))
         );
-        let err = concrete_step(
-            0,
-            &ConcreteState::initial(),
-            &BpfInsn::AddImm { dst: 10, imm: -520 },
-        )
-        .unwrap_err();
+        let state = run(&[BpfInsn::AddImm { dst: 10, imm: -520 }]);
         assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 0, reg: 10 }
+            state.regs[10],
+            Some(ConcreteValue::StackPtr(STACK_BASE - 520))
         );
     }
 
     #[test]
     fn stack_ptr_add_reg_computed() {
-        // computed pointer arithmetic (#45): in-frame scalar ADD
+        // computed pointer arithmetic (#87): scalar ADD widens the
+        // pointer value without a frame check at arithmetic time
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: -8 },
             BpfInsn::AddReg { dst: 10, src: 2 },
@@ -1818,13 +1815,10 @@ mod tests {
             state.regs[10],
             Some(ConcreteValue::StackPtr(STACK_BASE - 8))
         );
-        // out-of-frame scalar ADD
+        // out-of-frame scalar ADD is fine at arithmetic time
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
-        let err = concrete_step(1, &state, &BpfInsn::AddReg { dst: 10, src: 2 }).unwrap_err();
-        assert_eq!(
-            err,
-            ConcreteFailure::StackPointerOutOfFrame { pc: 1, reg: 10 }
-        );
+        let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 10, src: 2 }).unwrap();
+        assert_eq!(next.regs[10], Some(ConcreteValue::StackPtr(STACK_BASE + 8)));
     }
 
     #[test]
