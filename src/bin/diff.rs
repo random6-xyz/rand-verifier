@@ -18,11 +18,9 @@ use std::process;
 
 use rand_verifier::diff::{DiffClass, SideVerdict, categorize_mini_reason, classify, whitelisted};
 use rand_verifier::env::BpfVerifierEnv;
-use rand_verifier::error::Verdict;
 use rand_verifier::env::parse_maps_sidecar;
-use rand_verifier::krun::{
-    KernelOutcome, drop_privileged_caps, load_with_kernel_maps,
-};
+use rand_verifier::error::Verdict;
+use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel_maps};
 
 /// One compared program: the two verdicts plus the classification.
 struct DiffEntry {

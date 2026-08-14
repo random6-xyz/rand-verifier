@@ -20,9 +20,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
+use rand_verifier::env::parse_maps_sidecar;
 use rand_verifier::insn::{decode_program, disassemble};
 use rand_verifier::klog::ReasonCategory;
-use rand_verifier::env::parse_maps_sidecar;
 use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel_maps_level};
 
 /// Print the disassembly of a program (decode errors are shown inline —

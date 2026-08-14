@@ -144,7 +144,8 @@ fn referenced_map_fds(insns: &[u8]) -> Vec<u32> {
         if insns[i] == 0x18 {
             let pseudo = (insns[i + 1] >> 4) & 0x0F;
             if pseudo == BPF_PSEUDO_MAP_FD || pseudo == BPF_PSEUDO_MAP_VALUE {
-                let fd = u32::from_le_bytes([insns[i + 4], insns[i + 5], insns[i + 6], insns[i + 7]]);
+                let fd =
+                    u32::from_le_bytes([insns[i + 4], insns[i + 5], insns[i + 6], insns[i + 7]]);
                 if !fds.contains(&fd) {
                     fds.push(fd);
                 }
@@ -183,6 +184,9 @@ pub fn load_with_kernel_maps_level(
                 live.insert(fd, real);
             }
             Err(errno) => {
+                if errno == -libc::EPERM {
+                    return (KernelOutcome::Privilege, String::new());
+                }
                 return (KernelOutcome::NoErrorLine { errno }, String::new());
             }
         }
