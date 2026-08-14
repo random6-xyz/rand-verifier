@@ -149,33 +149,74 @@ pub fn classify(mini: &SideVerdict, kernel: &SideVerdict) -> DiffClass {
 /// not count as findings. `name` is the corpus program name (file
 /// stem). Returns the reason when the pair is expected.
 ///
+/// Besides the name-based entries, a category rule covers the whole
+/// privileged-leniency family ([`privileged_stack_leniency`]) so
+/// fuzzer-generated and corpus programs are treated alike.
+///
 /// The computed-offset / pointer-arith entries were removed in v0.8.1
 /// (#90): #87 moved bounds/alignment validation to access time like the
 /// kernel, so those fixtures moved to the accept corpus and the pairs
 /// no longer occur.
-pub fn whitelisted(name: &str, mini: &SideVerdict, kernel: &SideVerdict) -> Option<&'static str> {
+pub fn whitelisted(
+    name: &str,
+    mini: &SideVerdict,
+    kernel: &SideVerdict,
+    mini_reason: Option<&str>,
+) -> Option<&'static str> {
     match (mini, kernel) {
-        (SideVerdict::Reject { .. }, SideVerdict::Accept) => match name {
-            // mini's state budget is 1024 vs the kernel's limits
-            // (BPF_COMPLEXITY_LIMIT_JMP_SEQ 8192, STATES 64, INSNS —
-            // kernel/bpf/verifier.c) — an intentional design limit,
-            // not a bug
-            "complexity_limit" => {
-                Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
+        (SideVerdict::Reject { .. }, SideVerdict::Accept) => {
+            // privileged loads allow uninit stack reads
+            // (allow_uninit_stack) and indirect reads over spilled
+            // pointers (allow_ptr_leaks) by design — the same family as
+            // stack_write_before_read, applied by category so it also
+            // covers fuzzer-generated programs
+            if privileged_stack_leniency(mini, mini_reason) {
+                return Some(
+                    "privileged load leniency: uninit stack reads (allow_uninit_stack) and indirect reads over spilled pointers (allow_ptr_leaks) are allowed for privileged loaders (CAP_SYS_ADMIN superset, kernel/bpf/token.c)",
+                );
             }
-            // privileged load: allow_uninit_stack is
-            // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
-            // CAP_SYS_ADMIN as a superset of every BPF capability
-            // (kernel/bpf/token.c: ns_capable(ns, cap) || (cap !=
-            // CAP_SYS_ADMIN && ns_capable(ns, CAP_SYS_ADMIN))) — uninit
-            // stack reads are allowed for privileged loaders by design
-            "stack_write_before_read" => Some(
-                "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
-            ),
-            _ => None,
-        },
+            match name {
+                // mini's state budget is 1024 vs the kernel's limits
+                // (BPF_COMPLEXITY_LIMIT_JMP_SEQ 8192, STATES 64, INSNS —
+                // kernel/bpf/verifier.c) — an intentional design limit,
+                // not a bug
+                "complexity_limit" => {
+                    Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
+                }
+                // privileged load: allow_uninit_stack is
+                // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
+                // CAP_SYS_ADMIN as a superset of every BPF capability
+                // (kernel/bpf/token.c: ns_capable(ns, cap) || (cap !=
+                // CAP_SYS_ADMIN && ns_capable(ns, CAP_SYS_ADMIN))) — uninit
+                // stack reads are allowed for privileged loaders by design.
+                // The category rule above covers the same family for
+                // programs without a mini reason (fuzzer seeds); this name
+                // entry keeps the corpus fixture stable.
+                "stack_write_before_read" => Some(
+                    "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
+                ),
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+/// Privileged-load stack leniency (#90): mini rejects uninitialized
+/// stack reads ("stack slot ... is uninitialized") and indirect reads
+/// over spilled pointers ("invalid indirect read from stack") that the
+/// kernel accepts when the loader is privileged — `allow_uninit_stack`
+/// and `allow_ptr_leaks` are gated on `bpf_token_capable` / the
+/// CAP_SYS_ADMIN superset rule (kernel/bpf/token.c:14), so unprivileged
+/// (--strict) loads reject the same programs. Uninit *register* reads
+/// are NOT lenient — the kernel rejects those too.
+pub fn privileged_stack_leniency(mini: &SideVerdict, mini_reason: Option<&str>) -> bool {
+    matches!(
+        mini,
+        SideVerdict::Reject {
+            category: ReasonCategory::UninitRead
+        }
+    ) && mini_reason.is_some_and(|r| r.contains("stack slot") || r.contains("indirect read"))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -334,20 +375,60 @@ mod tests {
         };
         let acc = SideVerdict::Accept;
         // the documented mini-limit difference is whitelisted
-        assert!(whitelisted("complexity_limit", &rej, &acc).is_some());
-        // privileged loads allow uninit stack reads by design
-        // (allow_uninit_stack, CAP_SYS_ADMIN superset — token.c)
-        assert!(whitelisted("stack_write_before_read", &rej, &acc).is_some());
+        assert!(whitelisted("complexity_limit", &rej, &acc, None).is_some());
+        // the same pair under another name is a finding
+        assert!(whitelisted("bounded_loop", &rej, &acc, None).is_none());
+        // and the whitelist never applies to other pairs
+        assert!(whitelisted("complexity_limit", &acc, &rej, None).is_none());
+    }
+
+    #[test]
+    fn whitelist_privileged_stack_leniency() {
+        // the category rule covers the whole privileged-leniency
+        // family (#90): uninit stack reads and indirect reads over
+        // spilled pointers that the kernel accepts under privilege
+        let uninit = SideVerdict::Reject {
+            category: ReasonCategory::UninitRead,
+        };
+        let acc = SideVerdict::Accept;
+        for reason in [
+            "stack slot at offset -8 is uninitialized (write before read)",
+            "invalid indirect read from stack at r6+0: spilled PTR_CTX at offset -8",
+        ] {
+            assert!(
+                whitelisted("anything", &uninit, &acc, Some(reason)).is_some(),
+                "{reason}"
+            );
+        }
+        // uninit *register* reads stay findings (the kernel rejects
+        // those too — a kernel accept would be a real bug)
+        assert!(
+            whitelisted(
+                "anything",
+                &uninit,
+                &acc,
+                Some("register r2 is uninitialized")
+            )
+            .is_none()
+        );
+        // and the rule never applies to other pairs
+        assert!(
+            whitelisted(
+                "anything",
+                &uninit,
+                &SideVerdict::Reject {
+                    category: ReasonCategory::UninitRead
+                },
+                Some("stack slot at offset -8 is uninitialized (write before read)")
+            )
+            .is_none()
+        );
         // the computed-offset / pointer-arith entries were removed in
         // v0.8.1 (#90): the fixtures moved to the accept corpus after
         // #87 moved validation to access time
-        assert!(whitelisted("computed_offset_misaligned", &rej, &acc).is_none());
-        assert!(whitelisted("computed_offset_out_of_frame", &rej, &acc).is_none());
-        assert!(whitelisted("pointer_reg_arith", &rej, &acc).is_none());
-        // the same pair under another name is a finding
-        assert!(whitelisted("bounded_loop", &rej, &acc).is_none());
-        // and the whitelist never applies to other pairs
-        assert!(whitelisted("complexity_limit", &acc, &rej).is_none());
+        assert!(whitelisted("computed_offset_misaligned", &uninit, &acc, None).is_none());
+        assert!(whitelisted("computed_offset_out_of_frame", &uninit, &acc, None).is_none());
+        assert!(whitelisted("pointer_reg_arith", &uninit, &acc, None).is_none());
     }
 
     #[test]

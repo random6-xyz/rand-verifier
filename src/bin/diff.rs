@@ -71,7 +71,7 @@ fn run_one(path: &Path) -> DiffEntry {
     };
 
     let class = classify(&mini, &kernel);
-    let whitelist = whitelisted(&name, &mini, &kernel);
+    let whitelist = whitelisted(&name, &mini, &kernel, mini_reason.as_deref());
     DiffEntry {
         name,
         mini,

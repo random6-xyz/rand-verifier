@@ -127,8 +127,8 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // v0.6 kernel-accepts fixtures are design behaviour
                 // (e.g. stack_write_before_read under privilege)
                 SideVerdict::Accept => {
-                    if whitelisted(name, mini, kernel).is_some()
-                        || is_privileged_uninit_stack(mini, *mini_reason)
+                    if whitelisted(name, mini, kernel, *mini_reason).is_some()
+                        || crate::diff::privileged_stack_leniency(mini, *mini_reason)
                     {
                         Finding::Whitelisted
                     } else {
@@ -143,7 +143,7 @@ pub fn classify(input: &OracleInput) -> Finding {
             SideVerdict::Skipped => Finding::Skipped,
             SideVerdict::Accept => match mini {
                 SideVerdict::Reject { .. } => {
-                    if whitelisted(name, mini, kernel).is_some() {
+                    if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                         Finding::Whitelisted
                     } else {
                         Finding::RvPrecisionGap
@@ -153,7 +153,7 @@ pub fn classify(input: &OracleInput) -> Finding {
             },
             SideVerdict::Reject { category } => {
                 // name-based diff whitelist (kernel-accepts fixtures)
-                if whitelisted(name, mini, kernel).is_some() {
+                if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                     return Finding::Whitelisted;
                 }
                 // strict mode: unprivileged-equivalent kernel rules are
@@ -182,23 +182,15 @@ pub fn classify(input: &OracleInput) -> Finding {
 }
 
 /// Privileged loads allow uninit stack reads by design
-/// (`allow_uninit_stack`; `bpf_ns_capable` treats CAP_SYS_ADMIN as a
-/// superset of every BPF cap — verified against kernel/bpf/token.c in
-/// v0.6). mini rejects those with "stack slot ... is uninitialized",
-/// while the kernel accepts under privilege — the same design
-/// difference as the v0.6 `stack_write_before_read` whitelist, applied
-/// by category so it also covers fuzzer-generated programs (found
-/// empirically as mseed-5-19 in the first kernel-backed campaign,
-/// #73). Uninit *register* reads stay soundness candidates — the
-/// kernel rejects those too, so a kernel accept would be a real bug.
-fn is_privileged_uninit_stack(mini: &SideVerdict, mini_reason: Option<&str>) -> bool {
-    matches!(
-        mini,
-        SideVerdict::Reject {
-            category: ReasonCategory::UninitRead
-        }
-    ) && mini_reason.is_some_and(|r| r.contains("stack slot"))
-}
+/// Privileged-load stack leniency, shared with the diff whitelist
+/// (#90): mini rejects uninitialized stack reads and indirect reads
+/// over spilled pointers that the kernel accepts under privilege
+/// (allow_uninit_stack / allow_ptr_leaks; CAP_SYS_ADMIN superset rule,
+/// kernel/bpf/token.c). Applied by category so it covers fuzzer-
+/// generated programs (found empirically as mseed-5-19 in the first
+/// kernel-backed campaign, #73). Uninit *register* reads stay
+/// soundness candidates — the kernel rejects those too.
+pub use crate::diff::privileged_stack_leniency as is_privileged_uninit_stack;
 
 /// Classify a verified program from its environment — the binary-
 /// facing wrapper for the campaign runner (#69): reads the concrete
