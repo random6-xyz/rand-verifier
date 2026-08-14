@@ -164,7 +164,7 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | ldimm64_bad_pseudo          | `r1 = <ldimm64 pseudo class 9>; r0 = 0; exit`                     | unknown ldimm64 pseudo class (#89) |
 | overflowed_range_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | unbounded addend rejected at arithmetic time (kernel check_reg_sane_offset_scalar, #90) |
 | infinite_loop_identical       | `r0 = 0; r2 = 100; r1 = 0; if r1 < r2 goto -1; exit`               | identical loop-head state = infinite loop (kernel states.c, #90) |
-| pointer_reg_arith             | `r0 = 1; r0 += r10; exit`                          | exit with a pointer in R0: scalar += pointer inherits pointer state, but the kernel requires a scalar return value (check_return_code, #87) |
+| pointer_reg_arith             | `r0 = 1; r0 += r10; exit`                          | exit with a pointer in R0: scalar += pointer inherits pointer state (#87); the strict kernel rejects pointer returns ("R0 leaks addr as return value"), privileged loads allow them (allow_ptr_leaks — whitelisted in the privileged diff) |
 
 Map fixtures use a sibling `<name>.maps` sidecar registering fd 1 as an
 ARRAY map (key 4B / value 8B / 1 entry) — the program loader resolves
