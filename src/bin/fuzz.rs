@@ -410,6 +410,7 @@ fn run_program(args: &Args, name: &str, insns: &[BpfInsn]) -> anyhow::Result<Out
         &mini,
         mini_reason.as_deref(),
         &kernel,
+        kernel_message.as_deref(),
         args.strict,
     );
     Ok(Outcome {

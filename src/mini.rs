@@ -255,8 +255,18 @@ fn verify_mini_core(
 
         // a path ends at exit; R0 must hold a valid value there
         if matches!(insn, BpfInsn::Exit) {
-            read_reg(item.pc, &item.state, 0)
+            let r0 = read_reg(item.pc, &item.state, 0)
                 .map_err(|_| VerificationFailure::new(item.pc, "r0 is uninitialized at exit"))?;
+            // the kernel requires R0 to be a scalar return value at
+            // exit (check_return_code: "R0 leaks addr as return
+            // value" / "R0 is not a known value (ctx)") — a pointer
+            // in R0 is never a valid program return value
+            if !matches!(r0, RegState::Scalar(_)) {
+                return Err(VerificationFailure::new(
+                    item.pc,
+                    "r0 is not a scalar value at exit",
+                ));
+            }
             continue;
         }
 
@@ -323,6 +333,32 @@ mod tests {
         let program = vec![BpfInsn::Exit];
         let err = verify_mini(&program, &[]).unwrap_err();
         assert!(err.message.contains("r0 is uninitialized at exit"));
+    }
+
+    #[test]
+    fn verify_mini_exit_r0_pointer_rejected() {
+        // spill the ctx pointer, reload it into R0, exit — the kernel
+        // rejects a pointer in R0 at exit ("R0 leaks addr as return
+        // value" unprivileged / "R0 is not a known value" privileged,
+        // check_return_code); the mini must mirror the rule
+        // (mseed-99399-57 shape)
+        let program = vec![
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::MovImm { dst: 5, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        let err = verify_mini(&program, &[]).unwrap_err();
+        assert_eq!(err.insn_idx, 3);
+        assert!(err.message.contains("r0 is not a scalar value at exit"));
     }
 
     #[test]

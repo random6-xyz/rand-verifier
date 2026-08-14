@@ -54,6 +54,11 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // "stack access at r6+0 with base offsets ...",
         // "stack pointer ... may leave/are out of the frame"
         ReasonCategory::StackBounds
+    } else if msg.contains("not a scalar") {
+        // "r0 is not a scalar value at exit" — the kernel's
+        // check_return_code rejects a non-scalar R0 at exit
+        // ("R0 leaks addr as return value" / "R0 is not a known value")
+        ReasonCategory::ExitR0
     } else if msg.contains("helper") || msg.contains("expected") {
         ReasonCategory::HelperArgs
     } else if msg.contains("back-edge") || msg.contains("complexity limit") {
@@ -197,6 +202,28 @@ pub fn whitelisted(
             if privileged_stack_leniency(mini, mini_reason) {
                 return Some(
                     "privileged load leniency: uninit stack reads (allow_uninit_stack) and indirect reads over spilled pointers (allow_ptr_leaks) are allowed for privileged loaders (CAP_SYS_ADMIN superset, kernel/bpf/token.c)",
+                );
+            }
+            // privileged loads allow pointer values in R0 at exit: the
+            // exit-time check ("R0 leaks addr as return value") is
+            // gated on is_pointer_value(), which returns false when
+            // allow_ptr_leaks is set (kernel/bpf/verifier.c) —
+            // returning a pointer from a program is allowed for
+            // privileged loaders by design; strict mode
+            // (unprivileged-equivalent) rejects it, which the mini
+            // mirrors ("r0 is not a scalar value at exit"). Same
+            // privileged-leniency family as the stack rule above;
+            // category-applied so fuzzer-generated programs are
+            // whitelisted like the corpus fixture (m5, PR #92).
+            if matches!(
+                mini,
+                SideVerdict::Reject {
+                    category: ReasonCategory::ExitR0
+                }
+            ) && mini_reason.is_some_and(|r| r.contains("at exit"))
+            {
+                return Some(
+                    "privileged load leniency: pointer return in R0 allowed for privileged loaders (allow_ptr_leaks gates the exit-time R0 check); strict mode rejects it",
                 );
             }
             match name {
@@ -351,6 +378,7 @@ mod tests {
                 ReasonCategory::Complexity,
             ),
             ("r0 is uninitialized at exit", ReasonCategory::UninitRead),
+            ("r0 is not a scalar value at exit", ReasonCategory::ExitR0),
             (
                 "verification complexity limit exceeded (max_states 1024)",
                 ReasonCategory::Complexity,
@@ -390,6 +418,15 @@ mod tests {
         assert_eq!(classify(&skip, &acc), DiffClass::Skipped);
         assert_eq!(classify(&acc, &skip), DiffClass::Skipped);
         assert_eq!(classify(&skip, &skip), DiffClass::Skipped);
+    }
+
+    #[test]
+    fn categorize_mini_exit_r0_pointer() {
+        // the mini rejects a pointer in R0 at exit (mseed-99399-57) —
+        // same ExitR0 category as the kernel's "R0 leaks addr as
+        // return value" / "R0 is not a known value"
+        let failure = VerificationFailure::new(3, "r0 is not a scalar value at exit");
+        assert_eq!(categorize_mini_reason(&failure), ReasonCategory::ExitR0);
     }
 
     #[test]
@@ -459,6 +496,63 @@ mod tests {
         assert!(whitelisted("computed_offset_misaligned", &uninit, &acc, None).is_none());
         assert!(whitelisted("computed_offset_out_of_frame", &uninit, &acc, None).is_none());
         assert!(whitelisted("pointer_reg_arith", &uninit, &acc, None).is_none());
+    }
+
+    #[test]
+    fn whitelist_privileged_pointer_return() {
+        // the mini mirrors the strict (unprivileged-equivalent) rule:
+        // R0 must be a scalar at exit. The privileged kernel accepts
+        // pointer returns (allow_ptr_leaks gates the exit-time check),
+        // so the pair is a design difference, whitelisted by category
+        // (m5 mseed-99399-57 shape; pointer_reg_arith corpus fixture)
+        let exit = SideVerdict::Reject {
+            category: ReasonCategory::ExitR0,
+        };
+        let acc = SideVerdict::Accept;
+        assert!(
+            whitelisted(
+                "pointer_reg_arith",
+                &exit,
+                &acc,
+                Some("r0 is not a scalar value at exit")
+            )
+            .is_some()
+        );
+        // category-applied: fuzzer-generated names are treated alike
+        assert!(
+            whitelisted(
+                "seed-1-7",
+                &exit,
+                &acc,
+                Some("r0 is not a scalar value at exit")
+            )
+            .is_some()
+        );
+        // other categories under any name stay findings
+        let uninit = SideVerdict::Reject {
+            category: ReasonCategory::UninitRead,
+        };
+        assert!(
+            whitelisted(
+                "pointer_reg_arith",
+                &uninit,
+                &acc,
+                Some("r0 is not a scalar value at exit")
+            )
+            .is_none()
+        );
+        // and the rule never applies to other pairs
+        assert!(
+            whitelisted(
+                "pointer_reg_arith",
+                &exit,
+                &SideVerdict::Reject {
+                    category: ReasonCategory::ExitR0
+                },
+                Some("r0 is not a scalar value at exit")
+            )
+            .is_none()
+        );
     }
 
     #[test]
