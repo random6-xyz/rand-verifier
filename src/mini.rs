@@ -196,6 +196,17 @@ fn verify_mini_core(
 
         // skip states subsumed by an already-analyzed state at this pc
         let seen = visited.entry(item.pc).or_default();
+        // the kernel rejects a loop head revisited with an IDENTICAL
+        // state — the loop can never make progress (kernel/bpf/states.c:
+        // "infinite loop detected at insn %d", states_equal EXACT).
+        // A bounded loop's head state changes every iteration, so it
+        // never trips this rule.
+        if loop_heads.contains(&item.pc) && seen.contains(&item.state) {
+            return Err(VerificationFailure::new(
+                item.pc,
+                format!("infinite loop detected at insn {}", item.pc),
+            ));
+        }
         if seen.iter().any(|old| subsumes(old, &item.state)) {
             continue;
         }

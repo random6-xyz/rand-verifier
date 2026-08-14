@@ -355,7 +355,9 @@ mod tests {
             ),
             Finding::Whitelisted
         );
-        // the same pair under a fuzzer-generated name is a finding
+        // the same pair under a fuzzer-generated name is whitelisted
+        // too — mini's exploration budget is a category-based design
+        // difference (#90)
         assert_eq!(
             classify_with(
                 rej(ReasonCategory::Complexity),
@@ -364,7 +366,7 @@ mod tests {
                 "seed-1-3",
                 false
             ),
-            Finding::RvPrecisionGap
+            Finding::Whitelisted
         );
         // strict mode whitelists the !root kernel rules even when mini
         // rejects for a different reason...

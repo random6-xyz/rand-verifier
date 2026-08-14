@@ -282,12 +282,12 @@ BPF-to-BPF/kfunc calls, …) are rejected as unsupported.
 
 Raw bytecode fixtures live in `tests/programs/`:
 
-- `tests/programs/accept/` — 40 programs that must pass
-- `tests/programs/reject/` — 36 programs that must fail
+- `tests/programs/accept/` — 41 programs that must pass
+- `tests/programs/reject/` — 38 programs that must fail
 
 Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, access-time pointer checks, map fd/key-value validation, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list. Map fixtures carry a sibling `<name>.maps` sidecar registering the referenced map fds (ARRAY key 4B / value 8B / 1 entry).
 
-Run the test suite (471 tests — unit, corpus, and the reducer integration suite):
+Run the test suite (472 tests — unit, corpus, and the reducer integration suite):
 
 ```sh
 cargo test

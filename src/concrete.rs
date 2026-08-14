@@ -476,7 +476,14 @@ fn concrete_alu_imm(
             next.regs[dst as usize] = Some(ConcreteValue::MapPtr((v as i64 + imm as i64) as u64));
             Ok(next)
         }
-        ConcreteValue::CtxPtr(_) => Err(ConcreteFailure::PointerArithmetic { pc, reg: dst }),
+        // context pointer + immediate: ADD/SUB keeps the pointer (the
+        // kernel allows ctx arithmetic with a sane offset, #90)
+        ConcreteValue::CtxPtr(_) => {
+            if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            Ok(*state)
+        }
     }
 }
 
@@ -554,6 +561,17 @@ fn concrete_alu_reg(
             }
             let mut next = *state;
             next.regs[dst as usize] = Some(ConcreteValue::MapPtr((v as i64 + s as i64) as u64));
+            Ok(next)
+        }
+        // context pointer + scalar / scalar + context pointer:
+        // ADD/SUB keeps (or inherits) the context pointer (#90)
+        (ConcreteValue::CtxPtr(_), ConcreteValue::Scalar(_))
+        | (ConcreteValue::Scalar(_), ConcreteValue::CtxPtr(_)) => {
+            if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+                return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+            }
+            let mut next = *state;
+            next.regs[dst as usize] = Some(ConcreteValue::CtxPtr(CTX_BASE));
             Ok(next)
         }
         // every other combination is pointer arithmetic (#20)
@@ -2336,17 +2354,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 0, reg: 10 });
-        // immediate arithmetic on the context pointer
-        let err = concrete_step(
+        // immediate arithmetic on the context pointer is allowed for
+        // ADD/SUB (mirror of the abstract, #90); other ops stay rejected
+        let next = concrete_step(
             0,
             &ConcreteState::initial(),
             &BpfInsn::AddImm { dst: 1, imm: 8 },
         )
+        .unwrap();
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        let err = concrete_step(
+            0,
+            &ConcreteState::initial(),
+            &BpfInsn::XorImm { dst: 1, imm: 8 },
+        )
         .unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 0, reg: 1 });
-        // register arithmetic on the context pointer
+        // register ADD on the context pointer is allowed (mirror of
+        // the abstract, #90); SUB keeps it too, other ops stay rejected
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
-        let err = concrete_step(1, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        let err = concrete_step(1, &state, &BpfInsn::XorReg { dst: 1, src: 2 }).unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 1, reg: 1 });
         // stack pointer + stack pointer
         let err = concrete_step(

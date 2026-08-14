@@ -386,10 +386,19 @@ fn alu_imm(
             };
             Ok(next)
         }
-        RegState::PtrToCtx => Err(VerificationFailure::new(
-            pc,
-            format!("arithmetic on context pointer r{} is not allowed", dst),
-        )),
+        // the kernel allows context pointer ADD/SUB with a sane known
+        // offset (adjust_ptr_min_max_vals, PTR_TO_CTX — used for ctx
+        // field access); the offset is not tracked (no ctx loads yet)
+        RegState::PtrToCtx => {
+            if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!("arithmetic on context pointer r{} is not allowed", dst),
+                ));
+            }
+            check_sane_addend(pc, "ctx", ScalarBounds::constant(imm as i64))?;
+            Ok(*state)
+        }
         RegState::PtrToMap { .. } => Err(VerificationFailure::new(
             pc,
             format!("arithmetic on map pointer r{} is not allowed", dst),
@@ -470,6 +479,20 @@ fn alu_reg(
         let s = read_scalar(pc, state, src)?;
         return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, s, state);
     }
+    // context pointer arithmetic (register form): the kernel allows
+    // ctx ADD/SUB with a sane scalar (adjust_ptr_min_max_vals,
+    // PTR_TO_CTX); the offset is not tracked (no ctx loads yet)
+    if let RegState::PtrToCtx = dst_state {
+        if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
+            return Err(VerificationFailure::new(
+                pc,
+                format!("arithmetic on context pointer r{} is not allowed", dst),
+            ));
+        }
+        let s = read_scalar(pc, state, src)?;
+        check_sane_addend(pc, "ctx", s)?;
+        return Ok(*state);
+    }
     // map value pointer arithmetic: PtrToMapValue + ScalarRange widens
     // the offset interval; bounds are validated at access time (#89)
     if let RegState::PtrToMapValue {
@@ -490,6 +513,7 @@ fn alu_reg(
         }
         let s = read_scalar(pc, state, src)?;
         return add_scalar_to_map_value_ptr(
+            pc,
             dst,
             RegState::PtrToMapValue {
                 min_offset,
@@ -524,10 +548,17 @@ fn alu_reg(
             align_off,
         } = read_reg(pc, state, src)?
         {
+            check_sane_addend(pc, "stack", d)?;
             return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, d, state);
         }
         if let RegState::PtrToMapValue { .. } = read_reg(pc, state, src)? {
-            return add_scalar_to_map_value_ptr(dst, read_reg(pc, state, src)?, d, state);
+            return add_scalar_to_map_value_ptr(pc, dst, read_reg(pc, state, src)?, d, state);
+        }
+        if let RegState::PtrToCtx = read_reg(pc, state, src)? {
+            check_sane_addend(pc, "ctx", d)?;
+            let mut next = *state;
+            next.regs[dst as usize] = RegState::PtrToCtx;
+            return Ok(next);
         }
     }
     let s = read_scalar(pc, state, src)?;
@@ -821,8 +852,66 @@ fn slot_offset(slot: usize) -> i32 {
 /// bounds and alignment are validated at access time, mirroring the
 /// kernel's adjust_ptr_min_max_vals (no arithmetic-time checks for
 /// privileged loads).
+/// The kernel's arithmetic-time pointer sanity bound
+/// (kernel/bpf/verifier.c: BPF_MAX_VAR_OFF = 1 << 28): scalar addends
+/// and pointer offsets beyond it are rejected at arithmetic time by
+/// check_reg_sane_offset_scalar / check_reg_sane_offset_ptr — distinct
+/// from the 512-byte frame checks that happen at access time (#87).
+pub(crate) const BPF_MAX_VAR_OFF: i64 = 1 << 28;
+
+/// The kernel's arithmetic-time sanity checks on a scalar addend
+/// (check_reg_sane_offset_scalar): an unbounded minimum or an offset
+/// beyond BPF_MAX_VAR_OFF is rejected at arithmetic time.
+fn check_sane_addend(pc: u32, ptr_kind: &str, s: ScalarBounds) -> Result<(), VerificationFailure> {
+    if s.is_constant() {
+        let v = s.smin;
+        if v >= BPF_MAX_VAR_OFF || v <= -BPF_MAX_VAR_OFF {
+            return Err(VerificationFailure::new(
+                pc,
+                format!("math between {} pointer and {} is not allowed", ptr_kind, v),
+            ));
+        }
+        return Ok(());
+    }
+    if s.smin == i64::MIN {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "math between {} pointer and register with unbounded min value is not allowed",
+                ptr_kind
+            ),
+        ));
+    }
+    if s.smin >= BPF_MAX_VAR_OFF || s.smin <= -BPF_MAX_VAR_OFF {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "value {} makes {} pointer be out of bounds",
+                s.smin, ptr_kind
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The kernel's arithmetic-time sanity check on the resulting pointer
+/// offset (check_reg_sane_offset_ptr).
+fn check_sane_result_offset(
+    pc: u32,
+    ptr_kind: &str,
+    min_offset: i64,
+) -> Result<(), VerificationFailure> {
+    if min_offset >= BPF_MAX_VAR_OFF || min_offset <= -BPF_MAX_VAR_OFF {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("{} pointer offset {} is not allowed", ptr_kind, min_offset),
+        ));
+    }
+    Ok(())
+}
+
 fn add_scalar_to_stack_ptr(
-    _pc: u32,
+    pc: u32,
     dst: u8,
     min_offset: i32,
     max_offset: i32,
@@ -830,8 +919,16 @@ fn add_scalar_to_stack_ptr(
     s: ScalarBounds,
     state: &VerifierState,
 ) -> Result<VerifierState, VerificationFailure> {
-    let new_min = clamp_offset((min_offset as i64).saturating_add(s.smin));
-    let new_max = clamp_offset((max_offset as i64).saturating_add(s.smax));
+    // arithmetic-time sanity (kernel check_reg_sane_offset_scalar /
+    // check_reg_sane_offset_ptr): the addend and the result must stay
+    // within BPF_MAX_VAR_OFF — the 512-byte frame check itself stays at
+    // access time (#87)
+    check_sane_addend(pc, "stack", s)?;
+    let new_min64 = (min_offset as i64).saturating_add(s.smin);
+    let new_max64 = (max_offset as i64).saturating_add(s.smax);
+    check_sane_result_offset(pc, "stack", new_min64)?;
+    let new_min = clamp_offset(new_min64);
+    let new_max = clamp_offset(new_max64);
     // alignment: the low three bits of the scalar's tnum, when known
     let new_align = if s.tnum.mask & 7 == 0 {
         (align_off as i32 + (s.tnum.value & 7) as i32).rem_euclid(8) as u8
@@ -858,6 +955,7 @@ fn clamp_offset(v: i64) -> i32 {
 /// (saturated to i32) and the alignment tracked; bounds are validated
 /// against `value_size` at access time (kernel check_map_access).
 fn add_scalar_to_map_value_ptr(
+    pc: u32,
     dst: u8,
     ptr: RegState,
     s: ScalarBounds,
@@ -872,8 +970,14 @@ fn add_scalar_to_map_value_ptr(
     else {
         unreachable!("the caller matched PtrToMapValue")
     };
-    let new_min = clamp_offset((min_offset as i64).saturating_add(s.smin));
-    let new_max = clamp_offset((max_offset as i64).saturating_add(s.smax));
+    // arithmetic-time sanity (kernel check_reg_sane_offset_scalar /
+    // check_reg_sane_offset_ptr) — value_size bounds stay at access time
+    check_sane_addend(pc, "map_value", s)?;
+    let new_min64 = (min_offset as i64).saturating_add(s.smin);
+    let new_max64 = (max_offset as i64).saturating_add(s.smax);
+    check_sane_result_offset(pc, "map_value", new_min64)?;
+    let new_min = clamp_offset(new_min64);
+    let new_max = clamp_offset(new_max64);
     let new_align = if s.tnum.mask & 7 == 0 {
         (align_off as i32 + (s.tnum.value & 7) as i32).rem_euclid(8) as u8
     } else {
@@ -2193,10 +2297,24 @@ mod tests {
 
     #[test]
     fn step_add_ptr_rejected() {
-        // r1 += 10 with R1 = PtrToCtx → arithmetic on a context pointer is rejected
+        // the kernel allows ctx ADD/SUB with a sane offset (#90,
+        // adjust_ptr_min_max_vals PTR_TO_CTX); other ops stay rejected
         let state = VerifierState::initial();
-        let err = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap_err();
+        let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
+        assert_eq!(next.regs[1], RegState::PtrToCtx);
+        let err = step(0, &state, &BpfInsn::XorImm { dst: 1, imm: 10 }).unwrap_err();
         assert!(err.message.contains("context pointer"));
+        // an insane offset is rejected (kernel check_reg_sane_offset_*)
+        let err = step(
+            0,
+            &state,
+            &BpfInsn::AddImm {
+                dst: 1,
+                imm: 1 << 29,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("not allowed"), "{}", err.message);
         // r10 += r1 with R1 = PtrToCtx → a pointer destination with a
         // non-scalar source is rejected
         let state = step(0, &state, &BpfInsn::MovImm { dst: 0, imm: 1 }).unwrap();
@@ -3371,10 +3489,10 @@ mod tests {
     }
 
     #[test]
-    fn step_add_reg_stack_ptr_overflow_clamped() {
-        // #87: a scalar whose signed range reaches i64::MIN/MAX cannot
-        // overflow the offset arithmetic — the interval saturates to
-        // the i32 bounds and any later access is rejected out of frame
+    fn step_add_reg_stack_ptr_unbounded_addend_rejected() {
+        // the kernel's arithmetic-time sanity check
+        // (check_reg_sane_offset_scalar): an addend with an unbounded
+        // minimum is rejected at arithmetic time (#90)
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToStack {
             min_offset: -32,
@@ -3382,6 +3500,18 @@ mod tests {
             align_off: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(
+            err.message.contains("unbounded min value"),
+            "{}",
+            err.message
+        );
+        // a bounded addend still widens the interval (the i32 clamp
+        // keeps the arithmetic overflow-safe)
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(-(1 << 29), 1 << 29));
+        let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
+        assert!(err.message.contains("out of bounds"), "{}", err.message);
+        state.regs[2] = RegState::Scalar(ScalarBounds::from_signed(0, 1000));
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         let RegState::PtrToStack {
             min_offset,
@@ -3391,7 +3521,7 @@ mod tests {
         else {
             panic!("expected stack pointer");
         };
-        assert_eq!((min_offset, max_offset), (i32::MIN, i32::MAX));
+        assert_eq!((min_offset, max_offset), (-32, 968));
         assert_eq!(align_off, ALIGN_UNKNOWN);
     }
 

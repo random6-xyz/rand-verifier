@@ -34,10 +34,16 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         || msg.contains("non-stack pointer")
         || msg.contains("through a scalar")
         || msg.contains("map value")
+        || msg.contains("math between")
+        || msg.contains("out of bounds")
+        || msg.contains("pointer offset")
     {
         // "... pointer arithmetic ...", "stack access through a
         // non-stack pointer / a scalar ...", "invalid access to map
-        // value ..." — the kernel says "invalid mem access"
+        // value ...", "math between ... pointer and ... is not
+        // allowed", "value ... makes ... pointer be out of bounds",
+        // "... pointer offset ... is not allowed" (the kernel's
+        // check_reg_sane_offset_* family)
         ReasonCategory::PointerArith
     } else if msg.contains("indirect read") {
         // "invalid indirect read from stack ... spilled ..." — the
@@ -54,6 +60,9 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // mini's loop budget is its complexity mechanism — the kernel
         // rejects non-converging loops with "BPF program is too large"
         ReasonCategory::Complexity
+    } else if msg.contains("infinite loop") {
+        // kernel/bpf/states.c: "infinite loop detected at insn N"
+        ReasonCategory::Loop
     } else {
         // decode rejections ("unknown opcode", "reserved fields",
         // "invalid register"), shift-amount errors, ...
@@ -165,6 +174,21 @@ pub fn whitelisted(
 ) -> Option<&'static str> {
     match (mini, kernel) {
         (SideVerdict::Reject { .. }, SideVerdict::Accept) => {
+            // mini's exploration budget (max_states 1024 / max_steps)
+            // vs the kernel's much larger limits — an intentional
+            // design limit; category-applied so fuzzer-generated
+            // complexity programs are whitelisted like the corpus
+            // fixture (the kernel accepts what mini rejects here)
+            if matches!(
+                mini,
+                SideVerdict::Reject {
+                    category: ReasonCategory::Complexity
+                }
+            ) {
+                return Some(
+                    "mini's exploration budget (max_states 1024 / max_steps) vs the kernel's much larger limits — intentional design limit (§6)",
+                );
+            }
             // privileged loads allow uninit stack reads
             // (allow_uninit_stack) and indirect reads over spilled
             // pointers (allow_ptr_leaks) by design — the same family as
@@ -374,10 +398,16 @@ mod tests {
             category: ReasonCategory::Complexity,
         };
         let acc = SideVerdict::Accept;
-        // the documented mini-limit difference is whitelisted
+        // the documented mini-limit difference is whitelisted — by
+        // category, so fuzzer-generated complexity programs are treated
+        // like the corpus fixture (#90)
         assert!(whitelisted("complexity_limit", &rej, &acc, None).is_some());
-        // the same pair under another name is a finding
-        assert!(whitelisted("bounded_loop", &rej, &acc, None).is_none());
+        assert!(whitelisted("seed-1-3", &rej, &acc, None).is_some());
+        // other categories under any name stay findings
+        let uninit = SideVerdict::Reject {
+            category: ReasonCategory::UninitRead,
+        };
+        assert!(whitelisted("anything", &uninit, &acc, None).is_none());
         // and the whitelist never applies to other pairs
         assert!(whitelisted("complexity_limit", &acc, &rej, None).is_none());
     }
