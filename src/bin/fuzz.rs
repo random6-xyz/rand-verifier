@@ -328,9 +328,11 @@ fn load_corpus_seeds() -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str
                 continue;
             }
             let bytes = fs::read(&path)?;
-            let insns = rand_verifier::insn::decode_program(&bytes).map_err(|(idx, e)| {
-                anyhow::anyhow!("{}: decode: {e} (slot {idx})", path.display())
-            })?;
+            // skip decode-invalid fixtures (e.g. ldimm64_bad_pseudo):
+            // there is no instruction stream to mutate from
+            let Ok(insns) = rand_verifier::insn::decode_program(&bytes) else {
+                continue;
+            };
             seeds.push((
                 path.file_stem().unwrap().to_string_lossy().into_owned(),
                 insns,
