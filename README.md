@@ -18,7 +18,7 @@ The milestones completed so far:
 | **v0.6** | Linux differential verifier | Native eBPF input, kernel-runner via the raw `bpf()` syscall, verdict matrix vs the kernel, whitelisted design differences |
 | **v0.7** | Verifier fuzzer | Deterministic program generation + seed-based mutation, oracle classification matrix, triage/dedup, campaign runner |
 | **v0.8** | Failure reducer | Finding replay + reduction invariant, offset-fixed deletion, ddmin with cache/budget, CFG/operand passes, reduce CLI |
-| **v0.8.1** | Precision gap closure | Root-cause of the first kernel-backed finding (mseed-5-99, #86); pointer bounds/alignment validated at access time like the kernel (LD/ST through computed stack pointers, variable-offset store/load semantics, #87) |
+| **v0.8.1** | Precision gap closure | Root-cause of the first kernel-backed finding (mseed-5-99, #86); access-time pointer validation (#87), kernel bug-pattern catalog (#88), ldimm64/map support with kernel map creation (#89), whitelist pruned to genuine design differences plus category rules (#90). First kernel-backed mutation campaign (2000 iters): 11 findings analysed against the kernel source and resolved (3 mini model gaps fixed, 2 category whitelist rules) |
 
 The next milestone — the **Linux verifier analysis** (v0.9) — starts from the
 minimal reproducers the reducer produces.
@@ -66,6 +66,9 @@ The crate is a library (`rand-verifier`) plus a thin CLI binary.
 - **Helper calls** — argument types are validated against prototypes, R1..R5 are clobbered after the call, R6..R9 preserved, R0 gets the return type.
 - **Nullable pointers** — a `PtrToMapValueOrNull` must pass a NULL check (`jeq ptr, 0`) before use; the fall-through refines it to `PtrToMapValue`.
 - **Complexity limits** — exploration is bounded by `max_states` (1024) and `max_steps` (100 000), mirroring `BPF_COMPLEXITY_LIMIT_*`.
+- **Infinite-loop detection** — a state revisited with an identical state at a pc on a cycle is rejected (kernel `states.c`: "infinite loop detected").
+- **Arithmetic-time pointer sanity** — pointer ADD/SUB addends must stay within `BPF_MAX_VAR_OFF` (1 << 28) and may not have an unbounded minimum (kernel `check_reg_sane_offset_*`); the 512-byte frame bounds themselves are validated at access time.
+- **Context pointer arithmetic** — ctx ADD/SUB with a sane offset is allowed (kernel `adjust_ptr_min_max_vals` PTR_TO_CTX), like the kernel.
 
 ## Building
 
@@ -114,15 +117,19 @@ cargo run --bin diff -- --strict           # unprivileged-equivalent comparison 
 
 The default diff runs **privileged** — the real-world baseline (root loads get the kernel's
 lenient rules). Loading needs root / CAP_BPF when `kernel.unprivileged_bpf_disabled = 2`;
-the runner reports EPERM with guidance. The kernel-accepts cases found on the first
-privileged corpus run are whitelisted after verifying each against the kernel source
-(`docs/DIFFERENTIAL_PLAN.md` §10); since v0.8.1 (#87) the remaining entries are:
+the runner reports EPERM with guidance. Since v0.8.1 (#90) the whitelist is a mix of
+name entries and category rules, each justified against the kernel source
+(`docs/DIFFERENTIAL_PLAN.md` §10, kernel/bpf/token.c, kernel/bpf/verifier.c):
 
-- `complexity_limit` — mini's 1024-state budget vs the kernel's limits (intentional)
-- `stack_write_before_read` — privileged loads allow uninit stack reads by design
-  (`allow_uninit_stack`; `bpf_ns_capable` treats CAP_SYS_ADMIN as a superset of every BPF cap)
+- `complexity_limit` + the **Complexity category rule** — mini's exploration budget
+  (max_states 1024 / max_steps) vs the kernel's much larger limits (intentional);
+  category-applied so fuzzer-generated complexity programs are covered too
+- `stack_write_before_read` + the **privileged stack-leniency category rule** — privileged
+  loads allow uninit stack reads (`allow_uninit_stack`) and indirect reads over spilled
+  pointers (`allow_ptr_leaks`); `bpf_ns_capable` treats CAP_SYS_ADMIN as a superset of
+  every BPF cap (kernel/bpf/token.c). Uninit *register* reads stay findings
 
-The `computed_offset_*` / `pointer_reg_arith` entries were removed in v0.8.1: pointer
+The `computed_offset_*` / `pointer_reg_arith` entries were removed: pointer
 bounds/alignment are now validated at access time like the kernel does (mseed-5-99
 analysis, #86; fix #87), so those programs agree on both sides.
 
@@ -240,6 +247,13 @@ First campaign numbers (v0.7, 2026-08):
 | generation + kernel (seed 42, 500 iters, privileged) | agree 500 | 0 | the kernel agrees with rand-verifier on every generated program |
 | mutation + kernel --strict (seed 5, 200 iters) | agree 157, whitelisted 4, inconclusive 1, skipped 1 | 0 | strict `!root` rules absorbed by the strict whitelist |
 
+First v0.8.1 kernel-backed mutation campaign (2026-08, seed 5, 2000 iters, privileged):
+
+| campaign | verdicts | findings | resolution |
+|----------|----------|----------|------------|
+| mutation + kernel (seed 5, 2000 iters) | agree 1747, whitelisted 9, inconclusive 31, precision-candidate 5, soundness-candidate 2, rv-precision-gap 4 | 11 | all analysed against the kernel source: 2x ctx arithmetic (kernel PTR_TO_CTX allows ADD/SUB — mini+concrete now mirror it), 3x infinite loop (kernel states.c identical-state rule — mini now detects it), 2x unbounded/huge addend (kernel check_reg_sane_offset_* — mini now enforces BPF_MAX_VAR_OFF at arithmetic time), 4x complexity (whitelisted by category) |
+| re-run (same seed) | agree 1760, whitelisted 13, inconclusive 37, precision-candidate 1 | 1 | the remaining candidate was a klog category gap (kernel's "math between ..." message fell to Other) — fixed; both sides reject with the same category |
+
 ## Instruction subset
 
 The verifier accepts the kernel's `struct bpf_insn` encoding (8 bytes per
@@ -282,7 +296,7 @@ BPF-to-BPF/kfunc calls, …) are rejected as unsupported.
 
 Raw bytecode fixtures live in `tests/programs/`:
 
-- `tests/programs/accept/` — 41 programs that must pass
+- `tests/programs/accept/` — 40 programs that must pass
 - `tests/programs/reject/` — 38 programs that must fail
 
 Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, access-time pointer checks, map fd/key-value validation, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list. Map fixtures carry a sibling `<name>.maps` sidecar registering the referenced map fds (ARRAY key 4B / value 8B / 1 entry).
@@ -309,7 +323,7 @@ The project is a research framework in progress. The next phases:
 3. **Linux differential verifier** — run the same program through rand-verifier, the concrete interpreter, and the real Linux verifier.
 4. **Verifier fuzzer** — generate eBPF programs to search for `Linux verifier: REJECT` vs `Concrete execution: SAFE` discrepancies.
 5. **Failure reducer** — automatically minimize discovered testcases down to a minimal reproducer (v0.8 ✅, see the section above).
-6. **Linux verifier analysis** — trace comparisons and precision-loss analysis on the reduced reproducers (v0.9). The first analysis round is done (mseed-5-99, #86) and the fix landed in v0.8.1 (#87); the next candidate feeds in from the fuzzer.
+6. **Linux verifier analysis** — trace comparisons and precision-loss analysis on the reduced reproducers (v0.9). The first analysis round is done (mseed-5-99, #86) with the fix in v0.8.1 (#87); the first kernel-backed mutation campaign then surfaced 11 findings that were all resolved against the kernel source (mini model gaps fixed, category whitelist rules added) — the next candidate feeds in from the fuzzer.
 7. **Kernel patch** — a soundness-preserving fix for `kernel/bpf/verifier.c` plus a BPF selftest.
 8. **Upstream** — submit `[PATCH bpf-next] bpf: verifier: ...` and land it.
 
