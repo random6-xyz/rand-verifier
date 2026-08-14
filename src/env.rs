@@ -11,7 +11,7 @@ use crate::concrete::{
     run_concrete_with_maps,
 };
 use crate::error::{Verdict, VerificationFailure};
-use crate::insn::{BpfInsn, DecodeError, opcode, parse_insn, parse_ldimm64};
+use crate::insn::{BpfInsn, decode_program};
 use crate::mini::{VerifierLimits, verify_mini_with_states};
 
 /// Map metadata carried by `PtrToMap` and needed for key/value argument
@@ -152,50 +152,10 @@ impl BpfVerifierEnv {
         // instruction plus a transparent marker entry (#89).
         let mut insns = Vec::with_capacity(insn_cnt as usize);
         let mut decode_error = None;
-        let mut idx = 0usize;
-        let chunks: Vec<&[u8]> = raw_data.chunks_exact(8).collect();
-        while idx < chunks.len() {
-            let chunk = chunks[idx];
-            if chunk[0] == opcode::LD_IMM64 {
-                match chunks.get(idx + 1) {
-                    Some(second) => match parse_ldimm64(chunk, second) {
-                        Ok(insn) => {
-                            insns.push(insn);
-                            insns.push(BpfInsn::LdImm64Second {
-                                imm_hi: u32::from_le_bytes([
-                                    second[4], second[5], second[6], second[7],
-                                ]),
-                            });
-                            idx += 2;
-                        }
-                        Err(e) => {
-                            decode_error =
-                                Some(VerificationFailure::new(idx as u32, e.to_string()));
-                            insns.clear();
-                            break;
-                        }
-                    },
-                    None => {
-                        decode_error = Some(VerificationFailure::new(
-                            idx as u32,
-                            DecodeError::LdImm64Truncated.to_string(),
-                        ));
-                        insns.clear();
-                        break;
-                    }
-                }
-            } else {
-                match parse_insn(chunk) {
-                    Ok(insn) => {
-                        insns.push(insn);
-                        idx += 1;
-                    }
-                    Err(e) => {
-                        decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
-                        insns.clear();
-                        break;
-                    }
-                }
+        match decode_program(&raw_data) {
+            Ok(decoded) => insns = decoded,
+            Err((idx, e)) => {
+                decode_error = Some(VerificationFailure::new(idx as u32, e.to_string()));
             }
         }
         // resolve map fds from the registry at load time (kernel:
@@ -495,8 +455,10 @@ mod tests {
                     .unwrap();
                 let v_file = env_file.verify().unwrap();
 
-                // byte array
+                // byte array (maps sidecar registered the same way the
+                // file path does, #89)
                 let mut env_bytes = BpfVerifierEnv::new();
+                env_bytes.load_maps_sidecar(path.to_str().unwrap());
                 env_bytes.setup_prog_bytes(&bytes).unwrap();
                 let v_bytes = env_bytes.verify().unwrap();
 
@@ -663,7 +625,11 @@ mod tests {
                 "reject program {:?} was accepted",
                 path
             );
-            let report = env.concrete_report.as_ref().expect("concrete report");
+            // decode-error rejects (e.g. ldimm64_bad_pseudo) have no
+            // concrete run — nothing to cross-check
+            let Some(report) = env.concrete_report.as_ref() else {
+                continue;
+            };
             let note = report
                 .reject_note
                 .as_deref()

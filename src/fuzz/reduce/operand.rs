@@ -24,7 +24,7 @@
 //! `MOV64 imm`; any other write clears the known value).
 
 use crate::fuzz::insn_lib::encode;
-use crate::insn::{BpfInsn, parse_insn};
+use crate::insn::BpfInsn;
 
 /// The interesting-values pool (v0.7 #65), in preference order.
 const VALUE_POOL: [i32; 5] = [0, 1, -1, i32::MIN, i32::MAX];
@@ -351,11 +351,7 @@ fn decode(bytes: &[u8]) -> Option<Vec<BpfInsn>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(8) {
         return None;
     }
-    bytes
-        .chunks_exact(8)
-        .map(parse_insn)
-        .collect::<Result<_, _>>()
-        .ok()
+    crate::insn::decode_program(bytes).ok()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

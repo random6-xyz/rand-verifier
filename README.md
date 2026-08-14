@@ -270,6 +270,7 @@ same bytes clang and the kernel selftests emit (issue #56):
 | `0x1d`…`0xdd` | compares | `if rX op rY goto +off` and `if rX op imm goto +off` — `JEQ`/`JNE`/`JGT`/`JGE`/`JLT`/`JLE` (unsigned) and `JSGT`/`JSGE`/`JSLT`/`JSLE` (signed), register (`BPF_J*_X`) and immediate (`BPF_J*_K`) forms |
 | `0x05` | `JMP` | `goto +off` (`BPF_JA`) |
 | `0x85` | `CALL` | helper call — `imm` is the helper id (kernel convention) |
+| `0x18` | `LD_IMM64` | `rX = imm64` (two slots); `PSEUDO_MAP_FD` → `CONST_PTR_TO_MAP`, `PSEUDO_MAP_VALUE` → map value pointer (#89) |
 | `0x95` | `EXIT` | terminate path |
 
 Unknown opcodes, invalid registers and non-zero reserved fields are
@@ -281,12 +282,12 @@ BPF-to-BPF/kfunc calls, …) are rejected as unsupported.
 
 Raw bytecode fixtures live in `tests/programs/`:
 
-- `tests/programs/accept/` — 35 programs that must pass
-- `tests/programs/reject/` — 30 programs that must fail
+- `tests/programs/accept/` — 40 programs that must pass
+- `tests/programs/reject/` — 36 programs that must fail
 
-Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, access-time pointer checks, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list.
+Each fixture exercises one specific verification rule (uninitialized reads, stack bounds/alignment, write-before-read, invalid jumps, unbounded loops, helper argument mismatches, complexity limits, access-time pointer checks, map fd/key-value validation, …). See [`tests/programs/README.md`](tests/programs/README.md) for the full list. Map fixtures carry a sibling `<name>.maps` sidecar registering the referenced map fds (ARRAY key 4B / value 8B / 1 entry).
 
-Run the test suite (460 tests — unit, corpus, and the reducer integration suite):
+Run the test suite (471 tests — unit, corpus, and the reducer integration suite):
 
 ```sh
 cargo test

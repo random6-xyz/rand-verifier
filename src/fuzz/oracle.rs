@@ -425,8 +425,11 @@ mod tests {
                     Verdict::Safe => acc(),
                     Verdict::Unsafe(failure) => rej(crate::diff::categorize_mini_reason(failure)),
                 };
-                let concrete =
-                    concrete_side(env.concrete_report.as_ref().expect("concrete report"));
+                let concrete = match env.concrete_report.as_ref() {
+                    Some(report) => concrete_side(report),
+                    // decode-error rejects have no concrete run
+                    None => continue,
+                };
 
                 // kernel verdict from the v0.6 privileged run: all
                 // accept fixtures accepted; the five kernel-accepts

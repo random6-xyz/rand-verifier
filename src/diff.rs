@@ -33,10 +33,11 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         || msg.contains("comparing pointers")
         || msg.contains("non-stack pointer")
         || msg.contains("through a scalar")
+        || msg.contains("map value")
     {
         // "... pointer arithmetic ...", "stack access through a
-        // non-stack pointer / a scalar ..." — the kernel says
-        // "invalid mem access"
+        // non-stack pointer / a scalar ...", "invalid access to map
+        // value ..." — the kernel says "invalid mem access"
         ReasonCategory::PointerArith
     } else if msg.contains("indirect read") {
         // "invalid indirect read from stack ... spilled ..." — the
@@ -217,6 +218,10 @@ mod tests {
                 ReasonCategory::StackBounds,
             ),
             (
+                "invalid access to map value r0+0, value_size=8 (base offsets 8..8)",
+                ReasonCategory::PointerArith,
+            ),
+            (
                 "stack access through a non-stack pointer r1 is not supported",
                 ReasonCategory::PointerArith,
             ),
@@ -368,10 +373,14 @@ mod tests {
                 crate::error::Verdict::Safe => panic!("reject program accepted: {:?}", path),
                 crate::error::Verdict::Unsafe(failure) => {
                     let category = categorize_mini_reason(&failure);
-                    let shift_other =
-                        category == ReasonCategory::Other && failure.message.contains("shift");
+                    // decode-level rejections (unknown opcode, reserved
+                    // fields, unsupported instructions) stay Other, like
+                    // their kernel-side "unknown opcode" family
+                    let decode_other = category == ReasonCategory::Other
+                        && (failure.message.contains("shift")
+                            || failure.message.contains("unsupported instruction"));
                     assert!(
-                        shift_other || category != ReasonCategory::Other,
+                        decode_other || category != ReasonCategory::Other,
                         "{:?}: {} → {:?}",
                         path,
                         failure.message,

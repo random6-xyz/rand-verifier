@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use rand_verifier::insn::{disassemble, parse_insn};
+use rand_verifier::insn::{decode_program, disassemble};
 use rand_verifier::klog::ReasonCategory;
 use rand_verifier::krun::{
     KernelOutcome, drop_privileged_caps, load_with_kernel_debug, load_with_kernel_verbose,
@@ -29,11 +29,13 @@ use rand_verifier::krun::{
 /// Print the disassembly of a program (decode errors are shown inline —
 /// the kernel would reject them as "unknown opcode").
 fn print_program(insns: &[u8]) {
-    for (i, chunk) in insns.chunks_exact(8).enumerate() {
-        match parse_insn(chunk) {
-            Ok(insn) => println!("{:4}: {}", i, disassemble(&insn)),
-            Err(e) => println!("{:4}: <{}>", i, e),
+    match decode_program(insns) {
+        Ok(decoded) => {
+            for (i, insn) in decoded.iter().enumerate() {
+                println!("{:4}: {}", i, disassemble(insn));
+            }
         }
+        Err((_, e)) => println!("decode error: {e}"),
     }
 }
 

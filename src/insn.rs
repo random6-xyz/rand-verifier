@@ -747,6 +747,33 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
     }
 }
 
+/// Decode a whole program (kernel slot stream) into instructions (#89).
+/// ldimm64 (0x18) consumes two slots and decodes to the instruction
+/// plus a transparent `LdImm64Second` marker, so branch offsets stay in
+/// kernel slot units. The first decode error stops the decode; the
+/// error carries the failing slot index.
+pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)> {
+    let mut insns = Vec::new();
+    let mut idx = 0usize;
+    let chunks: Vec<&[u8]> = bytes.chunks_exact(8).collect();
+    while idx < chunks.len() {
+        if chunks[idx][0] == opcode::LD_IMM64 {
+            let second = chunks
+                .get(idx + 1)
+                .ok_or((idx, DecodeError::LdImm64Truncated))?;
+            insns.push(parse_ldimm64(chunks[idx], second).map_err(|e| (idx, e))?);
+            insns.push(BpfInsn::LdImm64Second {
+                imm_hi: u32::from_le_bytes([second[4], second[5], second[6], second[7]]),
+            });
+            idx += 2;
+        } else {
+            insns.push(parse_insn(chunks[idx]).map_err(|e| (idx, e))?);
+            idx += 1;
+        }
+    }
+    Ok(insns)
+}
+
 /// Decode a two-slot `BPF_LD|BPF_DW|BPF_IMM` (ldimm64, #89). `first` is
 /// the instruction slot, `second` its 64-bit continuation. The pseudo
 /// classes (kernel `BPF_PSEUDO_*` in `src_reg`) select the meaning:

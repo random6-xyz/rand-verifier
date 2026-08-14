@@ -590,10 +590,10 @@ mod tests {
                     continue;
                 }
                 let bytes = std::fs::read(&path).unwrap();
-                let insns: Vec<BpfInsn> = bytes
-                    .chunks_exact(8)
-                    .map(|c| crate::insn::parse_insn(c).unwrap())
-                    .collect();
+                // skip decode-invalid fixtures (e.g. ldimm64_bad_pseudo)
+                let Some(insns) = crate::insn::decode_program(&bytes).ok() else {
+                    continue;
+                };
                 seeds.push((
                     path.file_stem().unwrap().to_string_lossy().into_owned(),
                     insns,

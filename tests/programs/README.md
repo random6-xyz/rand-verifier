@@ -108,6 +108,11 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | computed_offset_access      | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed offset in-frame + aligned   |
 | computed_ptr_access         | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; [r6] = r2; r0 = [r6]; exit` | computed pointer in-frame aligned access (variable store/load) |
 | computed_pointer_no_access  | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed pointer never dereferenced (reduced mseed-5-99, #86/#87) |
+| ldimm64_const               | `r2 = 0x1234567890abcdef; r0 = r2; exit`                          | ldimm64 64-bit constant (#89) |
+| ldimm64_map_fd              | `r1 = map_fd(1); r0 = 0; exit`                                    | CONST_PTR_TO_MAP from a map fd (#89) |
+| map_lookup_null_check       | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +2; r4 = [r0]; r0 = 1; exit; exit` | map_lookup → NULL check → value load (#89) |
+| map_value_access            | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +4; r4 = 42; [r0] = r4; r4 = [r0]; r0 = r4; exit; exit` | map value store/load roundtrip (#89) |
+| map_update_basic            | `r1 = map_fd(1); r2 = r10-8; r3 = r10-16; [r10-8] = 0; [r10-16] = 0; call 2; r0 = 0; exit` | map_update key/value buffers (#89) |
 | computed_offset_misaligned  | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment tracked, not rejected (#87) |
 | computed_offset_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed out-of-frame offset without access (#87) |
 | overflowed_range_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r2 += 1000000000; r6 += r2; r0 = 1; exit` | saturated offset interval without access (#87) |
@@ -152,3 +157,13 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | alu32_uninit                   | `w2 += 5; exit`                                     | ALU32 read of an uninitialized register   |
 | loop_no_exit                   | `jmp -1`                                           | loop whose subprogram does not end with exit |
 | immediate_compare_uninit | `jeq r2, 5, +2; r0 = 1; exit; r0 = 0; exit`                     | immediate compare reads an uninitialized register (#57) |
+| map_value_out_of_bounds     | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +3; r0 += 8; r4 = [r0]; r0 = 1; exit; exit` | map value access past value_size (#89) |
+| map_value_misaligned        | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +3; r0 += 4; r4 = [r0]; r0 = 1; exit; exit` | misaligned map value access (#89) |
+| map_lookup_null_deref       | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; r4 = [r0]; r0 = 1; exit` | map value deref without a NULL check (#89) |
+| map_lookup_uninit_key       | `r1 = map_fd(1); r2 = r10-8; call 1; r0 = 1; exit`               | map_lookup with an uninitialized key buffer (#89) |
+| map_update_bad_value_arg    | `r1 = map_fd(1); r2 = r10-8; r3 = 7; [r10-8] = 0; call 2; r0 = 0; exit` | map_update value arg is not a buffer (#89) |
+| ldimm64_bad_pseudo          | `r1 = <ldimm64 pseudo class 9>; r0 = 0; exit`                     | unknown ldimm64 pseudo class (#89) |
+
+Map fixtures use a sibling `<name>.maps` sidecar registering fd 1 as an
+ARRAY map (key 4B / value 8B / 1 entry) — the program loader resolves
+map fds at load time like the kernel's `check_ld_imm64` (#89).
