@@ -271,11 +271,11 @@ pub(crate) fn compute_loop_pcs(
                     if bwd[idx as usize] {
                         continue;
                     }
-                    if let Ok(nexts) = visit_insn(idx, insns, subprogs) {
-                        if nexts.contains(&v) {
-                            bwd[idx as usize] = true;
-                            stack.push(idx);
-                        }
+                    if let Ok(nexts) = visit_insn(idx, insns, subprogs)
+                        && nexts.contains(&v)
+                    {
+                        bwd[idx as usize] = true;
+                        stack.push(idx);
                     }
                 }
             }
