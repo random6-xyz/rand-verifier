@@ -3,15 +3,28 @@
 use crate::error::VerificationFailure;
 use crate::insn::BpfInsn;
 
-/// Collect subprogram entry points.
-///
-/// BPF-to-BPF calls (BPF_PSEUDO_CALL) are rejected at decode time
-/// (issue #56), so every program is a single subprogram: the main
-/// program at index 0. The subprogram machinery (the boundary checks
-/// in `visit_insn`) stays in place — with `subprogs == [0]` the
-/// boundaries are simply the whole program.
-pub(crate) fn add_subprog(_insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
-    Ok(vec![0u32])
+/// Collect subprogram entry points (#100): the main program at index 0
+/// plus every BPF_PSEUDO_CALL target, sorted (the kernel's
+/// `subprog_info` / find_subprog). A call target beyond the program or
+/// inside a function body (not an entry) is rejected here.
+pub(crate) fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
+    let mut starts = vec![0u32];
+    for (pc, insn) in insns.iter().enumerate() {
+        if let BpfInsn::CallSub { offset } = insn {
+            let target = (pc as i32 + 1 + *offset) as u32;
+            if target as usize >= insns.len() {
+                return Err(VerificationFailure::new(
+                    pc as u32,
+                    format!("call target {} is out of the program", target),
+                ));
+            }
+            if !starts.contains(&target) {
+                starts.push(target);
+            }
+        }
+    }
+    starts.sort_unstable();
+    Ok(starts)
 }
 
 /// Return the [start, end) range of the subprogram that contains `insn_idx`.
@@ -48,8 +61,24 @@ pub(crate) fn visit_insn(
     let (start, end) = find_subprog_range(idx, subprogs, insn_cnt);
 
     let nexts = match &insns[idx as usize] {
-        // terminal — no successors
-        BpfInsn::Exit => vec![],
+        // the main program's exit is terminal; a subprogram's exit
+        // returns to every call site + 1 (#100)
+        BpfInsn::Exit => {
+            if start == 0 {
+                vec![]
+            } else {
+                let mut returns = Vec::new();
+                for (pc, insn) in insns.iter().enumerate() {
+                    if let BpfInsn::CallSub { offset } = insn {
+                        let target = (pc as i32 + 1 + *offset) as u32;
+                        if target == start {
+                            returns.push(pc as u32 + 1);
+                        }
+                    }
+                }
+                returns
+            }
+        }
         // unconditional jump — no fall-through
         BpfInsn::Jmp { offset } => {
             // BPF branch target is PC-relative to the next insn: idx + 1 + offset
@@ -102,8 +131,23 @@ pub(crate) fn visit_insn(
             vec![target, idx + 1]
         }
         // helper calls (imm = helper id, kernel convention) fall
-        // straight through; BPF-to-BPF calls are rejected at decode
+        // straight through
         BpfInsn::Call { .. } => vec![idx + 1],
+        // BPF-to-BPF calls: the target must be a subprogram entry
+        // (#100); the call itself falls into the callee
+        BpfInsn::CallSub { offset } => {
+            let target = (idx as i32 + 1 + *offset) as u32;
+            if !subprogs.contains(&target) {
+                return Err(VerificationFailure::new(
+                    idx,
+                    format!(
+                        "call target {} is not a subprogram entry {:?}",
+                        target, subprogs
+                    ),
+                ));
+            }
+            vec![target]
+        }
         // everything else — straight-line fall-through
         _ => vec![idx + 1],
     };

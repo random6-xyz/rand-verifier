@@ -90,12 +90,25 @@ pub(crate) enum ConcreteValue {
 /// value where the abstract side is uninitialized is an immediate
 /// coverage violation (#52), so no value is ever invented for an
 /// uninitialized register.
+/// One concrete verifier frame (registers + stack), #100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConcreteFrame {
+    pub(crate) regs: [Option<ConcreteValue>; NUM_REGS],
+    pub(crate) stack: [Option<ConcreteValue>; STACK_SLOTS],
+    pub(crate) ret_pc: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConcreteState {
     pub(crate) regs: [Option<ConcreteValue>; NUM_REGS],
     /// One slot per 8-byte cell of the 512-byte frame, like the abstract
     /// `StackState`.
     pub(crate) stack: [Option<ConcreteValue>; STACK_SLOTS],
+    /// The caller frames of active BPF-to-BPF calls (#100), mirroring
+    /// the abstract `VerifierState::saved` + `curframe`.
+    pub(crate) saved: [Option<ConcreteFrame>; crate::state::MAX_CALL_FRAMES - 1],
+    pub(crate) curframe: u8,
+    pub(crate) ret_pc: u32,
 }
 
 /// Clean a concrete state with its pc's liveness masks, mirroring the
@@ -131,7 +144,52 @@ impl ConcreteState {
         Self {
             regs,
             stack: [None; STACK_SLOTS],
+            saved: [None; crate::state::MAX_CALL_FRAMES - 1],
+            curframe: 0,
+            ret_pc: 0,
         }
+    }
+
+    /// Enter a subprogram call (#100): save the current frame, set up
+    /// the callee frame with R1..R5 as the arguments.
+    pub(crate) fn call_subprog(&mut self, return_pc: u32) -> Result<(), ConcreteFailure> {
+        if self.curframe as usize >= crate::state::MAX_CALL_FRAMES - 1 {
+            return Err(ConcreteFailure::InternalError { pc: 0 });
+        }
+        self.saved[self.curframe as usize] = Some(ConcreteFrame {
+            regs: self.regs,
+            stack: self.stack,
+            ret_pc: self.ret_pc,
+        });
+        let args = self.regs[1..=5].to_vec();
+        self.curframe += 1;
+        self.regs = [None; NUM_REGS];
+        self.stack = [None; STACK_SLOTS];
+        for (i, v) in args.into_iter().enumerate() {
+            self.regs[1 + i] = v;
+        }
+        self.regs[10] = Some(ConcreteValue::StackPtr(STACK_BASE));
+        self.ret_pc = return_pc;
+        Ok(())
+    }
+
+    /// Return from a subprogram call (#100): restore the caller frame
+    /// with the callee's R0.
+    pub(crate) fn return_from_subprog(&mut self) -> Option<()> {
+        if self.curframe == 0 {
+            return None;
+        }
+        let ret = self.regs[0];
+        self.curframe -= 1;
+        let caller = self.saved[self.curframe as usize].take()?;
+        self.ret_pc = caller.ret_pc;
+        self.regs = caller.regs;
+        self.stack = caller.stack;
+        self.regs[0] = ret;
+        for r in 1..=5 {
+            self.regs[r] = None;
+        }
+        Some(())
     }
 }
 
@@ -649,7 +707,8 @@ pub(crate) fn concrete_step(
         | BpfInsn::JsgeImm { .. }
         | BpfInsn::JsltImm { .. }
         | BpfInsn::JsleImm { .. }
-        | BpfInsn::Call { .. } => {
+        | BpfInsn::Call { .. }
+        | BpfInsn::CallSub { .. } => {
             unreachable!(
                 "exit, control flow and calls are expanded by the explorer (#51), not concrete_step()"
             )
@@ -969,11 +1028,19 @@ pub(crate) fn run_concrete_with_maps(
             .get(pc as usize)
             .ok_or(ConcreteFailure::InternalError { pc })?;
 
-        // a path ends at exit; R0 must hold a valid value there (mirror
-        // of the abstract "r0 is uninitialized at exit")
+        // a subprogram's exit returns to the caller (#100); the
+        // outermost exit ends the path (R0 must hold a valid value
+        // there — mirror of the abstract "r0 is uninitialized at exit")
         if matches!(insn, BpfInsn::Exit) {
             read_concrete_reg(pc, &state, 0)
                 .map_err(|_| ConcreteFailure::UninitializedRead { pc, reg: 0 })?;
+            if state.curframe > 0 {
+                let return_pc = state.ret_pc;
+                let mut returned = state;
+                returned.return_from_subprog();
+                worklist.push((return_pc, returned));
+                continue;
+            }
             // deduplicate identical exit states (e.g. converging seeds)
             if !outcomes.iter().any(|o| o.state == state) {
                 outcomes.push(ConcreteOutcome { pc, state });
@@ -1010,7 +1077,21 @@ fn concrete_successors(
     mem: &mut MapMem,
 ) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
     match insn {
-        BpfInsn::Exit => Ok(vec![]),
+        // a subprogram's exit returns to the caller (#100)
+        BpfInsn::Exit => {
+            if state.curframe == 0 {
+                Ok(vec![])
+            } else {
+                let mut returned = *state;
+                returned.return_from_subprog();
+                Ok(vec![(pc + 1, returned)])
+            }
+        }
+        BpfInsn::CallSub { offset } => {
+            let mut callee = *state;
+            callee.call_subprog(pc + 1)?;
+            Ok(vec![(branch_target(pc, *offset as i16), callee)])
+        }
         BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
         BpfInsn::Jeq { dst, src, offset } => {
             concrete_cond(pc, *dst, *src, *offset, CondOp::Eq, state)

@@ -392,13 +392,51 @@ impl StackState {
 
 // ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
 
+/// Maximum number of active verifier frames (kernel MAX_CALL_FRAMES).
+pub(crate) const MAX_CALL_FRAMES: usize = 16;
+
+/// The abstract state of one verifier frame (the kernel's
+/// `bpf_func_state`, #100): registers plus stack. `ret_pc` is this
+/// frame's return address — where the execution continues when THIS
+/// frame returns (the kernel's per-frame `callsite` + 1); each frame
+/// carries its own, so nested calls return correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameState {
+    pub(crate) regs: [RegState; NUM_REGS],
+    pub(crate) stack: StackState,
+    pub(crate) ret_pc: u32,
+}
+
+impl FrameState {
+    /// A fresh frame: R10 = the frame pointer, everything else
+    /// uninitialized (the kernel's `init_func_state`).
+    pub(crate) fn new() -> Self {
+        Self {
+            regs: initial_reg_state(),
+            stack: StackState::new(),
+            ret_pc: 0,
+        }
+    }
+}
+
 /// Unified verifier state carried through instruction simulation.
 ///
-/// Holds the abstract state of all 11 registers plus the stack.
+/// `regs`/`stack` are the CURRENT (deepest) frame — the kernel's
+/// `frame[curframe]` — so every existing access site keeps meaning
+/// "the executing frame". `saved` holds the caller frames of
+/// BPF-to-BPF calls (#100): `saved[i]` is the frame at depth `i`
+/// (Some while a call is active below it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VerifierState {
     pub(crate) regs: [RegState; NUM_REGS],
     pub(crate) stack: StackState,
+    /// The caller frames of active BPF-to-BPF calls (#100).
+    pub(crate) saved: [Option<FrameState>; MAX_CALL_FRAMES - 1],
+    /// The current frame's depth (0 = the main program; the kernel's
+    /// `curframe`).
+    pub(crate) curframe: u8,
+    /// The current frame's return address (#100).
+    pub(crate) ret_pc: u32,
 }
 
 impl VerifierState {
@@ -408,7 +446,54 @@ impl VerifierState {
         Self {
             regs: initial_reg_state(),
             stack: StackState::new(),
+            saved: [None; MAX_CALL_FRAMES - 1],
+            curframe: 0,
+            ret_pc: 0,
         }
+    }
+
+    /// Enter a subprogram call (#100): save the current frame and set
+    /// up a fresh callee frame with R1..R5 as the arguments (the
+    /// kernel's `__check_func_call`). The callee-saved registers
+    /// R6..R9 of the caller survive via the saved frame.
+    pub(crate) fn call_subprog(&mut self, return_pc: u32) -> Result<(), &'static str> {
+        if self.curframe as usize >= MAX_CALL_FRAMES - 1 {
+            return Err("the call stack of 16 frames is too deep");
+        }
+        self.saved[self.curframe as usize] = Some(FrameState {
+            regs: self.regs,
+            stack: self.stack,
+            ret_pc: self.ret_pc,
+        });
+        let args: [RegState; 5] = self.regs[1..=5].try_into().unwrap();
+        self.curframe += 1;
+        let mut callee = FrameState::new();
+        callee.regs[1..=5].copy_from_slice(&args);
+        self.regs = callee.regs;
+        self.stack = callee.stack;
+        self.ret_pc = return_pc;
+        Ok(())
+    }
+
+    /// Return from a subprogram call (#100): restore the caller frame
+    /// with the callee's R0 as the return value (the kernel's
+    /// `check_func_call` return handling). The caller's argument
+    /// registers R1..R5 are clobbered by the call, like helper calls.
+    pub(crate) fn return_from_subprog(&mut self) -> Option<()> {
+        if self.curframe == 0 {
+            return None;
+        }
+        let ret = self.regs[0];
+        self.curframe -= 1;
+        let caller = self.saved[self.curframe as usize].take()?;
+        self.ret_pc = caller.ret_pc;
+        self.regs = caller.regs;
+        self.stack = caller.stack;
+        self.regs[0] = ret;
+        for r in 1..=5 {
+            self.regs[r] = RegState::Uninit;
+        }
+        Some(())
     }
 }
 

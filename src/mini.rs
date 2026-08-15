@@ -245,11 +245,12 @@ fn backtrack_insn(
         | BpfInsn::LdMapFd { dst, .. }
         | BpfInsn::LdMapValue { dst, .. } => bt.regs &= !dst_bit(*dst),
         BpfInsn::LdImm64Second { .. } => {}
-        // a helper call writes R0; the argument registers were either
-        // consumed by the call's own checks or are dead — a requirement
-        // still pending on them cannot be resolved here (kernel:
-        // verifier_bug; we fall back conservatively)
-        BpfInsn::Call { .. } => {
+        // a helper call or BPF-to-BPF call writes R0; the argument
+        // registers were either consumed by the call's own checks or
+        // are dead — a requirement still pending on them cannot be
+        // resolved here (kernel: verifier_bug; we fall back
+        // conservatively)
+        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } => {
             bt.regs &= !(1u16 << 0);
             if bt.regs & 0b111110 != 0 {
                 return BacktrackOutcome::Fallback;
@@ -786,6 +787,42 @@ fn verify_mini_core(
             jmps_processed += 1;
         }
 
+        // an exit inside a subprogram returns to the caller (#100):
+        // the callee's R0 becomes the caller's R0 (a scalar return, like
+        // the kernel's check_return_code), the caller frame is restored
+        // with its callee-saved registers, and the path continues at
+        // the call site + 1. The kernel only rejects a STACK pointer
+        // return here ("cannot return stack pointer to the caller" —
+        // other pointer types are legal in static subprogs). The
+        // OUTERMOST exit ends the path and requires a scalar R0.
+        if matches!(insn, BpfInsn::Exit) && item.state.curframe > 0 {
+            let r0 = read_reg(pc, &item.state, 0)
+                .map_err(|_| VerificationFailure::new(pc, "r0 is uninitialized at subprog exit"))?;
+            if matches!(r0, RegState::PtrToStack { .. }) {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "cannot return stack pointer to the caller",
+                ));
+            }
+            // the callee's return address (its call site + 1); after
+            // the pop, the state's ret_pc is the caller frame's own
+            // return address for ITS eventual return
+            let return_pc = item.state.ret_pc;
+            let mut returned = item.state;
+            returned.return_from_subprog();
+            // the returned path continues at the call site + 1 with a
+            // fresh history segment (#100)
+            bump_branches(&mut checkpoints, item.last_cp, 1);
+            worklist.push(WorkItem {
+                pc: return_pc,
+                state: returned,
+                last_cp: item.last_cp,
+                history: Vec::new(),
+            });
+            // the exit item is consumed
+            bump_branches(&mut checkpoints, item.last_cp, -1);
+            continue;
+        }
         // a path ends at exit; R0 must hold a valid value there
         if matches!(insn, BpfInsn::Exit) {
             let r0 = read_reg(pc, &item.state, 0)
@@ -1694,6 +1731,127 @@ mod tests {
             err.message.contains("uninitialized"),
             "the B path's uninit read must be found: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn verify_mini_subprog_call_basic() {
+        // a simple BPF-to-BPF call (#100):
+        // main:  r1 = 5 ; call sub @3 (r1 arg) ; r0 = r0 + 1 ; exit
+        // sub @3: r0 = r1 ; r0 += 1 ; exit     (r0 = arg + 1)
+        // → main's r0 = 6
+        let program = vec![
+            BpfInsn::MovImm { dst: 1, imm: 5 },
+            BpfInsn::CallSub { offset: 2 },
+            BpfInsn::AddImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+            BpfInsn::MovReg { dst: 0, src: 1 },
+            BpfInsn::AddImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        assert_eq!(subprogs, vec![0, 4]);
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        assert!(verify_mini(&program, &heads).is_ok());
+    }
+
+    #[test]
+    fn verify_mini_subprog_callee_saved_and_args() {
+        // the callee's r6..r9 are its own; the caller's survive the
+        // call (restored on the return); the caller's r1..r5 are
+        // clobbered:
+        // main: r6 = 42 ; r1 = 7 ; call sub @5 ; r0 = r6 ; exit
+        // sub @5: r6 = 0 ; r0 = r1 ; exit
+        let program = vec![
+            BpfInsn::MovImm { dst: 6, imm: 42 },
+            BpfInsn::MovImm { dst: 1, imm: 7 },
+            BpfInsn::CallSub { offset: 2 },
+            BpfInsn::MovReg { dst: 0, src: 6 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 6, imm: 0 },
+            BpfInsn::MovReg { dst: 0, src: 1 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        assert_eq!(subprogs, vec![0, 5]);
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        // the main's r6 = 42 survives the call → r0 = 42 at exit
+        let (_, states) =
+            verify_mini_with_states(&program, &heads, &VerifierLimits::default()).unwrap();
+        // the exit pc (4): r0 must be the restored 42
+        let exit_states = states.get(&4).expect("exit pc analyzed");
+        assert!(exit_states.iter().any(|st| matches!(
+            st.regs[0],
+            RegState::Scalar(b) if b.smin == 42
+        )));
+    }
+
+    #[test]
+    fn verify_mini_subprog_recursion_rejected() {
+        // a subprogram calling itself: the call depth limit fires
+        // a recursive subprogram whose state CHANGES per recursion (r1
+        // decreases) — the loop detection cannot fire, and the call
+        // depth grows until the frame limit rejects:
+        // main: 0: call 7 ; 1: r1 = r0 ; 2: call sub @4 ; 3: exit
+        // sub:  4: r1 -= 1 ; 5: jgt r1, 1, +1 → taken 7, fall 6
+        //       6: exit ; 7: call sub @4 (self) ; 8: exit
+        let program = vec![
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::MovReg { dst: 1, src: 0 },
+            BpfInsn::CallSub { offset: 1 },
+            BpfInsn::Exit,
+            BpfInsn::AddImm { dst: 1, imm: -1 },
+            BpfInsn::JgtImm {
+                dst: 1,
+                imm: 1,
+                offset: 1,
+            },
+            BpfInsn::Exit,
+            BpfInsn::CallSub { offset: -4 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        assert_eq!(subprogs, vec![0, 4]);
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        // the kernel rejects recursive programs; the mini rejects via
+        // the frame-depth limit, the loop detection, or the exit checks
+        assert!(verify_mini(&program, &heads).is_err());
+    }
+
+    #[test]
+    fn verify_mini_nested_subprog_calls() {
+        // nested BPF-to-BPF calls must return to the right caller
+        // (#100 review BLOCKER: the return address is per frame):
+        // main: 0: r1 = 1 ; 1: call A @4 ; 2: r0 += 1 ; 3: exit
+        // A @4: 4: r6 = 7 ; 5: call B @8 ; 6: r0 = r6 ; 7: exit
+        // B @8: 8: r0 = 1 ; 9: exit
+        // B returns 1 to A; A's callee-saved r6 = 7 survives the nested
+        // call; A returns 7 to main; main: 7 + 1 = 8
+        let program = vec![
+            BpfInsn::MovImm { dst: 1, imm: 1 },
+            BpfInsn::CallSub { offset: 2 },
+            BpfInsn::AddImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 6, imm: 7 },
+            BpfInsn::CallSub { offset: 2 },
+            BpfInsn::MovReg { dst: 0, src: 6 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        assert_eq!(subprogs, vec![0, 4, 8]);
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let (_, states) =
+            verify_mini_with_states(&program, &heads, &VerifierLimits::default()).unwrap();
+        // the main's exit (pc 3): r0 = 8
+        let exit_states = states.get(&3).expect("main exit analyzed");
+        assert!(
+            exit_states.iter().any(|st| matches!(
+                st.regs[0],
+                RegState::Scalar(b) if b.smin == 8
+            )),
+            "main r0 must be 8 after the nested calls"
         );
     }
 

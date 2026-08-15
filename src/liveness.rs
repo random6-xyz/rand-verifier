@@ -125,6 +125,22 @@ fn write_slots_for(base: u8, offset: i16) -> u64 {
     }
 }
 
+/// The subprogram entry containing insn `i` (0 = the main program).
+fn subprog_entry_at(i: usize, program: &[BpfInsn]) -> Option<u32> {
+    let mut starts = vec![0u32];
+    for (pc, insn) in program.iter().enumerate() {
+        if let BpfInsn::CallSub { offset } = insn {
+            let target = (pc as i32 + 1 + *offset) as u32;
+            if target as usize <= i && !starts.contains(&target) {
+                starts.push(target);
+            }
+        }
+    }
+    starts.retain(|&s| (s as usize) <= i);
+    starts.sort_unstable();
+    starts.last().copied().filter(|&s| s != 0)
+}
+
 fn use_def(insn: &BpfInsn) -> InsnUseDef {
     let mut ud = NO_USE_DEF;
     match insn {
@@ -193,10 +209,11 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         | BpfInsn::LdMapFd { dst, .. }
         | BpfInsn::LdMapValue { dst, .. } => ud.def_regs = reg_bit(*dst),
         BpfInsn::LdImm64Second { .. } => {}
-        // helper calls read the argument registers R1..R5 and clobber
-        // all caller-saved registers R0..R5 (kernel BPF_CALL:
-        // `def = ALL_CALLER_SAVED_REGS`, `use = r1..r5`)
-        BpfInsn::Call { .. } => {
+        // helper calls and BPF-to-BPF calls read the argument
+        // registers R1..R5 and clobber all caller-saved registers
+        // R0..R5 (kernel BPF_CALL: `def = ALL_CALLER_SAVED_REGS`,
+        // `use = r1..r5`)
+        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } => {
             ud.use_regs = reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);
             ud.def_regs =
                 reg_bit(0) | reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);
@@ -245,7 +262,28 @@ fn static_successors(i: usize, program: &[BpfInsn]) -> Vec<usize> {
     };
     let mut succ = Vec::with_capacity(2);
     match insn {
-        BpfInsn::Exit => {}
+        // a subprogram's exit returns to every call site + 1 (#100);
+        // the main program's exit is terminal
+        BpfInsn::Exit => {
+            if i != 0
+                && let Some(start) = subprog_entry_at(i, program)
+            {
+                for (pc, insn) in program.iter().enumerate() {
+                    if let BpfInsn::CallSub { offset } = insn {
+                        let target = (pc as i32 + 1 + *offset) as u32;
+                        if target == start {
+                            succ.push(pc + 1);
+                        }
+                    }
+                }
+            }
+        }
+        BpfInsn::CallSub { offset } => {
+            let tgt = i as i64 + 1 + *offset as i64;
+            if tgt >= 0 && (tgt as usize) < program.len() {
+                succ.push(tgt as usize);
+            }
+        }
         BpfInsn::Jmp { offset } => {
             let tgt = i as i64 + 1 + *offset as i64;
             if tgt >= 0 && (tgt as usize) < program.len() {

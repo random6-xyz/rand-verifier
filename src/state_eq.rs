@@ -382,6 +382,10 @@ pub(crate) fn states_equal(
     exact: ExactLevel,
     live_regs: u16,
 ) -> bool {
+    // the kernel's `states_equal` requires the same number of frames
+    if old.curframe != new.curframe {
+        return false;
+    }
     // one idmap per comparison (kernel reset_idmap_scratch)
     let mut idmap = IdMap::default();
     // the frame pointer (R10) is never part of the live mask comparison
@@ -395,7 +399,29 @@ pub(crate) fn states_equal(
     // with it, so its dead slots are Uninit and stacksafe skips them.
     // The kernel's stacksafe has the same shape (the current state is
     // cleaned with the same mask before the comparison).
-    stacksafe(&old.stack, &new.stack, exact, &mut idmap)
+    if !stacksafe(&old.stack, &new.stack, exact, &mut idmap) {
+        return false;
+    }
+    // the caller frames of active calls must match too (the kernel's
+    // per-frame func_states_equal); they are not liveness-cleaned, so
+    // the comparison is conservative
+    for i in 0..crate::state::MAX_CALL_FRAMES - 1 {
+        match (&old.saved[i], &new.saved[i]) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                for r in 0..NUM_REGS {
+                    if !regsafe(&a.regs[r], &b.regs[r], exact, &mut idmap) {
+                        return false;
+                    }
+                }
+                if !stacksafe(&a.stack, &b.stack, exact, &mut idmap) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The kernel's `clean_verifier_state()` / `__clean_func_state()`: dead

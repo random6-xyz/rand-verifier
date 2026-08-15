@@ -79,6 +79,14 @@ pub(crate) fn step(
             }
             Ok(next)
         }
+        // BPF-to-BPF call: save the current frame and enter the
+        // subprogram with R1..R5 as arguments (#100)
+        BpfInsn::CallSub { .. } => {
+            let mut next = *state;
+            next.call_subprog(pc + 1)
+                .map_err(|msg| VerificationFailure::new(pc, msg.to_string()))?;
+            Ok(next)
+        }
         // terminal and control flow are expanded by successors();
         // reaching them here is a driver bug
         BpfInsn::Exit
@@ -1940,6 +1948,16 @@ pub(crate) fn successors(
     match insn {
         BpfInsn::Exit => Ok(vec![]),
         BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
+        // a subprogram call falls into the callee (the caller's
+        // continuation is the return address, tracked by the mini's
+        // ret_pc, #100)
+        BpfInsn::CallSub { offset } => {
+            let mut callee = *state;
+            callee
+                .call_subprog(pc + 1)
+                .map_err(|msg| VerificationFailure::new(pc, msg.to_string()))?;
+            Ok(vec![(branch_target(pc, *offset as i16), callee)])
+        }
         BpfInsn::Jeq { dst, src, offset } => {
             cond_branch(pc, *dst, *src, *offset, CondOp::Eq, state)
         }
@@ -3589,7 +3607,9 @@ mod tests {
         state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
         state = step(0, &state, &BpfInsn::MovReg { dst: 1, src: 2 }).unwrap();
         state = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
-        let RegState::Scalar(b) = state.regs[1] else { panic!() };
+        let RegState::Scalar(b) = state.regs[1] else {
+            panic!()
+        };
         assert_eq!(b.id, 0, "the ALU32 op must clear the link id");
         let nexts = successors(
             0,
@@ -3604,7 +3624,9 @@ mod tests {
         // the fall side (w1 > 10): r2 must stay FULL-RANGE (no sync —
         // a wrong 64-bit shift would narrow it below 2^32)
         let (_, fall) = &nexts[1];
-        let RegState::Scalar(fb) = fall.regs[2] else { panic!() };
+        let RegState::Scalar(fb) = fall.regs[2] else {
+            panic!()
+        };
         assert_eq!(fb.umin, 0);
         assert_eq!(fb.umax, u64::MAX);
     }
