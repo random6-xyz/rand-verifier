@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check, test, lint, format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check compilation
+        run: cargo check --all-targets
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  diff:
+    name: Kernel differential check
+    # hosted runners have passwordless sudo and run directly in a VM, so
+    # `sudo` provides the capabilities for the raw bpf() syscall. Do NOT
+    # switch this to a container: job — Docker's default seccomp profile
+    # blocks the bpf() syscall entirely.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the binaries
+        run: cargo build --bin diff --bin fuzz --bin reduce
+
+      - name: Run the differential harness
+        # build as the runner user, run only the binary as root —
+        # sudo resets PATH (secure_path) and HOME, which would hide
+        # cargo/rustup from root. Exits 1 on non-whitelisted
+        # kernel-accepts findings (src/diff.rs, docs/DIFFERENTIAL_PLAN.md §10)
+        run: sudo ./target/debug/diff -- --json /tmp/diff.json
+
+      - name: Upload the diff report
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-report
+          path: /tmp/diff.json
+          if-no-files-found: error
+
+      - name: Run a short kernel-backed fuzz campaign
+        # same exit contract as the diff harness: a non-whitelisted
+        # finding (precision/soundness candidate, rv gap/bug) fails CI
+        # so a discovered candidate never goes unnoticed (#73)
+        run: sudo ./target/debug/fuzz --seed 7 --iters 50 --kernel --out-dir /tmp/fuzz-kernel
+
+      - name: Upload the kernel campaign artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-kernel
+          path: /tmp/fuzz-kernel/
+          if-no-files-found: error
+
+  fuzz:
+    name: Fuzzer smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the fuzz binary
+        run: cargo build --bin fuzz --bin reduce
+
+      - name: Run the fuzzer regression suite
+        # fixed-seed determinism, classification invariants, opcode
+        # coverage, finding replay — all without a bpf() syscall (#72)
+        # (quoted: YAML would parse the ':: ' in 'fuzz:: --lib' as a mapping)
+        run: "cargo test fuzz:: --lib"
+
+      - name: Reduce the unprivileged verdict-flip fixture
+        # kernel-independent finding (mini + concrete only); exits 1 on
+        # a classification change (reducer bug) (#83)
+        run: ./target/debug/reduce tests/data/reduce/verdict-flip-mseed-5-3 --out-dir /tmp/reduce-out
+
+      - name: Upload the reduced verdict-flip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reduce-unprivileged
+          path: /tmp/reduce-out/
+          if-no-files-found: error
+
+      - name: Run an unprivileged smoke campaign
+        # kernel columns are skipped without privileges; exits 1 only
+        # on a non-whitelisted finding (e.g. a rand-verifier model bug)
+        run: ./target/debug/fuzz --seed 42 --iters 200 --out-dir /tmp/fuzz-out
+
+      - name: Upload the campaign summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-summary
+          path: /tmp/fuzz-out/summary.json
+          if-no-files-found: error
