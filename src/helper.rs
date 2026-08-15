@@ -37,7 +37,10 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
             args: &[ArgType::PtrToMap, ArgType::PtrToStack],
             // the value size is filled from R1's map metadata at the
             // call site (the kernel builds the return from the map)
-            return_type: RegState::PtrToMapValueOrNull { value_size: 0 },
+            return_type: RegState::PtrToMapValueOrNull {
+                value_size: 0,
+                id: 0,
+            },
         }),
         // BPF_FUNC_map_update_elem: map_update(map, key, value, flags)
         2 => Some(&HelperPrototype {
@@ -58,6 +61,8 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 u32_max: 0,
                 tnum: Tnum { value: 0, mask: 0 },
                 precise: false,
+                id: 0,
+                delta: 0,
             }),
         }),
         // BPF_FUNC_ktime_get_ns: no arguments, unknown u64 scalar

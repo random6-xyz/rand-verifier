@@ -1822,8 +1822,12 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0,
+            },
         ];
         for reg in regs {
             for value in [
@@ -1836,7 +1840,10 @@ mod tests {
         }
         // the nullable form covers the NULL scalar 0 (#89)
         assert!(abstract_covers(
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            },
             ConcreteValue::Scalar(0)
         ));
     }
@@ -1860,6 +1867,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
             ConcreteValue::MapPtr(region)
         ));
@@ -1869,11 +1877,15 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
             ConcreteValue::MapPtr(region + 8)
         ));
         assert!(abstract_covers(
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            },
             ConcreteValue::MapPtr(region + 8)
         ));
     }

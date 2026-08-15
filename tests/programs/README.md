@@ -111,6 +111,7 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | ldimm64_const               | `r2 = 0x1234567890abcdef; r0 = r2; exit`                          | ldimm64 64-bit constant (#89) |
 | ldimm64_map_fd              | `r1 = map_fd(1); r0 = 0; exit`                                    | CONST_PTR_TO_MAP from a map fd (#89) |
 | map_lookup_null_check       | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +2; r4 = [r0]; r0 = 1; exit; exit` | map_lookup → NULL check → value load (#89) |
+| null_alias_refinement        | `r1 = map_fd(1); r2 = r10-8; r3 = 0; [r10-8] = r3; call 1; r7 = r0; if r0 == 0 goto +3; r4 = [r7]; r0 = r4; exit; r0 = 0; exit` | NULL check on one alias refines the copy (id, #99) |
 | map_value_access            | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +4; r4 = 42; [r0] = r4; r4 = [r0]; r0 = r4; exit; exit` | map value store/load roundtrip (#89) |
 | map_update_basic            | `r1 = map_fd(1); r2 = r10-8; r3 = r10-16; [r10-8] = 0; [r10-16] = 0; call 2; r0 = 0; exit` | map_update key/value buffers (#89) |
 | computed_offset_misaligned  | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment tracked, not rejected (#87) |

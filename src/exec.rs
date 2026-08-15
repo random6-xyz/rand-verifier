@@ -61,7 +61,22 @@ pub(crate) fn step(
             check_reg(pc, *dst)?;
             let src_state = read_reg(pc, state, *src)?;
             let mut next = *state;
-            next.regs[*dst as usize] = src_state;
+            // the kernel's assign_scalar_id_before_mov (#99): a
+            // non-constant scalar without a link id gets a fresh one
+            // before the copy, and BOTH registers carry it, so they
+            // become a link group (branch refinements of one sync to
+            // the other). Constants and pointers keep their existing
+            // ids.
+            if let RegState::Scalar(b) = src_state
+                && b.id == 0
+                && !b.is_constant()
+            {
+                let linked = RegState::Scalar(ScalarBounds { id: pc + 1, ..b });
+                next.regs[*src as usize] = linked;
+                next.regs[*dst as usize] = linked;
+            } else {
+                next.regs[*dst as usize] = src_state;
+            }
             Ok(next)
         }
         // terminal and control flow are expanded by successors();
@@ -132,6 +147,7 @@ pub(crate) fn step(
                 max_offset: *offset as i32,
                 align_off: (*offset % 8) as u8,
                 value_size: *value_size,
+                id: 0,
             };
             Ok(next)
         }
@@ -310,7 +326,11 @@ pub(crate) fn step(
             if *imm == 1
                 && let RegState::PtrToMap { value_size, .. } = state.regs[1]
             {
-                next.regs[0] = RegState::PtrToMapValueOrNull { value_size };
+                next.regs[0] = RegState::PtrToMapValueOrNull {
+                    value_size,
+                    // the lookup identity: pc-derived (0 is "no id")
+                    id: pc + 1,
+                };
             }
             Ok(next)
         }
@@ -413,6 +433,7 @@ fn alu_imm(
             max_offset,
             align_off,
             value_size,
+            ..
         } => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(VerificationFailure::new(
@@ -431,6 +452,10 @@ fn alu_imm(
                 max_offset: max_offset.saturating_add(imm),
                 align_off: (align_off as i32 + imm.rem_euclid(8)).rem_euclid(8) as u8,
                 value_size,
+                id: match state.regs[dst as usize] {
+                    RegState::PtrToMapValue { id, .. } => id,
+                    _ => 0,
+                },
             };
             Ok(next)
         }
@@ -504,6 +529,7 @@ fn alu_reg(
         max_offset,
         align_off,
         value_size,
+        id,
     } = dst_state
     {
         if op != AluOp::Add || width != AluWidth::W64 {
@@ -524,6 +550,7 @@ fn alu_reg(
                 max_offset,
                 align_off,
                 value_size,
+                id,
             },
             s,
             state,
@@ -598,6 +625,7 @@ fn map_value_access_check(
         max_offset,
         align_off,
         value_size,
+        ..
     } = ptr
     else {
         unreachable!("the caller matched PtrToMapValue")
@@ -965,6 +993,7 @@ fn add_scalar_to_map_value_ptr(
         max_offset,
         align_off,
         value_size,
+        ..
     } = ptr
     else {
         unreachable!("the caller matched PtrToMapValue")
@@ -988,6 +1017,10 @@ fn add_scalar_to_map_value_ptr(
         max_offset: new_max,
         align_off: new_align,
         value_size,
+        id: match state.regs[dst as usize] {
+            RegState::PtrToMapValue { id, .. } => id,
+            _ => 0,
+        },
     };
     Ok(next)
 }
@@ -999,6 +1032,15 @@ fn add_scalar_to_map_value_ptr(
 /// is re-synced (kernel reg_bounds_sync) so the two interpretations stay
 /// consistent.
 fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> ScalarBounds {
+    // the kernel's scalar linking rules (#99): const add/sub on a
+    // linked register records the delta; everything else clears the
+    // link. The unknown-shift fallback returns a fresh unknown (id 0).
+    let mut result = apply_alu_inner(op, width, d, s);
+    apply_linking(op, width, &mut result, d, s);
+    result
+}
+
+fn apply_alu_inner(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> ScalarBounds {
     // Register shifts: the kernel does not reject out-of-range amounts
     // (check_alu_op only validates *immediate* shifts); the hardware
     // masks the amount (count & 63 / count & 31) and the kernel tracks
@@ -1047,6 +1089,8 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 u32_max: u32::MAX,
                 tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax),
                 precise: false,
+                id: d.id,
+                delta: d.delta,
             }
             .synced()
         }
@@ -1067,8 +1111,60 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 u32_max: u32::MAX,
                 tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax).subreg(),
                 precise: false,
+                id: d.id,
+                delta: d.delta,
             }
             .synced()
+        }
+    }
+}
+
+/// The kernel's scalar linking rules (#99, verifier.c check_alu_op):
+/// `dst += K` / `dst -= K` on a register with a link id records the
+/// constant delta (BPF_ADD_CONST); every other ALU operation clears
+/// the link (the result's identity is new — only pure movs and
+/// constant add/sub preserve a link group).
+fn apply_linking(
+    op: AluOp,
+    width: AluWidth,
+    result: &mut ScalarBounds,
+    dst: ScalarBounds,
+    src: ScalarBounds,
+) {
+    match op {
+        AluOp::Add | AluOp::Sub if src.is_constant() => {
+            // ALU32 links are NOT tracked: the kernel uses a separate
+            // ADD_CONST32 flag, skips mixed-width syncs, and
+            // zero-extends the result — a 64-bit shift of a 32-bit
+            // link would wrongly narrow the base register. Clearing
+            // the link is the conservative sound choice (the branch
+            // refinement of the 32-bit result does not sync the base).
+            if width != AluWidth::W64 {
+                result.id = 0;
+                result.delta = 0;
+                return;
+            }
+            if dst.id == 0 || result.id != dst.id || result.delta != 0 {
+                result.id = 0;
+                result.delta = 0;
+                return;
+            }
+            let off = if op == AluOp::Sub {
+                -src.smin
+            } else {
+                src.smin
+            };
+            // s32 range check (kernel: val must fit s32)
+            if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
+                result.delta = off as i32;
+            } else {
+                result.id = 0;
+                result.delta = 0;
+            }
+        }
+        _ => {
+            result.id = 0;
+            result.delta = 0;
         }
     }
 }
@@ -1560,6 +1656,8 @@ pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         // tnum_intersect in regs_refine_cond_op)
         tnum: dst.tnum.intersect(src.tnum),
         precise: false,
+        id: 0,
+        delta: 0,
     }
     .synced();
     // the fall-through (dst != src) excludes the other operand's values
@@ -1618,6 +1716,8 @@ fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
         // is not representable — keep the sound over-approximation
         tnum: a.tnum,
         precise: false,
+        id: 0,
+        delta: 0,
     }
 }
 
@@ -1638,6 +1738,8 @@ pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         u32_max: u32::MAX,
         tnum: dst.tnum.intersect(src.tnum),
         precise: false,
+        id: 0,
+        delta: 0,
     }
     .synced();
     (
@@ -1981,6 +2083,66 @@ pub(crate) fn cond_branch_imm(
 /// `src_reg` names the register holding the source operand — `None` for
 /// the immediate form, where the refined source value has no register
 /// to be written to.
+/// The kernel's `sync_linked_regs()` (#99): when a branch refines a
+/// linked scalar operand, every register (and spilled slot) sharing its
+/// link id is refined too — `reg = known + (reg.delta - known.delta)`.
+/// The id and delta of the synced register are preserved (kernel: "Must
+/// preserve off and id, otherwise another sync_linked_regs() will be
+/// incorrect").
+fn sync_linked_scalars(state: &mut VerifierState, id: u32, known_delta: i32, known: ScalarBounds) {
+    if id == 0 {
+        return;
+    }
+    for reg in state.regs.iter_mut() {
+        let RegState::Scalar(b) = reg else { continue };
+        if b.id != id || bounds_equal(b, &known) {
+            continue;
+        }
+        let shift = (b.delta as i64) - (known_delta as i64);
+        let mut shifted = if shift == 0 {
+            known
+        } else {
+            apply_alu(
+                AluOp::Add,
+                AluWidth::W64,
+                known,
+                ScalarBounds::constant(shift),
+            )
+        };
+        shifted.id = b.id;
+        shifted.delta = b.delta;
+        *b = shifted;
+    }
+    for slot in state.stack.slots.iter_mut() {
+        let StackSlot::Spilled(RegState::Scalar(b)) = slot else {
+            continue;
+        };
+        if b.id != id {
+            continue;
+        }
+        let shift = (b.delta as i64) - (known_delta as i64);
+        let mut shifted = if shift == 0 {
+            known
+        } else {
+            apply_alu(
+                AluOp::Add,
+                AluWidth::W64,
+                known,
+                ScalarBounds::constant(shift),
+            )
+        };
+        shifted.id = b.id;
+        shifted.delta = b.delta;
+        *slot = StackSlot::Spilled(RegState::Scalar(shifted));
+    }
+}
+
+/// Whether two scalar bounds are identical (the sync skips registers
+/// that already equal the known refinement).
+fn bounds_equal(a: &ScalarBounds, b: &ScalarBounds) -> bool {
+    a.smin == b.smin && a.smax == b.smax && a.umin == b.umin && a.umax == b.umax && a.tnum == b.tnum
+}
+
 fn cond_branch_impl(
     pc: u32,
     dst: u8,
@@ -2010,6 +2172,13 @@ fn cond_branch_impl(
                 if let Some(src_reg) = src_reg {
                     taken.regs[src_reg as usize] = RegState::Scalar(t_src);
                 }
+                // the kernel's sync_linked_regs (#99): the refinement
+                // of a linked operand propagates to every register with
+                // the same link id, shifted by its delta
+                sync_linked_scalars(&mut taken, d.id, d.delta, t_dst);
+                if src_reg.is_some() {
+                    sync_linked_scalars(&mut taken, s.id, s.delta, t_src);
+                }
                 out.push((taken_pc, taken));
             }
             if !matches!(verdict, BranchVerdict::AlwaysTaken) {
@@ -2017,6 +2186,10 @@ fn cond_branch_impl(
                 fall.regs[dst as usize] = RegState::Scalar(f_dst);
                 if let Some(src_reg) = src_reg {
                     fall.regs[src_reg as usize] = RegState::Scalar(f_src);
+                }
+                sync_linked_scalars(&mut fall, d.id, d.delta, f_dst);
+                if src_reg.is_some() {
+                    sync_linked_scalars(&mut fall, s.id, s.delta, f_src);
                 }
                 out.push((fall_pc, fall));
             }
@@ -2026,8 +2199,8 @@ fn cond_branch_impl(
         // `== 0` the taken branch becomes the scalar 0 and the fall-through
         // a valid map value pointer; for `!= 0` the roles are swapped.
         // The map's value size is propagated into the refined pointer (#89).
-        (RegState::PtrToMapValueOrNull { value_size }, RegState::Scalar(s))
-        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull { value_size })
+        (RegState::PtrToMapValueOrNull { value_size, id }, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMapValueOrNull { value_size, id })
             if s.is_zero() =>
         {
             match op {
@@ -2048,13 +2221,65 @@ fn cond_branch_impl(
                         _ => unreachable!(),
                     };
                     let mut null_state = *state;
-                    null_state.regs[ptr_reg as usize] = RegState::Scalar(ScalarBounds::constant(0));
                     let mut valid = *state;
+                    // the kernel's mark_ptr_or_null_regs (#99): EVERY
+                    // register (and spilled slot) sharing the lookup id
+                    // is refined — NULL on the null side, non-null on
+                    // the valid side — so aliases of the checked
+                    // pointer are usable after the check
+                    for reg in null_state.regs.iter_mut() {
+                        if matches!(reg, RegState::PtrToMapValueOrNull { id: rid, .. } if *rid == id)
+                        {
+                            *reg = RegState::Scalar(ScalarBounds::constant(0));
+                        }
+                    }
+                    for slot in null_state.stack.slots.iter_mut() {
+                        if let StackSlot::Spilled(RegState::PtrToMapValueOrNull { id: rid, .. }) =
+                            slot
+                            && *rid == id
+                        {
+                            *slot = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+                        }
+                    }
+                    for reg in valid.regs.iter_mut() {
+                        if let RegState::PtrToMapValueOrNull {
+                            value_size: vs,
+                            id: rid,
+                        } = reg
+                            && *rid == id
+                        {
+                            *reg = RegState::PtrToMapValue {
+                                min_offset: 0,
+                                max_offset: 0,
+                                align_off: 0,
+                                value_size: *vs,
+                                id: *rid,
+                            };
+                        }
+                    }
+                    for slot in valid.stack.slots.iter_mut() {
+                        if let StackSlot::Spilled(RegState::PtrToMapValueOrNull {
+                            value_size: vs,
+                            id: rid,
+                        }) = slot
+                            && *rid == id
+                        {
+                            *slot = StackSlot::Spilled(RegState::PtrToMapValue {
+                                min_offset: 0,
+                                max_offset: 0,
+                                align_off: 0,
+                                value_size: *vs,
+                                id: *rid,
+                            });
+                        }
+                    }
+                    null_state.regs[ptr_reg as usize] = RegState::Scalar(ScalarBounds::constant(0));
                     valid.regs[ptr_reg as usize] = RegState::PtrToMapValue {
                         min_offset: 0,
                         max_offset: 0,
                         align_off: 0,
                         value_size,
+                        id,
                     };
                     vec![(null_side, null_state), (valid_side, valid)]
                 }
@@ -2415,6 +2640,8 @@ mod tests {
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2828,6 +3055,8 @@ mod tests {
                 mask: 0b010,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 1 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2855,6 +3084,8 @@ mod tests {
                 mask: 0b001,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::OrImm { dst: 1, imm: 0b100 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2885,6 +3116,8 @@ mod tests {
             u32_max: 1,
             tnum: Tnum::constant(0x1_0000_0001),
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2911,6 +3144,8 @@ mod tests {
                 mask: 0b001,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
         let nexts = successors(
@@ -2949,6 +3184,8 @@ mod tests {
                 mask: 0b001,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
         let nexts = successors(
@@ -2994,6 +3231,8 @@ mod tests {
                 mask: 0b001,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let state = step(
             0,
@@ -3044,6 +3283,8 @@ mod tests {
                 u32_max: 0xFFFF_FFFF,
                 tnum: Tnum::unknown(),
                 precise: false,
+                id: 0,
+                delta: 0,
             }
             .synced(),
         );
@@ -3066,6 +3307,8 @@ mod tests {
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
                 precise: false,
+                id: 0,
+                delta: 0,
             }
             .synced(),
         );
@@ -3264,11 +3507,117 @@ mod tests {
     }
 
     #[test]
+    fn successors_linked_scalar_sync() {
+        // the kernel's sync_linked_regs (#99): `r1 = r2; if r1 > 10`
+        // refines r2 (same link id, delta 0) on both branches
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        // the mov assigns the link id (kernel assign_scalar_id_before_mov)
+        state = step(0, &state, &BpfInsn::MovReg { dst: 1, src: 2 }).unwrap();
+        let nexts = successors(
+            0,
+            &BpfInsn::JgtImm {
+                dst: 1,
+                imm: 10,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        let (_, taken) = &nexts[0];
+        let RegState::Scalar(tb) = taken.regs[2] else {
+            panic!("r2 should be a scalar on the taken side");
+        };
+        // jgt is unsigned: the refinement (and the sync) is on the
+        // unsigned side
+        assert!(tb.umin > 10, "taken r2 umin {}", tb.umin);
+        // fall: r1 <= 10 → r2 <= 10 (synced)
+        let (_, fall) = &nexts[1];
+        let RegState::Scalar(fb) = fall.regs[2] else {
+            panic!("r2 should be a scalar on the fall side");
+        };
+        assert!(fb.umax <= 10, "fall r2 umax {}", fb.umax);
+        // the link id survives on both sides
+        let RegState::Scalar(t1) = taken.regs[1] else {
+            panic!()
+        };
+        assert_eq!(t1.id, tb.id);
+    }
+
+    #[test]
+    fn successors_linked_scalar_delta_sync() {
+        // `r1 = r2; r1 -= 5; if r1 > 10`: the taken side refines r1 to
+        // > 10 and r2 (delta 0 vs known delta -5) to > 15
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        state = step(0, &state, &BpfInsn::MovReg { dst: 1, src: 2 }).unwrap();
+        state = step(0, &state, &BpfInsn::SubImm { dst: 1, imm: 5 }).unwrap();
+        let nexts = successors(
+            0,
+            &BpfInsn::JgtImm {
+                dst: 1,
+                imm: 10,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        // the taken side's refinement [11, MAX] shifted by +5 overflows
+        // the mini's range arithmetic (a pre-existing approximation);
+        // the FALL side [MIN, 10] + 5 = [MIN, 15] is exact — the delta
+        // sync is observable there
+        let (_, fall) = &nexts[1];
+        let RegState::Scalar(fb) = fall.regs[2] else {
+            panic!("r2 should be a scalar on the fall side");
+        };
+        assert!(fb.umax <= 15, "fall r2 umax {}", fb.umax);
+        let RegState::Scalar(f1) = fall.regs[1] else {
+            panic!()
+        };
+        assert_eq!(f1.delta, -5);
+        assert_eq!(fb.id, f1.id);
+    }
+
+    #[test]
+    fn apply_linking_alu32_clears_the_link() {
+        // the kernel tracks ALU32 links with a separate flag and skips
+        // mixed-width syncs — a 64-bit shift of a 32-bit link would
+        // wrongly narrow the base, so the mini clears the link instead
+        // (#99 review SHOULD-FIX-1): `r1 = r2; w1 += 5; if w1 <= 10`
+        // must NOT sync r2
+        let mut state = VerifierState::initial();
+        state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
+        state = step(0, &state, &BpfInsn::MovReg { dst: 1, src: 2 }).unwrap();
+        state = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 5 }).unwrap();
+        let RegState::Scalar(b) = state.regs[1] else { panic!() };
+        assert_eq!(b.id, 0, "the ALU32 op must clear the link id");
+        let nexts = successors(
+            0,
+            &BpfInsn::JleImm {
+                dst: 1,
+                imm: 10,
+                offset: 1,
+            },
+            &state,
+        )
+        .unwrap();
+        // the fall side (w1 > 10): r2 must stay FULL-RANGE (no sync —
+        // a wrong 64-bit shift would narrow it below 2^32)
+        let (_, fall) = &nexts[1];
+        let RegState::Scalar(fb) = fall.regs[2] else { panic!() };
+        assert_eq!(fb.umin, 0);
+        assert_eq!(fb.umax, u64::MAX);
+    }
+
+    #[test]
     fn successors_jne_null_check() {
         // r0 != 0 on a nullable pointer: taken is the valid pointer,
         // fall-through is NULL (scalar 0)
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
@@ -3295,6 +3644,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 1,
             }
         );
     }
@@ -3363,6 +3713,8 @@ mod tests {
                 mask: 0b1000,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         assert_eq!(
@@ -3413,6 +3765,8 @@ mod tests {
             u32_max: 1000,
             tnum: Tnum::unknown(),
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         let RegState::PtrToStack {
@@ -3466,6 +3820,8 @@ mod tests {
                 mask: 0b101,
             },
             precise: false,
+            id: 0,
+            delta: 0,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         let RegState::PtrToStack {
@@ -3501,6 +3857,8 @@ mod tests {
             u32_max: 1,
             tnum: Tnum::constant(1),
             precise: false,
+            id: 0,
+            delta: 0,
         });
         // exact result (r2 is a constant): accepted — access-time checks
         // cover exact offsets
@@ -4705,7 +5063,10 @@ mod tests {
         // branch becomes the scalar 0, the fall-through a valid map
         // value pointer
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         let nexts = successors(
             0,
             &BpfInsn::JeqImm {
@@ -4729,6 +5090,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 1,
             }
         );
     }
@@ -4775,7 +5137,10 @@ mod tests {
     fn successors_null_check_issue_example() {
         // issue example: r0 = PtrToMapValueOrNull; if r0 == 0 (via r1 = 0)
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
 
         let nexts = successors(
@@ -4804,6 +5169,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 1,
             }
         );
     }
@@ -4812,7 +5178,10 @@ mod tests {
     fn successors_null_check_reversed_operands() {
         // the constant 0 may also be the dst register: if r1 == r0 with r1 = 0
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
             0,
@@ -4836,6 +5205,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 1,
             }
         );
     }
@@ -4845,7 +5215,10 @@ mod tests {
         // only the constant 0 enables a NULL check; other scalars keep the
         // different-types rejection
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(8));
         let err = successors(
             0,
@@ -4869,6 +5242,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
         let nexts = successors(
@@ -4895,6 +5270,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         let nexts = successors(
             0,
@@ -4926,7 +5303,10 @@ mod tests {
     fn step_add_imm_nullable_ptr_rejected() {
         // arithmetic on a nullable pointer is rejected until the NULL check
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 1,
+        };
         let err = step(0, &state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap_err();
         assert!(err.message.contains("NULL"));
     }
@@ -4939,6 +5319,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         // #89: ADD widens the offset interval instead of rejecting
         let next = step(0, &state, &BpfInsn::AddImm { dst: 0, imm: 8 }).unwrap();
@@ -4975,7 +5357,10 @@ mod tests {
         let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         assert_eq!(
             next.regs[0],
-            RegState::PtrToMapValueOrNull { value_size: 8 }
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 1
+            }
         );
         assert_eq!(next.regs[1], RegState::Uninit);
         assert_eq!(next.regs[2], RegState::Uninit);
@@ -5052,6 +5437,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("map key buffer"), "{}", err.message);
@@ -5067,6 +5454,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         let next = step(
             0,
@@ -5128,6 +5517,8 @@ mod tests {
             max_offset: 4,
             align_off: ALIGN_UNKNOWN,
             value_size: 8,
+
+            id: 0,
         };
         let err = step(
             0,
@@ -5152,6 +5543,8 @@ mod tests {
             max_offset: 0,
             align_off: 0,
             value_size: 8,
+
+            id: 0,
         };
         let next = step(0, &state, &BpfInsn::AddReg { dst: 0, src: 1 }).unwrap();
         assert_eq!(
@@ -5161,6 +5554,7 @@ mod tests {
                 max_offset: 1,
                 align_off: 1,
                 value_size: 8,
+                id: 0,
             }
         );
     }
@@ -5214,7 +5608,10 @@ mod tests {
         // R0 = return type, R1..R5 invalidated
         assert_eq!(
             next.regs[0],
-            RegState::PtrToMapValueOrNull { value_size: 8 }
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 1
+            }
         );
         for reg in 1..=5 {
             assert_eq!(next.regs[reg], RegState::Uninit, "r{}", reg);

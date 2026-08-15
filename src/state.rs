@@ -42,6 +42,15 @@ pub(crate) struct ScalarBounds {
     /// exactness levels ignore it (regs_exact in state_eq.rs), like the
     /// kernel's regs_exact()/states_maybe_looping() memcmp ranges.
     pub(crate) precise: bool,
+    /// Kernel scalar linking id (#99): registers copied from the same
+    /// source share an id, and a branch refinement of one is synced to
+    /// the others (`sync_linked_regs`). 0 = not linked. `delta` is the
+    /// constant offset of this register from the base of its link
+    /// group (the kernel's BPF_ADD_CONST + delta). The idmap check in
+    /// the state equality (state_eq.rs) requires id relationships to
+    /// be preserved across pruning.
+    pub(crate) id: u32,
+    pub(crate) delta: i32,
 }
 
 impl ScalarBounds {
@@ -58,6 +67,8 @@ impl ScalarBounds {
             u32_max: value as u64 as u32,
             tnum: Tnum::constant(value as u64),
             precise: false,
+            id: 0,
+            delta: 0,
         }
     }
 
@@ -81,6 +92,8 @@ impl ScalarBounds {
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
                 precise: false,
+                id: 0,
+                delta: 0,
             }
         } else {
             // both interpretations are the same bit range
@@ -95,6 +108,8 @@ impl ScalarBounds {
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
                 precise: false,
+                id: 0,
+                delta: 0,
             }
         };
         bounds.synced()
@@ -129,6 +144,8 @@ impl ScalarBounds {
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
             precise: false,
+            id: 0,
+            delta: 0,
         }
     }
 
@@ -238,18 +255,24 @@ pub(crate) enum RegState {
     },
     /// A pointer into a map value (non-null) — an offset interval
     /// within the value; bounds are validated at access time against
-    /// `value_size` (#89, kernel check_map_access).
+    /// `value_size` (#89, kernel check_map_access). `id` is the lookup
+    /// identity (#99): registers derived from the same lookup share it,
+    /// so a NULL check on one refines all aliases (kernel
+    /// mark_ptr_or_null_regs).
     PtrToMapValue {
         min_offset: i32,
         max_offset: i32,
         /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
         align_off: u8,
         value_size: u32,
+        id: u32,
     },
     /// Nullable map value pointer; must pass a NULL check before use
-    /// (#27). Carries the map's value size for the refinement (#89).
+    /// (#27). Carries the map's value size for the refinement (#89)
+    /// and the lookup identity (`id`, #99).
     PtrToMapValueOrNull {
         value_size: u32,
+        id: u32,
     },
 }
 
@@ -294,7 +317,7 @@ impl std::fmt::Display for RegState {
                     )
                 }
             }
-            RegState::PtrToMapValueOrNull { value_size } => {
+            RegState::PtrToMapValueOrNull { value_size, .. } => {
                 write!(f, "PTR_MAP_VALUE_OR_NULL(sz:{})", value_size)
             }
         }
@@ -529,12 +552,17 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             }
             .to_string(),
             "PTR_MAP_VALUE(0,sz:8)"
         );
         assert_eq!(
-            RegState::PtrToMapValueOrNull { value_size: 8 }.to_string(),
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            }
+            .to_string(),
             "PTR_MAP_VALUE_OR_NULL(sz:8)"
         );
     }
@@ -618,6 +646,8 @@ mod tests {
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
             precise: false,
+            id: 0,
+            delta: 0,
         }
         .synced()
         .synced()
@@ -636,6 +666,8 @@ mod tests {
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
             precise: false,
+            id: 0,
+            delta: 0,
         }
         .synced()
         .synced()
@@ -791,7 +823,10 @@ mod tests {
         // an OrNull pointer survives spill/fill — the NULL check is still
         // required after the fill
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 0,
+        };
         let state = step(
             0,
             &state,
@@ -814,7 +849,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             next.regs[5],
-            RegState::PtrToMapValueOrNull { value_size: 8 }
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            }
         );
     }
 
