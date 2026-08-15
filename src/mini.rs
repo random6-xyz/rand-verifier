@@ -13,7 +13,7 @@ use crate::state_eq::{ExactLevel, clean_state, states_equal, states_maybe_loopin
 /// the program with a complexity error, mirroring the kernel's
 /// BPF_COMPLEXITY_LIMIT_* checks and BPF_MAX_LOOPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VerifierLimits {
+pub struct VerifierLimits {
     /// Maximum number of stored (checkpointed) states — the kernel's
     /// total_states analog. Deliberately smaller than the kernel's
     /// limits (its `BPF_COMPLEXITY_LIMIT_*`), like max_steps.
@@ -455,7 +455,7 @@ pub(crate) fn verify_mini(
 /// `verify_mini` with explicit exploration limits (#32, #46). `loop_heads`
 /// are the targets of back edges (from the structural pass): the
 /// exploration bounds how many times each loop head may be re-analyzed.
-pub(crate) fn verify_mini_with_limits(
+pub fn verify_mini_with_limits(
     program: &[BpfInsn],
     loop_heads: &[u32],
     limits: &VerifierLimits,

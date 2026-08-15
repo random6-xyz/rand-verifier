@@ -7,7 +7,7 @@ use crate::insn::BpfInsn;
 /// plus every BPF_PSEUDO_CALL target, sorted (the kernel's
 /// `subprog_info` / find_subprog). A call target beyond the program or
 /// inside a function body (not an entry) is rejected here.
-pub(crate) fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
+pub fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
     let mut starts = vec![0u32];
     for (pc, insn) in insns.iter().enumerate() {
         if let BpfInsn::CallSub { offset } = insn {
@@ -197,15 +197,15 @@ fn check_ldimm64_target(
 /// a node stays "Discovering" (gray) until all of its children are fully
 /// explored, so an edge to a gray node is exactly a back edge. Returns the
 /// loop heads (the targets of back edges) for the path exploration.
-pub(crate) fn check_cfg(
-    insns: &[BpfInsn],
-    subprogs: &[u32],
-) -> Result<Vec<u32>, VerificationFailure> {
+pub fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<Vec<u32>, VerificationFailure> {
     let insn_cnt = insns.len();
 
     // every subprogram must end with EXIT (cf. the kernel's "last insn
     // is not exit"): this is what guarantees that accepted programs
     // actually reach an exit, even when the CFG contains loops
+    if insns.is_empty() {
+        return Err(VerificationFailure::new(0, "empty program"));
+    }
     for (i, &start) in subprogs.iter().enumerate() {
         let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt as u32);
         if !matches!(insns[(end - 1) as usize], BpfInsn::Exit) {
