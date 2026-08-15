@@ -6,7 +6,7 @@
 //! side (when available) finds kernel precision/soundness candidates.
 //! The v0.6 diff whitelist is reused, never forked.
 
-use crate::concrete::{ConcreteReport, ConcreteVerdict};
+use crate::concrete::{ConcreteFailure, ConcreteReport, ConcreteVerdict};
 use crate::diff::{SideVerdict, whitelisted};
 use crate::env::BpfVerifierEnv;
 use crate::klog::ReasonCategory;
@@ -164,6 +164,14 @@ pub fn classify(input: &OracleInput) -> Finding {
                 if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                     return Finding::Whitelisted;
                 }
+                // both sides reject — the kernel is not rejecting a
+                // concretely safe program the way rand-verifier sees
+                // it; different categories just mean the two verifiers
+                // tripped on different rules first. Not a precision
+                // candidate (that requires mini to accept).
+                if matches!(mini, SideVerdict::Reject { .. }) {
+                    return Finding::Whitelisted;
+                }
                 // strict mode: unprivileged-equivalent kernel rules are
                 // design behaviour (v0.6 --strict empirical run:
                 // "R10 pointer comparison prohibited" → PointerArith,
@@ -184,6 +192,31 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // agreement, not a kernel precision candidate
                 if let SideVerdict::Reject { category: mini_cat } = mini
                     && mini_cat == category
+                {
+                    return Finding::Whitelisted;
+                }
+                // unbounded-loop rejections: the concrete run's finite
+                // execution does not prove the loop is bounded, so a
+                // kernel loop rejection (back-edge / infinite loop) is
+                // design behaviour even when mini's category differs
+                // (e.g. the kernel log noise hides the reason in Other)
+                if matches!(category, ReasonCategory::Loop)
+                    && mini_reason.is_some_and(|m| m.contains("loop") || m.contains("back edge"))
+                {
+                    return Finding::Whitelisted;
+                }
+                // strict mode: without CAP_PERFMON the kernel sanitizes
+                // speculative paths (bypass_spec_v1 = false) and rejects
+                // loops reachable only under speculative execution
+                // ("from N to M (speculative execution)"). The concrete
+                // run never takes those paths, so a kernel loop
+                // rejection with a mini ACCEPT is the unprivileged
+                // Spectre-v1 hardening, not a precision gap (verified
+                // on mseed-20260815-216: privileged load ACCEPTs the
+                // same program).
+                if *strict
+                    && matches!(category, ReasonCategory::Loop)
+                    && matches!(mini, SideVerdict::Accept)
                 {
                     return Finding::Whitelisted;
                 }
@@ -224,6 +257,28 @@ pub fn classify_env(
         .as_ref()
         .map(concrete_side)
         .unwrap_or(ConcreteSide::Inconclusive);
+    // Model-unsupported failures: the concrete interpreter could not
+    // even run the program (unknown helper id, unsupported memory
+    // access, prototype mismatch). That is a rand-verifier support
+    // gap, not evidence that a kernel-accepted program is unsafe —
+    // exclude these from soundness candidates.
+    if let Some(report) = env.concrete_report.as_ref() {
+        let unsupported = report.unexpected_failure.as_ref().is_some_and(|f| {
+            matches!(
+                f,
+                ConcreteFailure::UnknownHelper { .. }
+                    | ConcreteFailure::UnsupportedHelperReturn { .. }
+                    | ConcreteFailure::NonStackBase { .. }
+                    | ConcreteFailure::HelperArgMismatch { .. }
+            )
+        }) || report
+            .reject_note
+            .as_ref()
+            .is_some_and(|n| n.contains("unknown helper") || n.contains("not supported"));
+        if unsupported && matches!(concrete, ConcreteSide::Unsafe) {
+            return Finding::Whitelisted;
+        }
+    }
     classify(&OracleInput {
         name,
         mini,
@@ -369,10 +424,17 @@ mod tests {
             Finding::RvPrecisionGap
         );
         // precision candidate: kernel rejects a concretely safe program
-        // with a different reason than mini
+        // that mini accepts
+        assert_eq!(
+            classify_with(acc(), ConcreteSide::Safe, rej(s), "p", false),
+            Finding::PrecisionCandidate
+        );
+        // both reject (different categories) — not a precision
+        // candidate: the kernel is not rejecting a program mini sees
+        // as safe
         assert_eq!(
             classify_with(rej(u), ConcreteSide::Safe, rej(s), "p", false),
-            Finding::PrecisionCandidate
+            Finding::Whitelisted
         );
         // same-reason reject: intended agreement, not a finding
         assert_eq!(
@@ -461,7 +523,8 @@ mod tests {
             ),
             Finding::Whitelisted
         );
-        // ...but they are precision candidates in the default mode
+        // ...but in the default mode both sides reject — an intended
+        // agreement, not a precision candidate
         assert_eq!(
             classify_with(
                 rej(u),
@@ -470,7 +533,7 @@ mod tests {
                 "seed-1-3",
                 false
             ),
-            Finding::PrecisionCandidate
+            Finding::Whitelisted
         );
     }
 
@@ -630,7 +693,7 @@ mod tests {
         let mini = rej(ReasonCategory::Unreachable);
         let kernel = rej(ReasonCategory::UninitRead);
         let finding = classify_env(&env, "seed-0-1", &mini, None, &kernel, None, false);
-        assert_eq!(finding, Finding::PrecisionCandidate);
+        assert_eq!(finding, Finding::Whitelisted);
 
         // decode-error program: no concrete report → inconclusive
         // (non-finding; both sides reject decode errors anyway)

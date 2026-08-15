@@ -507,16 +507,10 @@ fn concrete_alu_reg(
     let src_value = read_concrete_reg(pc, state, src)?;
     match (dst_value, src_value) {
         (ConcreteValue::Scalar(d), ConcreteValue::Scalar(s)) => {
-            // shifts require an amount below the width (mirror of the
-            // abstract check_shift_amount, which collapses to
-            // s >= bitness for a single value)
-            let bitness = match width {
-                AluWidth::W64 => 64,
-                AluWidth::W32 => 32,
-            };
-            if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) && s >= bitness as u64 {
-                return Err(ConcreteFailure::InvalidShiftAmount { pc, amount: s });
-            }
+            // shifts follow the hardware semantics: the amount is
+            // masked (count & 63 / count & 31) — the kernel does not
+            // reject register shifts and the JIT/interpreter masks
+            // the amount (mirrors the abstract apply_alu)
             let result = alu_value(op, width, d, s);
             let mut next = *state;
             next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
@@ -2293,17 +2287,16 @@ mod tests {
     }
 
     #[test]
-    fn alu32_reg_shift_large_rejected() {
-        // ALU32 register shifts also require an amount below 32
+    fn alu32_reg_shift_large_masked() {
+        // ALU32 register shifts follow the hardware semantics: the
+        // amount is masked (& 31) — the kernel does not reject them
+        // (w2 = 1; w3 = 40; w2 <<= w3 → 40 & 31 = 8 → 256)
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: 1 },
             BpfInsn::MovImm { dst: 3, imm: 40 },
         ]);
-        let err = concrete_step(2, &state, &BpfInsn::Lsh32Reg { dst: 2, src: 3 }).unwrap_err();
-        assert_eq!(
-            err,
-            ConcreteFailure::InvalidShiftAmount { pc: 2, amount: 40 }
-        );
+        let next = concrete_step(2, &state, &BpfInsn::Lsh32Reg { dst: 2, src: 3 }).unwrap();
+        assert_eq!(next.regs[2], Some(ConcreteValue::Scalar(256)));
     }
 
     #[test]
@@ -2334,16 +2327,22 @@ mod tests {
     }
 
     #[test]
-    fn alu_reg_shift_invalid_amount() {
+    fn alu_reg_shift_amount_masked() {
+        // register shifts mask the amount like the hardware (& 63):
+        // r2 = 1; r3 = 64; r2 <<= r3 → 64 & 63 = 0 → 1
         let state = run(&[
             BpfInsn::MovImm { dst: 2, imm: 1 },
             BpfInsn::MovImm { dst: 3, imm: 64 },
         ]);
-        let err = concrete_step(2, &state, &BpfInsn::LshReg { dst: 2, src: 3 }).unwrap_err();
-        assert_eq!(
-            err,
-            ConcreteFailure::InvalidShiftAmount { pc: 2, amount: 64 }
-        );
+        let next = concrete_step(2, &state, &BpfInsn::LshReg { dst: 2, src: 3 }).unwrap();
+        assert_eq!(next.regs[2], Some(ConcreteValue::Scalar(1)));
+        // negative amounts wrap: r3 = -1 → 1 << 63 (0x8000_0000_0000_0000)
+        let state = run(&[
+            BpfInsn::MovImm { dst: 2, imm: 1 },
+            BpfInsn::MovImm { dst: 3, imm: -1 },
+        ]);
+        let next = concrete_step(2, &state, &BpfInsn::LshReg { dst: 2, src: 3 }).unwrap();
+        assert_eq!(next.regs[2], Some(ConcreteValue::Scalar(1 << 63)));
     }
 
     #[test]
