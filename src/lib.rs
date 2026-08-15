@@ -10,6 +10,8 @@
 //! - [`exec`] — abstract instruction execution and branch expansion
 //! - [`cfg`] — control flow graph checks (nano pass)
 //! - [`concrete`] — concrete execution state model (v0.5)
+//! - [`liveness`] — static liveness analysis (#97)
+//! - [`state_eq`] — kernel-style state equality (#97)
 //! - [`mini`] — path-sensitive exploration (mini pass)
 //! - [`helper`] — helper function prototypes and argument validation
 //! - [`tnum`] — tracked number abstraction (not wired into `RegState` yet)
@@ -29,8 +31,10 @@ pub mod helper;
 pub mod insn;
 pub mod klog;
 pub mod krun;
+pub mod liveness;
 pub mod mini;
 pub mod state;
+pub mod state_eq;
 pub mod tnum;
 pub mod trace;
 

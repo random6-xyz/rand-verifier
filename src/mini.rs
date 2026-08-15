@@ -1,87 +1,22 @@
-// ── Mini pass: path-sensitive exploration ───────────────────────────────────
+// ── Mini pass: path-sensitive exploration (issue #97) ───────────────────────
 
 use std::collections::HashMap;
 
-use crate::cfg::compute_loop_pcs;
 use crate::error::VerificationFailure;
-use crate::exec::{WorkItem, successors};
+use crate::exec::successors;
 use crate::insn::BpfInsn;
+use crate::liveness::{Liveness, analyze};
 use crate::state::{RegState, VerifierState, read_reg};
-
-/// Does `old` subsume `new`, i.e. is `new` strictly more specific?
-///
-/// A subsumed state needs no analysis: step() and successors() are
-/// monotone, so every outcome reachable from `new` is also reachable
-/// from `old`, and `old` has already been analyzed (#26).
-pub(crate) fn subsumes(old: &VerifierState, new: &VerifierState) -> bool {
-    old.regs
-        .iter()
-        .zip(&new.regs)
-        .all(|(old, new)| reg_subsumes(*old, *new))
-        && old.stack == new.stack
-}
-
-/// Per-register part of `subsumes`: the old bounds must contain the new
-/// ones in both interpretations (#40).
-pub(crate) fn reg_subsumes(old: RegState, new: RegState) -> bool {
-    match (old, new) {
-        (RegState::Uninit, RegState::Uninit) => true,
-        (RegState::Scalar(old), RegState::Scalar(new)) => {
-            // both interpretations must be contained, and the tnum must
-            // be a superset of the new one (#42)
-            old.smin <= new.smin
-                && old.smax >= new.smax
-                && old.umin <= new.umin
-                && old.umax >= new.umax
-                && old.tnum.subsumes(new.tnum)
-        }
-        (
-            RegState::PtrToStack {
-                min_offset: old_min,
-                max_offset: old_max,
-                align_off: old_align,
-            },
-            RegState::PtrToStack {
-                min_offset: new_min,
-                max_offset: new_max,
-                align_off: new_align,
-            },
-        ) => old_min == new_min && old_max == new_max && old_align == new_align,
-        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
-        (RegState::PtrToMap { .. }, RegState::PtrToMap { .. }) => true,
-        (
-            RegState::PtrToMapValue { .. },
-            RegState::PtrToMapValue {
-                min_offset: 0,
-                max_offset: 0,
-                align_off: 0,
-                value_size: 8,
-            },
-        ) => true,
-        (RegState::PtrToMapValueOrNull { .. }, RegState::PtrToMapValueOrNull { value_size: 8 }) => {
-            true
-        }
-        // a nullable pointer is a superset of the non-null one
-        (
-            RegState::PtrToMapValueOrNull { .. },
-            RegState::PtrToMapValue {
-                min_offset: 0,
-                max_offset: 0,
-                align_off: 0,
-                value_size: 8,
-            },
-        ) => true,
-        // different types are never comparable
-        _ => false,
-    }
-}
+use crate::state_eq::{ExactLevel, clean_state, states_equal, states_maybe_looping};
 
 /// Bounds for the exploration (#32, #46): exceeding any of them rejects
 /// the program with a complexity error, mirroring the kernel's
 /// BPF_COMPLEXITY_LIMIT_* checks and BPF_MAX_LOOPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VerifierLimits {
-    /// Maximum number of distinct (pc, state) pairs analyzed.
+    /// Maximum number of stored (checkpointed) states — the kernel's
+    /// total_states analog. Deliberately smaller than the kernel's
+    /// limits (its `BPF_COMPLEXITY_LIMIT_*`), like max_steps.
     pub(crate) max_states: usize,
     /// Maximum number of worklist steps (states popped).
     pub(crate) max_steps: usize,
@@ -104,29 +39,109 @@ impl Default for VerifierLimits {
     }
 }
 
+/// One stored (checkpointed) state — the kernel's
+/// `bpf_verifier_state_list` entry (kernel/bpf/states.c).
+///
+/// - `state` is the arrival state cleaned with its pc's liveness
+///   (kernel `clean_verifier_state` before storing);
+/// - `parent` points at the checkpoint this path descended from
+///   (kernel `cur->parent = new` — the parent chain that issue #98's
+///   precision backtracking walks);
+/// - `branches` counts the paths still pending under this checkpoint
+///   (kernel `sl->state.branches`): a checkpoint with `branches == 0`
+///   has been fully explored and proven safe, so it may prune
+///   equivalent states; a checkpoint with `branches > 0` is still being
+///   explored and only participates in infinite-loop detection.
+struct Checkpoint {
+    state: VerifierState,
+    parent: Option<usize>,
+    branches: usize,
+    /// Prune statistics (kernel `hit_cnt`/`miss_cnt`): a state that
+    /// misses much more often than it hits is evicted from the
+    /// comparison list.
+    hit_cnt: usize,
+    miss_cnt: usize,
+}
+
+/// One worklist item: a path arriving at `pc` with abstract state
+/// `state`. `last_cp` is the deepest checkpoint on this path's parent
+/// chain — the checkpoint whose branch count this path belongs to.
+struct WorkItem {
+    pc: u32,
+    state: VerifierState,
+    last_cp: Option<usize>,
+}
+
+/// Adjust the branch count of every checkpoint on a path's parent
+/// chain by `delta` (kernel `bpf_update_branch_counts`): every worklist
+/// item is a path segment under the checkpoints on its chain, so each
+/// push increments the whole chain and each pop decrements it again.
+/// A checkpoint reaching 0 has no pending items under it anymore — it
+/// is fully explored and safe to prune from.
+fn bump_branches(checkpoints: &mut [Checkpoint], mut last_cp: Option<usize>, delta: i32) {
+    while let Some(i) = last_cp {
+        let cp = &mut checkpoints[i];
+        if delta > 0 {
+            cp.branches += 1;
+        } else {
+            cp.branches -= 1;
+        }
+        last_cp = cp.parent;
+    }
+}
+
+/// The kernel's prune points (kernel/bpf/cfg.c): conditional jumps and
+/// unconditional jump targets. `is_state_visited` is only called (and
+/// states only stored) at these instructions.
+fn compute_prune_points(program: &[BpfInsn]) -> Vec<bool> {
+    let mut prune = vec![false; program.len()];
+    for (i, insn) in program.iter().enumerate() {
+        match insn {
+            BpfInsn::Jmp { offset } => {
+                let tgt = i as i64 + 1 + *offset as i64;
+                if (0..program.len() as i64).contains(&tgt) {
+                    prune[tgt as usize] = true;
+                }
+            }
+            insn if insn.is_conditional_branch() => prune[i] = true,
+            _ => {}
+        }
+    }
+    prune
+}
+
 /// Path-sensitive verification: explore every execution path with a
-/// worklist until it is empty.
+/// worklist until it is empty, mirroring the kernel's do_check /
+/// is_state_visited machinery (kernel/bpf/states.c):
 ///
 /// - states are processed LIFO (depth-first), like the kernel's
-///   push_stack/pop_stack verifier stack
-/// - a state is analyzed at most once per pc: a new state is skipped
-///   when an already-analyzed state subsumes it (cf. the kernel's
-///   is_state_visited / states_equal); step() and successors() are
-///   monotone, so the subsumed state cannot reach a new outcome — the
-///   first defense against state explosion (#25/#26)
+///   push_stack/pop_stack verifier stack; at a conditional branch the
+///   taken side is processed first, the fall-through is pushed (kernel
+///   check_cond_jmp_op)
+/// - `is_state_visited` runs at every prune point (conditional jumps
+///   and unconditional jump targets): the arrival state is cleaned with
+///   the pc's liveness masks, compared against the stored checkpoints
+///   (states_equal — only live registers, kernel-style regsafe/
+///   stacksafe), and either pruned (a completed equivalent checkpoint
+///   exists), rejected (an in-progress identical checkpoint = infinite
+///   loop, kernel "infinite loop detected at insn N"), or stored as a
+///   new checkpoint (gated by the kernel's add_new_state heuristic)
+/// - checkpoints track their parent and their pending branch count;
+///   every completed path decrements the counts along its parent chain
+///   (bpf_update_branch_counts), and a checkpoint with branches == 0 is
+///   fully explored — only those prune later states
 /// - every path must reach `exit` with R0 initialized (cf. the kernel's
 ///   R0 !read_ok check at exit); the structural pass guarantees that
-///   every accepted program has a reachable exit (unreachable
-///   instructions and subprograms whose last instruction is not exit
-///   are rejected)
+///   every accepted program has a reachable exit
 /// - branches ruled out by the static verdict (#24) are never explored
 /// - termination is guaranteed by the exploration bounds (#32, #46):
-///   loops converge when a new state at the loop head is subsumed by an
-///   already-analyzed one; a non-converging loop head hits the
+///   loops converge when an arrival is pruned against a completed
+///   checkpoint at a prune point; a non-converging loop hits the
 ///   `max_loop_iterations` budget and is rejected; `max_states` and
 ///   `max_steps` remain the outer bounds
 ///
-/// Returns the number of distinct (pc, state) pairs analyzed.
+/// Returns the number of stored checkpoints (the kernel's
+/// `total_states` analog).
 #[allow(dead_code)] // convenience entry kept for tests; the pipeline uses verify_mini_with_states (#53)
 pub(crate) fn verify_mini(
     program: &[BpfInsn],
@@ -137,11 +152,7 @@ pub(crate) fn verify_mini(
 
 /// `verify_mini` with explicit exploration limits (#32, #46). `loop_heads`
 /// are the targets of back edges (from the structural pass): the
-/// exploration bounds how many times each loop head may be re-analyzed,
-/// and relies on state subsumption for convergence — when a new state at
-/// the head is subsumed by an already-analyzed one, the loop has reached
-/// a fixed point and exploration stops (the kernel's loop convergence via
-/// states_equal at the loop head).
+/// exploration bounds how many times each loop head may be re-analyzed.
 pub(crate) fn verify_mini_with_limits(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -152,7 +163,8 @@ pub(crate) fn verify_mini_with_limits(
 
 /// `verify_mini_with_limits` that also returns the per-pc abstract
 /// states the exploration analyzed — the input of the abstract↔concrete
-/// coverage checker (#52).
+/// coverage checker (#52). The recorded states are cleaned with their
+/// pc's liveness, exactly like the concrete side's recorded states.
 pub(crate) fn verify_mini_with_states(
     program: &[BpfInsn],
     loop_heads: &[u32],
@@ -168,25 +180,33 @@ fn verify_mini_core(
     loop_heads: &[u32],
     limits: &VerifierLimits,
 ) -> Result<(usize, HashMap<u32, Vec<VerifierState>>), VerificationFailure> {
-    // the instructions lying on a cycle (#90): an exactly-equal state
-    // revisit at one of them is an infinite loop (kernel states.c —
-    // the kernel's read/precision marks keep loop-body states distinct,
-    // so its EXACT comparison fires where mini's dedup would otherwise
-    // prune the revisit before it reaches the loop head)
-    let loop_pcs: Vec<u32> = compute_loop_pcs(program, &[0], loop_heads);
+    let liveness: Liveness = analyze(program);
+    let prune_points = compute_prune_points(program);
     let mut worklist = vec![WorkItem {
         pc: 0,
         state: VerifierState::initial(),
+        last_cp: None,
     }];
-    // states already analyzed at each pc: a new state is skipped when an
-    // analyzed one subsumes it, like the kernel's per-pc state list
-    let mut visited: HashMap<u32, Vec<VerifierState>> = HashMap::new();
+    // the stored checkpoints, indexed — one global pool so the parent
+    // chain can span pcs (the kernel's explored-state list)
+    let mut checkpoints: Vec<Checkpoint> = Vec::new();
+    // per-pc checkpoint indices (the kernel's per-insn state list)
+    let mut visited: HashMap<u32, Vec<usize>> = HashMap::new();
+    // per-pc analyzed states — the input of the abstract↔concrete
+    // coverage checker (#52)
+    let mut analyzed: HashMap<u32, Vec<VerifierState>> = HashMap::new();
     // re-analyses per loop head (#46): exceeding the budget means the
     // loop never converges — REJECT like the kernel's "back-edge exceeds
     // max loops"
     let mut loop_iters: HashMap<u32, usize> = HashMap::new();
-    let mut explored = 0usize;
     let mut steps = 0usize;
+    // the kernel's env->insn_processed / env->jmps_processed counters
+    // and their snapshots at the last stored state (the add_new_state
+    // heuristic in is_state_visited)
+    let mut insn_processed = 0usize;
+    let mut jmps_processed = 0usize;
+    let mut prev_insn_processed = 0usize;
+    let mut prev_jmps_processed = 0usize;
 
     while let Some(item) = worklist.pop() {
         // worklist bound: every pop counts, even skipped ones
@@ -200,52 +220,129 @@ fn verify_mini_core(
                 ),
             ));
         }
+        let pc = item.pc;
+        let insn = program.get(pc as usize).ok_or_else(|| {
+            VerificationFailure::new(pc, "internal error: pc out of program range")
+        })?;
+        // the kernel counts the insn at the top of do_check, before
+        // is_state_visited (account_processed_insn)
+        insn_processed += 1;
 
-        // skip states subsumed by an already-analyzed state at this pc
-        let seen = visited.entry(item.pc).or_default();
-        // the kernel rejects a loop head revisited with an IDENTICAL
-        // state — the loop can never make progress (kernel/bpf/states.c:
-        // "infinite loop detected at insn %d", states_equal EXACT).
-        // A bounded loop's head state changes every iteration, so it
-        // never trips this rule.
-        if loop_pcs.contains(&item.pc) && seen.contains(&item.state) {
-            return Err(VerificationFailure::new(
-                item.pc,
-                format!("infinite loop detected at insn {}", item.pc),
-            ));
-        }
-        if seen.iter().any(|old| subsumes(old, &item.state)) {
-            // The kernel explores every distinct state (its pruning is
-            // equality-based), so a state mini would subsume can still
-            // be a no-progress loop: the kernel processes it and the
-            // next arrival repeats. Look one step ahead — a successor
-            // at a loop pc that equals the current state is a
-            // fixed-point loop (campaign finding mseed-999983-144).
-            if loop_pcs.contains(&item.pc) {
-                let nexts = successors(item.pc, &program[item.pc as usize], &item.state)?;
-                for (next_pc, next_state) in nexts {
-                    if loop_pcs.contains(&next_pc) && next_state == item.state {
-                        return Err(VerificationFailure::new(
-                            next_pc,
-                            format!("infinite loop detected at insn {}", next_pc),
-                        ));
+        let live_regs = liveness.live_regs_before(pc);
+        let live_stack = liveness.live_stack_before(pc);
+        let mut cleaned = item.state;
+        clean_state(&mut cleaned, live_regs, live_stack);
+
+        // ── is_state_visited (kernel/bpf/states.c) ────────────────────
+        let mut item_last_cp = item.last_cp;
+        if prune_points[pc as usize] {
+            // the add_new_state heuristic: after a stored state, only
+            // store again once at least 2 jumps and 8 instructions were
+            // processed (the kernel's "Do not add new state for future
+            // pruning if the verifier hasn't seen at least 2 jumps and
+            // at least 8 instructions")
+            let mut add_new_state = insn_processed - prev_insn_processed >= 8
+                && jmps_processed - prev_jmps_processed >= 2;
+            let mut pruned = false;
+            let mut evict: Vec<usize> = Vec::new();
+            if let Some(list) = visited.get(&pc) {
+                for &cp_idx in list {
+                    // compare the arrival against this checkpoint
+                    let equal = {
+                        let cp = &checkpoints[cp_idx];
+                        if cp.branches > 0 {
+                            // an in-progress state: only infinite-loop
+                            // detection — an identical revisit can never
+                            // make progress (kernel states.c:
+                            // states_maybe_looping + states_equal EXACT)
+                            if states_maybe_looping(&cp.state, &cleaned)
+                                && states_equal(&cp.state, &cleaned, ExactLevel::Exact, live_regs)
+                            {
+                                return Err(VerificationFailure::new(
+                                    pc,
+                                    format!("infinite loop detected at insn {}", pc),
+                                ));
+                            }
+                            // the kernel's in-progress store throttle
+                            // (states.c skip_inf_loop_check): while a
+                            // loop is still being explored, only store
+                            // a new state once at least 20 jumps and
+                            // 100 instructions were processed since the
+                            // last store — loop iterations would
+                            // otherwise accumulate one checkpoint each
+                            if insn_processed - prev_insn_processed < 100
+                                && jmps_processed - prev_jmps_processed < 20
+                            {
+                                add_new_state = false;
+                            }
+                            false
+                        } else {
+                            states_equal(&cp.state, &cleaned, ExactLevel::NotExact, live_regs)
+                        }
+                    };
+                    if equal {
+                        // the current state is equivalent to a completed
+                        // stored state: the path is safe, stop exploring
+                        // (kernel: "found equivalent state, can prune
+                        // the search")
+                        checkpoints[cp_idx].hit_cnt += 1;
+                        pruned = true;
+                        break;
+                    }
+                    // miss accounting (kernel: `if (add_new_state)
+                    // sl->miss_cnt++`) and eviction: a state that misses
+                    // much more than it hits is unlikely to help pruning
+                    // (kernel: `sl->miss_cnt > sl->hit_cnt * n + n`,
+                    // n = 3)
+                    if add_new_state {
+                        checkpoints[cp_idx].miss_cnt += 1;
+                    }
+                    let cp = &checkpoints[cp_idx];
+                    if cp.miss_cnt > cp.hit_cnt * 3 + 3 {
+                        evict.push(cp_idx);
                     }
                 }
             }
-            continue;
+            if pruned {
+                // the pruned path ends here — consume the item (its
+                // parent-chain branch counts drop by one)
+                bump_branches(&mut checkpoints, item.last_cp, -1);
+                continue;
+            }
+            if !evict.is_empty()
+                && let Some(list) = visited.get_mut(&pc)
+            {
+                list.retain(|i| !evict.contains(i));
+            }
+            if add_new_state {
+                // store the checkpoint (kernel: bpf_copy_verifier_state
+                // + `cur->parent = new`); the branch count starts at 0
+                // and counts the pushed successors below
+                let cp_idx = checkpoints.len();
+                checkpoints.push(Checkpoint {
+                    state: cleaned,
+                    parent: item.last_cp,
+                    branches: 0,
+                    hit_cnt: 0,
+                    miss_cnt: 0,
+                });
+                visited.entry(pc).or_default().push(cp_idx);
+                prev_insn_processed = insn_processed;
+                prev_jmps_processed = jmps_processed;
+                item_last_cp = Some(cp_idx);
+            }
         }
-        seen.push(item.state);
 
         // loop-head budget: a loop head that keeps producing new (not
-        // subsumed) states is not converging — bound it before the state
+        // pruned) states is not converging — bound it before the state
         // budget so the loop error is reported, like the kernel's
         // "back-edge exceeds max loops" (#46)
-        if loop_heads.contains(&item.pc) {
-            let iters = loop_iters.entry(item.pc).or_insert(0);
+        if loop_heads.contains(&pc) {
+            let iters = loop_iters.entry(pc).or_insert(0);
             *iters += 1;
             if *iters > limits.max_loop_iterations {
                 return Err(VerificationFailure::new(
-                    item.pc,
+                    pc,
                     format!(
                         "back-edge exceeds max loops ({}) — the loop does not converge",
                         limits.max_loop_iterations
@@ -253,12 +350,11 @@ fn verify_mini_core(
                 ));
             }
         }
-        explored += 1;
-        // analyzed-state bound: this is where pruning pays off — without
-        // subsumption (#26), diamond chains would hit this limit fast
-        if explored > limits.max_states {
+        // stored-state bound: the checkpoint budget (the kernel's
+        // BPF_COMPLEXITY_LIMIT_* family)
+        if checkpoints.len() > limits.max_states {
             return Err(VerificationFailure::new(
-                item.pc,
+                pc,
                 format!(
                     "verification complexity limit exceeded (max_states {})",
                     limits.max_states
@@ -266,35 +362,55 @@ fn verify_mini_core(
             ));
         }
 
-        let insn = program.get(item.pc as usize).ok_or_else(|| {
-            VerificationFailure::new(item.pc, "internal error: pc out of program range")
-        })?;
+        // record the analyzed arrival for the coverage checker (#52):
+        // every concrete state at this pc must be covered by one of
+        // these (the concrete side records states cleaned the same way)
+        analyzed.entry(pc).or_default().push(cleaned);
+
+        // the kernel counts jumps when the insn is actually processed
+        // (do_check_insn: `env->jmps_processed++` for the JMP class)
+        if insn.is_control_flow() || matches!(insn, BpfInsn::Call { .. }) {
+            jmps_processed += 1;
+        }
 
         // a path ends at exit; R0 must hold a valid value there
         if matches!(insn, BpfInsn::Exit) {
-            let r0 = read_reg(item.pc, &item.state, 0)
-                .map_err(|_| VerificationFailure::new(item.pc, "r0 is uninitialized at exit"))?;
+            let r0 = read_reg(pc, &item.state, 0)
+                .map_err(|_| VerificationFailure::new(pc, "r0 is uninitialized at exit"))?;
             // the kernel requires R0 to be a scalar return value at
             // exit (check_return_code: "R0 leaks addr as return
             // value" / "R0 is not a known value (ctx)") — a pointer
             // in R0 is never a valid program return value
             if !matches!(r0, RegState::Scalar(_)) {
                 return Err(VerificationFailure::new(
-                    item.pc,
+                    pc,
                     "r0 is not a scalar value at exit",
                 ));
             }
+            // the path ends here — consume the item (kernel
+            // process_bpf_exit → bpf_update_branch_counts)
+            bump_branches(&mut checkpoints, item.last_cp, -1);
             continue;
         }
 
-        for (next_pc, next_state) in successors(item.pc, insn, &item.state)? {
+        for (next_pc, next_state) in successors(pc, insn, &item.state)?.into_iter().rev() {
+            // the kernel pushes the fall-through and continues with the
+            // taken branch — with our LIFO worklist, pushing in reverse
+            // reproduces that order (taken processed first)
+            bump_branches(&mut checkpoints, item_last_cp, 1);
             worklist.push(WorkItem {
                 pc: next_pc,
                 state: next_state,
+                last_cp: item_last_cp,
             });
         }
+        // the item is consumed: its parent-chain branch counts drop by
+        // one (every worklist item is a path segment; the kernel counts
+        // paths, which only branch at forks — the per-push/per-pop
+        // accounting is equivalent)
+        bump_branches(&mut checkpoints, item.last_cp, -1);
     }
-    Ok((explored, visited))
+    Ok((checkpoints.len(), analyzed))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -305,8 +421,6 @@ mod tests {
     use crate::exec::*;
     use crate::insn::*;
     use crate::state::*;
-    use crate::testutil::*;
-    use crate::tnum::Tnum;
 
     #[test]
     fn verify_mini_straight_line() {
@@ -613,22 +727,22 @@ mod tests {
     }
 
     #[test]
-    fn verify_mini_converging_loop_stops() {
-        // a loop whose state converges at the head is analyzed once: the
-        // second visit is subsumed and exploration stops (the exit path
-        // was already explored from the first visit)
+    fn verify_mini_loop_read_error_before_loop_machinery() {
+        // the loop's branch reads an uninitialized register: the read
+        // error fires on the first analysis of the branch insn, before
+        // any loop detection or budget machinery (r2 is uninit at the
+        // jeq; convergence itself is covered by the bounded-loop tests)
         let program = vec![
             BpfInsn::MovImm { dst: 0, imm: 0 },
             BpfInsn::MovImm { dst: 1, imm: 0 },
             BpfInsn::AddImm { dst: 1, imm: 1 },
             BpfInsn::Jeq {
                 dst: 1,
-                src: 2, // r2 is uninit → rejected later; use r1 == r1?
+                src: 2,
                 offset: -2,
             },
             BpfInsn::Exit,
         ];
-        // r2 uninit: the loop is rejected for the read, not for looping
         let err = verify_mini(&program, &[2]).unwrap_err();
         assert!(err.message.contains("uninitialized"), "{}", err.message);
     }
@@ -708,211 +822,202 @@ mod tests {
         assert!(verify_mini(&program, &[]).is_ok());
     }
 
-    #[test]
-    fn verify_mini_dedup_join_state() {
-        // both branches rejoin at pc 4 with the same state (r0 = 1); the
-        // second visit is skipped (is_state_visited), so 5 distinct
-        // (pc, state) pairs are analyzed instead of 6:
-        // 0: jeq r10, r10, +2 → taken 3, fall 1
-        // 1: r0 = 1
-        // 2: jmp +1 → 4
-        // 3: r0 = 1
-        // 4: exit
-        let program = vec![
+    // ── Kernel-style pruning (issue #97) ─────────────────────────────────────
+
+    /// The kernel-style diamond test shape (26 insns, join at pc 25):
+    /// both paths are long enough (≥ 8 insns and ≥ 2 jumps between
+    /// stores) for the add_new_state heuristic to store checkpoints at
+    /// the join, so the tests exercise the pruning machinery itself.
+    /// `taken_r0` / `fall_r0` are the paths' r0 values; both paths also
+    /// write a *dead* r7 (taken: 2, fall: 1) that is never read after
+    /// the join:
+    /// 0-5: r1..r6 = 1 (filler)
+    /// 6: jeq r10, r10, +9 → taken 16, fall 7
+    /// 7: r0 = fall_r0 ; 8: r7 = 1 ; 9-14: filler
+    /// 15: jmp +6 → 22
+    /// 16: r0 = taken_r0 ; 17: r7 = 2 ; 18-20: filler
+    /// 21: jmp +3 → 25
+    /// 22-23: filler ; 24: jmp +0 → 25
+    /// 25: exit
+    fn diamond(taken_r0: i32, fall_r0: i32) -> Vec<BpfInsn> {
+        vec![
+            BpfInsn::MovImm { dst: 1, imm: 1 },
+            BpfInsn::MovImm { dst: 2, imm: 1 },
+            BpfInsn::MovImm { dst: 3, imm: 1 },
+            BpfInsn::MovImm { dst: 4, imm: 1 },
+            BpfInsn::MovImm { dst: 5, imm: 1 },
+            BpfInsn::MovImm { dst: 6, imm: 1 },
             BpfInsn::Jeq {
                 dst: 10,
                 src: 10,
-                offset: 2,
+                offset: 9,
             },
-            BpfInsn::MovImm { dst: 0, imm: 1 },
-            BpfInsn::Jmp { offset: 1 },
-            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::MovImm {
+                dst: 0,
+                imm: fall_r0,
+            },
+            BpfInsn::MovImm { dst: 7, imm: 1 },
+            BpfInsn::MovImm { dst: 9, imm: 1 },
+            BpfInsn::MovImm { dst: 5, imm: 5 },
+            BpfInsn::MovImm { dst: 6, imm: 6 },
+            BpfInsn::MovImm { dst: 4, imm: 4 },
+            BpfInsn::MovImm { dst: 3, imm: 3 },
+            BpfInsn::MovImm { dst: 2, imm: 2 },
+            BpfInsn::Jmp { offset: 6 },
+            BpfInsn::MovImm {
+                dst: 0,
+                imm: taken_r0,
+            },
+            BpfInsn::MovImm { dst: 7, imm: 2 },
+            BpfInsn::MovImm { dst: 9, imm: 2 },
+            BpfInsn::MovImm { dst: 8, imm: 2 },
+            BpfInsn::MovImm { dst: 5, imm: 5 },
+            BpfInsn::Jmp { offset: 3 },
+            BpfInsn::MovImm { dst: 6, imm: 6 },
+            BpfInsn::MovImm { dst: 4, imm: 4 },
+            BpfInsn::Jmp { offset: 0 },
             BpfInsn::Exit,
-        ];
-        assert_eq!(verify_mini(&program, &[]).unwrap(), 5);
+        ]
+    }
+
+    #[test]
+    fn verify_mini_dedup_join_state() {
+        // both branches rejoin at pc 25 with the same state; the second
+        // arrival is pruned against the taken path's checkpoint
+        // (states_equal), so exactly ONE checkpoint is stored at the
+        // join — without the kernel-style pruning a second checkpoint
+        // would be stored there
+        let program = diamond(1, 1);
+        // checkpoints: the taken path stores at the join (pc 25) and
+        // the fall path at its own jump target (pc 22, also a prune
+        // point) — 2 total. The dedup shows in the coverage map: the
+        // fall's arrival at the join is pruned, so only ONE state is
+        // analyzed at pc 25.
+        let (count, states) =
+            verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(states.get(&25).unwrap().len(), 1);
     }
 
     #[test]
     fn verify_mini_dedup_distinct_join_states_not_merged() {
-        // if the two branches write different values, the join states differ
-        // and both are analyzed:
-        // 0: jeq r10, r10, +2 → taken 3, fall 1
-        // 1: r0 = 1
-        // 2: jmp +1 → 4
-        // 3: r0 = 2
-        // 4: exit
+        // different r0 values (live at exit) → the join states differ
+        // and both are stored
+        let program = diamond(2, 1);
+        // different r0 values (live at exit) → the join states differ,
+        // so the fall's arrival is ANALYZED (not pruned): TWO states at
+        // the join. The add_new_state heuristic still gates the third
+        // store (fewer than 8 insns since the fall's own pc 22
+        // checkpoint), so the checkpoint count stays 2 — like the
+        // kernel's total_states.
+        let (count, states) =
+            verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(states.get(&25).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn verify_mini_dead_register_difference_still_dedups() {
+        // the paths write different r7 values, but r7 is never read
+        // after the join: the liveness masks drop it from the
+        // comparison (the kernel's live_regs_before behavior), so the
+        // join states are still equal and the second arrival is pruned
+        // (diamond(1, 1) has the built-in dead r7 = 2 vs 1 difference)
+        let program = diamond(1, 1);
+        let (_, states) =
+            verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
+        // the dead r7 difference does not block the dedup: only ONE
+        // state is analyzed at the join
+        assert_eq!(states.get(&25).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn verify_mini_live_register_difference_blocks_dedup() {
+        // the same shape, but r7 is read on the shared tail after the
+        // join (25: r0 = r7; 26: exit): the paths' different r7 values
+        // are live at the join, so the join states differ and both are
+        // stored
+        let mut program = diamond(1, 1);
+        program.push(BpfInsn::MovReg { dst: 0, src: 7 });
+        program.push(BpfInsn::Exit);
+        // retarget the jumps to the new join at 26
+        program[21] = BpfInsn::Jmp { offset: 4 };
+        program[24] = BpfInsn::Jmp { offset: 1 };
+        let (count, states) =
+            verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
+        // r7 is live at the join → the two arrivals differ → both are
+        // analyzed (TWO states at the join pc 26)
+        assert_eq!(count, 2);
+        assert_eq!(states.get(&26).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn verify_mini_taken_branch_processed_first() {
+        // the kernel processes the taken branch before the fall-through
+        // (check_cond_jmp_op pushes the fall-through): with different
+        // r0 values the join stores both checkpoints, and the coverage
+        // map records the taken path's arrival (r0 = 2) first
+        let program = diamond(2, 1);
+        let (count, states) =
+            verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
+        assert_eq!(count, 2);
+        let join = states.get(&25).expect("join pc recorded");
+        assert_eq!(join.len(), 2);
+        assert_eq!(
+            join[0].regs[0],
+            RegState::Scalar(ScalarBounds::constant(2)),
+            "the taken path (r0 = 2) is analyzed first"
+        );
+        assert_eq!(join[1].regs[0], RegState::Scalar(ScalarBounds::constant(1)));
+    }
+
+    #[test]
+    fn verify_mini_indirect_base_liveness_unsoundness_regression() {
+        // regression for the reviewer finding on #97: the load at
+        // [r6-8] (r6 = r10-8) really reads r10-16 (slot 1), but the
+        // static liveness analysis cannot know the base's offset. The
+        // taken path writes slot 1, the fall path does not; the fall's
+        // read at the join must be REJECTED. Attributing the read to
+        // the immediate offset alone (slot 0) would mark slot 1 dead,
+        // clean it from the stored state, prune the fall path at the
+        // join, and falsely ACCEPT the program:
+        // 0: r6 = r10
+        // 1: r6 += -8
+        // 2: jeq r10, r10, +2 → taken 5, fall 3
+        // 3: r0 = 0 ; 4: jmp +4 → 9
+        // 5: r7 = 42 ; 6: [r10-16] = r7 ; 7: r0 = 0 ; 8: jmp +0 → 9
+        // 9: r2 = [r6-8]  ← r10-16: uninit on the fall path → REJECT
+        // 10: r0 = r2 ; 11: exit
         let program = vec![
+            BpfInsn::MovReg { dst: 6, src: 10 },
+            BpfInsn::AddImm { dst: 6, imm: -8 },
             BpfInsn::Jeq {
                 dst: 10,
                 src: 10,
                 offset: 2,
             },
-            BpfInsn::MovImm { dst: 0, imm: 1 },
-            BpfInsn::Jmp { offset: 1 },
-            BpfInsn::MovImm { dst: 0, imm: 2 },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Jmp { offset: 4 },
+            BpfInsn::MovImm { dst: 7, imm: 42 },
+            BpfInsn::StMem {
+                src: 7,
+                base: 10,
+                offset: -16,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Jmp { offset: 0 },
+            BpfInsn::LdMem {
+                dst: 2,
+                base: 6,
+                offset: -8,
+            },
+            BpfInsn::MovReg { dst: 0, src: 2 },
             BpfInsn::Exit,
         ];
-        // (4, r0=1) and (4, r0=2) are distinct → both counted
-        assert_eq!(verify_mini(&program, &[]).unwrap(), 6);
-    }
-
-    // ── Subsumption (v0.3) ──────────────────────────────────────────────────
-
-    #[test]
-    fn subsumes_dual_ranges() {
-        // subsumption requires containment in both interpretations (#40).
-        // The states here are constructed directly (bypassing the sync)
-        // to pin the predicate itself.
-        let bounds = |smin: i64, smax: i64, umin: u64, umax: u64| ScalarBounds {
-            smin,
-            smax,
-            umin,
-            umax,
-            s32_min: i32::MIN,
-            s32_max: i32::MAX,
-            u32_min: 0,
-            u32_max: u32::MAX,
-            tnum: Tnum::unknown(),
-        };
-        let mut old = VerifierState::initial();
-        old.regs[1] = RegState::Scalar(bounds(0, 100, 0, 100));
-        let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar(bounds(10, 20, 10, 20));
-        assert!(subsumes(&old, &new));
-        // the signed range contains the new one but the unsigned range
-        // does not → not subsumed
-        new.regs[1] = RegState::Scalar(bounds(10, 20, 0, 1000));
-        assert!(!subsumes(&old, &new));
-        // and vice versa
-        new.regs[1] = RegState::Scalar(bounds(-50, 20, 0, 100));
-        assert!(!subsumes(&old, &new));
-    }
-
-    #[test]
-    fn subsumes_tnum() {
-        // a state with a narrower tnum is subsumed by one with a wider
-        // tnum when the ranges also contain it (#42)
-        let tnum_bounds = |value: u64, mask: u64| ScalarBounds {
-            smin: 0,
-            smax: 3,
-            umin: 0,
-            umax: 3,
-            s32_min: 0,
-            s32_max: 3,
-            u32_min: 0,
-            u32_max: 3,
-            tnum: Tnum { value, mask },
-        };
-        let mut wide = VerifierState::initial();
-        wide.regs[1] = RegState::Scalar(tnum_bounds(0, 0b011));
-        let mut narrow = VerifierState::initial();
-        narrow.regs[1] = RegState::Scalar(tnum_bounds(0b001, 0));
-        assert!(subsumes(&wide, &narrow));
-        // the narrower tnum never subsumes the wider one
-        assert!(!subsumes(&narrow, &wide));
-        // equal tnums subsume each other
-        assert!(subsumes(&wide, &wide));
-    }
-
-    #[test]
-    fn subsumes_issue_example() {
-        // issue example: old R1 = [0, 100] subsumes new R1 = [10, 20]
-        let mut old = VerifierState::initial();
-        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
-        let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
-        assert!(subsumes(&old, &new));
-    }
-
-    #[test]
-    fn subsumes_scalar_ranges() {
-        let old = VerifierState::initial();
-        let mut old = old;
-        old.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
-        let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(10, 20));
-
-        // subsumption is reflexive: a state subsumes itself
-        assert!(subsumes(&old, &old));
-        assert!(subsumes(&new, &new));
-        // a wider new range is not subsumed
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(-50, 200));
-        assert!(!subsumes(&old, &new));
-        // equal ranges subsume each other
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
-        assert!(subsumes(&old, &new));
-        assert!(subsumes(&new, &old));
-    }
-
-    #[test]
-    fn subsumes_reg_mismatch() {
-        // different types are never comparable
-        let old = VerifierState::initial();
-        let mut new = VerifierState::initial();
-        new.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
-        assert!(!subsumes(&old, &new)); // Uninit vs Scalar
-        assert!(!subsumes(&new, &old));
-
-        // pointer offsets must match exactly
-        let mut shifted = VerifierState::initial();
-        shifted.regs[10] = ptr_stack(-8);
-        assert!(!subsumes(&old, &shifted));
-        assert!(subsumes(&old, &old));
-    }
-
-    #[test]
-    fn subsumes_stack_mismatch() {
-        let mut old = VerifierState::initial();
-        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
-        let new = VerifierState::initial();
-        // stack states differ → not subsumed even though the registers match
-        assert!(!subsumes(&old, &new));
-        assert!(!subsumes(&new, &old));
-    }
-
-    #[test]
-    fn verify_mini_refined_state_subsumed_by_original() {
-        // the refined branches of [0, 100] > 50 (R1 = [51, 100] / [0, 50])
-        // are both subsumed by the original R1 = [0, 100]
-        let mut state = VerifierState::initial();
-        state.regs[1] = RegState::Scalar(ScalarBounds::from_signed(0, 100));
-        state.regs[2] = RegState::Scalar(ScalarBounds::constant(50));
-        let nexts = successors(
-            0,
-            &BpfInsn::Jgt {
-                dst: 1,
-                src: 2,
-                offset: 1,
-            },
-            &state,
-        )
-        .unwrap();
-        assert_eq!(nexts.len(), 2);
-        let (_, taken) = &nexts[0];
-        let (_, fall) = &nexts[1];
-        assert!(subsumes(&state, taken));
-        assert!(subsumes(&state, fall));
-    }
-
-    // ── Nullable pointers (v0.3) ─────────────────────────────────────────────
-
-    #[test]
-    fn subsumes_nullable_pointer() {
-        // OrNull = {valid} ∪ {NULL} subsumes the non-null pointer
-        let mut or_null = VerifierState::initial();
-        or_null.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
-        let mut valid = VerifierState::initial();
-        valid.regs[0] = RegState::PtrToMapValue {
-            min_offset: 0,
-            max_offset: 0,
-            align_off: 0,
-            value_size: 8,
-        };
-        assert!(subsumes(&or_null, &valid));
-        assert!(!subsumes(&valid, &or_null));
-        // same types subsume themselves
-        assert!(subsumes(&or_null, &or_null));
-        assert!(subsumes(&valid, &valid));
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let err = verify_mini(&program, &heads).unwrap_err();
+        assert!(err.message.contains("uninitialized"), "{}", err.message);
     }
 
     #[test]
@@ -950,14 +1055,31 @@ mod tests {
 
     #[test]
     fn verify_mini_max_states_exceeded() {
-        // r0 = 1; exit needs two distinct states (pc 0 and pc 1)
-        let program = vec![BpfInsn::MovImm { dst: 0, imm: 1 }, BpfInsn::Exit];
+        // max_states bounds the stored checkpoints: a bounded counter
+        // loop stores one checkpoint per iteration at its prune point
+        // (after the add_new_state threshold), so a tight budget rejects
+        // it while the default budget accepts it
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        // the kernel's in-progress store throttle (20 jmps / 100 insns
+        // since the last store) keeps loop checkpoints sparse: the
+        // 100-iteration loop stores 5, so a budget of 4 rejects it
         let tight = VerifierLimits {
-            max_states: 1,
-            max_steps: 100,
+            max_states: 4,
+            max_steps: 100_000,
             max_loop_iterations: 4096,
         };
-        let err = verify_mini_with_limits(&program, &[], &tight).unwrap_err();
+        let err = verify_mini_with_limits(&program, &[3], &tight).unwrap_err();
         assert!(
             err.message
                 .contains("verification complexity limit exceeded")
@@ -966,11 +1088,11 @@ mod tests {
 
         // with enough room the same program is accepted
         let roomy = VerifierLimits {
-            max_states: 2,
-            max_steps: 100,
+            max_states: 1024,
+            max_steps: 100_000,
             max_loop_iterations: 4096,
         };
-        assert!(verify_mini_with_limits(&program, &[], &roomy).is_ok());
+        assert!(verify_mini_with_limits(&program, &[3], &roomy).is_ok());
     }
 
     #[test]
@@ -1029,21 +1151,6 @@ mod tests {
         ];
         assert!(verify_mini(&program, &[]).is_ok());
     }
-
-    #[test]
-    fn subsumes_ptr_to_map() {
-        let mut map = VerifierState::initial();
-        map.regs[1] = RegState::PtrToMap {
-            key_size: 4,
-            value_size: 8,
-        };
-        let ctx = VerifierState::initial();
-        // same type subsumes itself; a map pointer never subsumes a ctx
-        // pointer (or vice versa)
-        assert!(subsumes(&map, &map));
-        assert!(!subsumes(&map, &ctx));
-        assert!(!subsumes(&ctx, &map));
-    }
 }
 
 #[cfg(test)]
@@ -1052,7 +1159,7 @@ mod loop_fixed_point_tests {
     use crate::insn::BpfInsn;
 
     /// A subsumed state at a loop pc whose successor loops back onto
-    /// itself is a no-progress (infinite) loop. Regression: the
+    /// itself is a no-progress (infinite) loop. Regression: the old
     /// subsumption pruning used to hide it — the kernel rejects such
     /// programs with "infinite loop detected" (campaign finding
     /// mseed-999983-144: r0 = prandom(); if r0 >= 0x7fffffff goto -2).
@@ -1087,8 +1194,8 @@ mod loop_fixed_point_tests {
         assert!(err.message.contains("infinite loop"), "{}", err.message);
     }
 
-    /// A bounded narrowing loop must still converge through subsumption
-    /// (no false infinite-loop detection).
+    /// A bounded narrowing loop must still converge (no false
+    /// infinite-loop detection).
     #[test]
     fn bounded_narrowing_loop_still_accepted() {
         // r2 = 3; loop: r2 -= 1; if r2 > 0 goto -2; r0 = 0; exit

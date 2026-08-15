@@ -1698,13 +1698,6 @@ impl CondOp {
 
 // ── Worklist path exploration (v0.3 Mini) ────────────────────────────────────
 
-/// One pending state in the path exploration: an instruction index and
-/// the verifier state carried to it (cf. the kernel's verifier stack).
-pub(crate) struct WorkItem {
-    pub(crate) pc: u32,
-    pub(crate) state: VerifierState,
-}
-
 /// PC-relative branch target: the offset is relative to the next insn.
 pub(crate) fn branch_target(pc: u32, offset: i16) -> u32 {
     (pc as i32 + 1 + offset as i32) as u32

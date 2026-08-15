@@ -15,6 +15,7 @@ use crate::env::MapInfo;
 use crate::exec::{AluOp, AluWidth, CondOp, alu_const32, alu_const64, branch_target};
 use crate::helper::{ArgType, HelperPrototype, helper_prototype};
 use crate::insn::{BpfInsn, disassemble};
+use crate::liveness::{Liveness, analyze};
 use crate::state::{
     ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOT_SIZE, STACK_SLOTS, ScalarBounds,
     StackSlot, VerifierState,
@@ -95,6 +96,27 @@ pub(crate) struct ConcreteState {
     /// One slot per 8-byte cell of the 512-byte frame, like the abstract
     /// `StackState`.
     pub(crate) stack: [Option<ConcreteValue>; STACK_SLOTS],
+}
+
+/// Clean a concrete state with its pc's liveness masks, mirroring the
+/// abstract side's `clean_state` (issue #97): registers and stack slots
+/// that are dead before `pc` are dropped, so the abstract↔concrete
+/// coverage containment holds after both sides clean their recorded
+/// states the same way. The frame pointer R10 is never cleaned (like
+/// the abstract side).
+fn clean_concrete_state(state: &mut ConcreteState, pc: u32, liveness: &Liveness) {
+    let live_regs = liveness.live_regs_before(pc);
+    for r in 0..NUM_REGS {
+        if r != 10 && live_regs & (1 << r) == 0 {
+            state.regs[r] = None;
+        }
+    }
+    let live_stack = liveness.live_stack_before(pc);
+    for i in 0..STACK_SLOTS {
+        if live_stack & (1 << i) == 0 {
+            state.stack[i] = None;
+        }
+    }
 }
 
 impl ConcreteState {
@@ -867,17 +889,25 @@ pub(crate) fn run_concrete_with_limits(
 
 /// `run_concrete_with_limits` with the map registry (#89). Map values
 /// live in a per-run memory; ARRAY values are zero-initialized.
+///
+/// The recorded visited states are cleaned with their pc's liveness
+/// masks (like the abstract side's coverage states, #97): dead
+/// registers and dead stack slots are dropped, so the abstract↔concrete
+/// coverage containment holds after the abstract side started cleaning
+/// its stored states the same way.
 pub(crate) fn run_concrete_with_maps(
     program: &[BpfInsn],
     loop_heads: &[u32],
     limits: &ConcreteLimits,
     maps: &HashMap<u32, MapInfo>,
 ) -> Result<ConcreteRun, ConcreteFailure> {
+    let liveness = analyze(program);
     let mut mem = MapMem::default();
     let mut worklist = vec![(0u32, ConcreteState::initial())];
     // states already visited at each pc, for exact-state deduplication
     let mut visited: HashMap<u32, Vec<ConcreteState>> = HashMap::new();
-    // visit order of the distinct states — the input of #52
+    // visit order of the distinct states — the input of #52 (cleaned
+    // with the pc's liveness, mirroring the abstract coverage states)
     let mut visited_order: Vec<(u32, ConcreteState)> = Vec::new();
     // distinct re-visits per loop head (#46): exceeding the budget means
     // the loop never converges → inconclusive (concrete cannot prove
@@ -905,7 +935,11 @@ pub(crate) fn run_concrete_with_maps(
             continue;
         }
         seen.push(state);
-        visited_order.push((pc, state));
+        // record the state cleaned with its pc's liveness (the abstract
+        // side records its coverage states the same way, #97)
+        let mut cleaned = state;
+        clean_concrete_state(&mut cleaned, pc, &liveness);
+        visited_order.push((pc, cleaned));
 
         // loop-head budget: a head that keeps producing new states is
         // not converging
@@ -1616,6 +1650,7 @@ pub(crate) fn render_coverage_report(
 mod tests {
     use super::*;
     use crate::state::ScalarBounds;
+    use crate::state_eq::clean_state;
 
     // ── concrete state model (#49) ──────────────────────────────────────
 
@@ -2913,12 +2948,26 @@ mod tests {
     // ── abstract↔concrete coverage checker (#52) ─────────────────────────
 
     /// The abstract states for `[r0 = 42, exit]`: initial at pc 0, a
-    /// state with `r0 = 42` at pc 1.
+    /// state with `r0 = 42` at pc 1 — cleaned with each pc's liveness
+    /// masks, exactly like the mini's coverage states (#97).
     fn abstract_states_for_constant_program(r0_at_exit: i64) -> HashMap<u32, Vec<VerifierState>> {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let liveness = analyze(&program);
         let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        abstract_states.insert(0, vec![VerifierState::initial()]);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
+        abstract_states.insert(0, vec![initial]);
         let mut at_exit = VerifierState::initial();
         at_exit.regs[0] = RegState::Scalar(ScalarBounds::constant(r0_at_exit));
+        clean_state(
+            &mut at_exit,
+            liveness.live_regs_before(1),
+            liveness.live_stack_before(1),
+        );
         abstract_states.insert(1, vec![at_exit]);
         abstract_states
     }
@@ -2948,9 +2997,17 @@ mod tests {
     fn check_coverage_detects_missing_pc() {
         let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
         let run = run_concrete(&program, &[]).unwrap();
-        // pc 1 (exit) is missing from the abstract side
+        // pc 1 (exit) is missing from the abstract side (the pc 0 entry
+        // is the cleaned initial state, like the mini's coverage map)
+        let liveness = analyze(&program);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
         let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        abstract_states.insert(0, vec![VerifierState::initial()]);
+        abstract_states.insert(0, vec![initial]);
         let violations = check_coverage(&abstract_states, &run);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].pc, 1);
@@ -2960,15 +3017,33 @@ mod tests {
 
     #[test]
     fn check_coverage_initial_mismatch() {
-        // abstract pc 0 has R0 initialized, concrete initial R0 is None
-        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        // abstract pc 0 has the WRONG type for a register that is live
+        // there (R1 is read by the store), the concrete has the context
+        // pointer → NotCovered at pc 0
+        let program = [
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 42 },
+            BpfInsn::Exit,
+        ];
         let run = run_concrete(&program, &[]).unwrap();
-        let mut abstract_states = abstract_states_for_constant_program(42);
+        let liveness = analyze(&program);
         let mut wrong_initial = VerifierState::initial();
-        wrong_initial.regs[0] = RegState::Scalar(ScalarBounds::constant(0));
+        wrong_initial.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
+        clean_state(
+            &mut wrong_initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
+        let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
         abstract_states.insert(0, vec![wrong_initial]);
         let violations = check_coverage(&abstract_states, &run);
-        assert_eq!(violations.len(), 1);
+        // pc 0 is the intended mismatch; pcs 1-2 are missed (the map
+        // only covers pc 0)
+        assert_eq!(violations.len(), 3);
         assert_eq!(violations[0].pc, 0);
         assert_eq!(violations[0].kind, CoverageKind::NotCovered);
     }
@@ -3022,9 +3097,17 @@ mod tests {
         assert!(report.contains("NOT COVERED"));
         assert!(!report.contains("ABSTRACT MISSED PC"));
 
-        // precision case: the abstract never visited pc 1
+        // precision case: the abstract never visited pc 1 (the pc 0
+        // entry is the cleaned initial state)
+        let liveness = analyze(&program);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
         let mut missing: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        missing.insert(0, vec![VerifierState::initial()]);
+        missing.insert(0, vec![initial]);
         let precision = check_coverage(&missing, &run);
         assert_eq!(precision.len(), 1);
         assert_eq!(precision[0].kind, CoverageKind::AbstractMissedPc);

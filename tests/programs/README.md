@@ -117,6 +117,7 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | computed_offset_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed out-of-frame offset without access (#87) |
 | ctx_arith_bounded            | `r0 = 0; r1 += 1; exit`                              | ctx ADD with a sane offset (kernel PTR_TO_CTX, #90) |
 | bounded_loop                | `r0 = 0; r2 = 100; r1 = 0; r1 += 1; jlt r1, r2, -2; exit`            | bounded counter loop (100 iterations) |
+| complexity_limit              | 11 stacked diamonds (2^11 states)                   | dead-slot pruning explores all paths within the limits (#97) |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
@@ -143,7 +144,6 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | uninit_register_on_path       | `jeq r10, r10, +1; r2 = 5; r0 = r2; exit`           | uninitialized register on a path    |
 | invalid_helper_argument       | `call 1; exit`                                     | helper argument type mismatch       |
 | invalid_pointer_arithmetic    | `r1 += 8; exit`                                     | context pointer arithmetic          |
-| complexity_limit              | 11 stacked diamonds (2^11 states)                   | exploration complexity limit        |
 | sub_on_pointer                | `r10 -= 8; exit`                                    | SUB on a stack pointer              |
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
 | alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |

@@ -30,8 +30,12 @@ Programs use the kernel `struct bpf_insn` encoding (8 bytes/instruction). Build:
 ## Current state
 
 - **Campaigns**: 24 kernel-backed runs (22 mutation + 2 generation), 340K+ programs, verified inside a qemu bpf-next guest.
-- **Corpus**: 39 accept / 39 reject fixtures in `tests/programs/` (see `tests/programs/README.md`), 485 tests green in CI.
-- **Model**: mini covers scalar ranges (signed/unsigned + tnum), ALU32/64, stack spill/fill (8-byte slots), map/ctx/stack pointers with access-time bounds, helper calls, bounded loops. Not yet covered: BPF-to-BPF calls, precision tracking, reference tracking, BTF/kfunc — see the roadmap below.
+- **Corpus**: 40 accept / 38 reject fixtures in `tests/programs/` (see `tests/programs/README.md`), 493 tests green in CI.
+- **Model**: mini covers scalar ranges (signed/unsigned + tnum), ALU32/64, stack spill/fill (8-byte slots), map/ctx/stack pointers with access-time bounds, helper calls, bounded loops. State pruning is kernel-style (liveness masks, prune points, parent/checkpoint states, `regsafe()`/`stacksafe()`/`states_equal()`). Not yet covered: BPF-to-BPF calls, precision tracking, reference tracking, BTF/kfunc — see the roadmap below.
+
+## Kernel findings
+
+- **Speculative dead-branch exploration rejects concretely-safe programs (strict loads)** — with `bypass_spec_v1` off (no `CAP_PERFMON`, e.g. the lab's `--strict` campaigns), the kernel explores statically-decided-dead branches speculatively (`sanitize_speculative_path`, kernel/bpf/verifier.c). A fixed-point loop inside such a dead branch — e.g. `r1 = -4; r2 = 100; if r1 < r2 goto -1; exit` (the unsigned compare is never taken) — then trips the infinite-loop detector on the speculative path and rejects the program, although the fall-through is concretely safe and the privileged load accepts it (bypass_spec_v1 on with `CAP_PERFMON`). mini follows the privileged behavior (accept); the strict-mode divergence is a kernel-side false reject (campaign class `precision-candidate`, first seen in the v0.8.4 campaigns, re-confirmed on bpf-next 7.2.0-rc6).
 
 ## Roadmap
 
