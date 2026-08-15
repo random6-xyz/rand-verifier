@@ -53,9 +53,12 @@ pub(crate) mod opcode {
     pub const ARSH32_IMM: u8 = 0xc4;
     pub const ARSH32_REG: u8 = 0xcc;
 
-    // loads/stores — only 8-byte (DW) accesses with the frame pointer
-    // as the base register are supported
+    // loads/stores — 8-byte (DW) accesses with the frame pointer as
+    // the base register (#100 adds the partial widths); the decode
+    // matches the MEM class generically, these stay for the tests
+    #[allow(dead_code)]
     pub const LD_STACK: u8 = 0x79; // BPF_LDX | BPF_MEM | BPF_DW, src_reg = R10
+    #[allow(dead_code)]
     pub const ST_STACK: u8 = 0x7b; // BPF_STX | BPF_MEM | BPF_DW, dst_reg = R10
 
     // jumps (class 0x05): every compare exists in the register-register
@@ -83,6 +86,26 @@ pub(crate) mod opcode {
     pub const JSLE_IMM: u8 = 0xd5; // BPF_JMP | BPF_JSLE | BPF_K (signed)
     pub const CALL: u8 = 0x85; // BPF_JMP | BPF_CALL — imm is the helper id
     pub const EXIT: u8 = 0x95; // BPF_JMP | BPF_EXIT
+}
+
+/// The memory access width of a load/store (kernel BPF_SIZE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemSize {
+    B,
+    H,
+    W,
+    DW,
+}
+
+impl MemSize {
+    pub fn bytes(self) -> usize {
+        match self {
+            MemSize::B => 1,
+            MemSize::H => 2,
+            MemSize::W => 4,
+            MemSize::DW => 8,
+        }
+    }
 }
 
 /// The supported eBPF subset, decoded from the kernel encoding (see
@@ -228,18 +251,31 @@ pub enum BpfInsn {
         dst: u8,
         src: u8,
     },
-    // 8-byte memory access through a base register (any register; the
+    // Memory access through a base register (any register; the
     // verifier requires a stack pointer base, #87). `base` is the
-    // kernel's src_reg for loads and dst_reg for stores.
+    // kernel's src_reg for loads and dst_reg for stores. `size` is the
+    // access width; `sign_extend` marks the sign-extending LDX|MEMSX
+    // forms (#100). 32-bit and narrower loads zero-extend into the
+    // 64-bit destination (or sign-extend for MEMSX).
     LdMem {
         dst: u8,
         base: u8,
         offset: i16,
+        size: MemSize,
+        sign_extend: bool,
     },
     StMem {
         src: u8,
         base: u8,
         offset: i16,
+        size: MemSize,
+    },
+    /// `BPF_ST`: store an immediate to memory (#100).
+    StMemImm {
+        imm: i32,
+        base: u8,
+        offset: i16,
+        size: MemSize,
     },
     // BPF_LD|BPF_DW|BPF_IMM (ldimm64, #89): two 8-byte slots in the
     // kernel encoding, decoded as TWO entries — the real instruction
@@ -721,30 +757,50 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
         // program loader, which owns the chunk stream).
         opcode::LD_IMM64 => Err(DecodeError::LdImm64Truncated),
         // BPF_LDX|BPF_MEM|BPF_DW — 8-byte load from [base + off]
-        opcode::LD_STACK => {
-            if imm != 0 {
+        // BPF_LDX|BPF_MEM (0x60) / BPF_LDX|BPF_MEMSX (0x80) — loads of
+        // every width (#100); BPF_STX|BPF_MEM stores a register,
+        // BPF_ST|BPF_MEM stores an immediate. The low 3 bits carry the
+        // access class (1 = LDX, 2 = ST, 3 = STX), bits 3-4 the size.
+        op if (op & 0xe0 == 0x60 && (1..=3).contains(&(op & 0x07)))
+            || (op & 0xe0 == 0x80 && op & 0x07 == 0x01) =>
+        {
+            let size = match (op >> 3) & 0x3 {
+                0x0 => MemSize::W,
+                0x1 => MemSize::H,
+                0x2 => MemSize::B,
+                _ => MemSize::DW,
+            };
+            if imm != 0 && op & 0x07 != 0x02 {
                 return Err(DecodeError::ReservedFields {
-                    message: "BPF_LDX uses reserved fields",
+                    message: "memory access uses reserved fields",
                 });
             }
-            Ok(BpfInsn::LdMem {
-                dst,
-                base: src,
-                offset,
-            })
-        }
-        // BPF_STX|BPF_MEM|BPF_DW — 8-byte store to [base + off]
-        opcode::ST_STACK => {
-            if imm != 0 {
-                return Err(DecodeError::ReservedFields {
-                    message: "BPF_STX uses reserved fields",
-                });
+            let sign_extend = op & 0xe0 == 0x80;
+            match op & 0x07 {
+                0x01 => Ok(BpfInsn::LdMem {
+                    dst,
+                    base: src,
+                    offset,
+                    size,
+                    sign_extend,
+                }),
+                0x02 => Ok(BpfInsn::StMemImm {
+                    imm,
+                    base: dst,
+                    offset,
+                    size,
+                }),
+                0x03 => Ok(BpfInsn::StMem {
+                    src,
+                    base: dst,
+                    offset,
+                    size,
+                }),
+                _ => Err(DecodeError::Unsupported {
+                    op,
+                    reason: "memory access with an unsupported modifier",
+                }),
             }
-            Ok(BpfInsn::StMem {
-                src,
-                base: dst,
-                offset,
-            })
         }
         _ => {
             if let Some(reason) = unsupported_reason(op) {
@@ -891,8 +947,62 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         BpfInsn::Rsh32Reg { dst, src } => format!("w{} >>= r{}", dst, src),
         BpfInsn::Arsh32Imm { dst, imm } => format!("w{} s>>= {}", dst, imm),
         BpfInsn::Arsh32Reg { dst, src } => format!("w{} s>>= r{}", dst, src),
-        BpfInsn::LdMem { dst, base, offset } => format!("r{} = [r{}{:+}]", dst, base, offset),
-        BpfInsn::StMem { src, base, offset } => format!("[r{}{:+}] = r{}", base, offset, src),
+        BpfInsn::LdMem {
+            dst,
+            base,
+            offset,
+            size,
+            sign_extend,
+        } => format!(
+            "r{} = {}[r{}{:+}]",
+            dst,
+            match (size, sign_extend) {
+                (MemSize::B, false) => "(u8)",
+                (MemSize::H, false) => "(u16)",
+                (MemSize::W, false) => "(u32)",
+                (MemSize::DW, false) => "",
+                (MemSize::B, true) => "(s8)",
+                (MemSize::H, true) => "(s16)",
+                (MemSize::W, true) => "(s32)",
+                (MemSize::DW, true) => "",
+            },
+            base,
+            offset
+        ),
+        BpfInsn::StMem {
+            src,
+            base,
+            offset,
+            size,
+        } => format!(
+            "[r{}{:+}] = {}{}",
+            base,
+            offset,
+            match size {
+                MemSize::B => "u8 ",
+                MemSize::H => "u16 ",
+                MemSize::W => "u32 ",
+                MemSize::DW => "r",
+            },
+            src
+        ),
+        BpfInsn::StMemImm {
+            imm,
+            base,
+            offset,
+            size,
+        } => format!(
+            "[r{}{:+}] = {}{}",
+            base,
+            offset,
+            match size {
+                MemSize::B => "u8 ",
+                MemSize::H => "u16 ",
+                MemSize::W => "u32 ",
+                MemSize::DW => "",
+            },
+            imm
+        ),
         BpfInsn::Jeq { dst, src, offset } => {
             format!("if r{} == r{} goto {:+}", dst, src, offset)
         }
@@ -1005,7 +1115,9 @@ mod tests {
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW,
+                sign_extend: false
             }
         ));
         let insn = parse(opcode::LD_STACK, 0, 6, -8, 0);
@@ -1014,7 +1126,9 @@ mod tests {
             BpfInsn::LdMem {
                 dst: 0,
                 base: 6,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW,
+                sign_extend: false
             }
         ));
     }
@@ -1028,7 +1142,8 @@ mod tests {
             BpfInsn::StMem {
                 src: 1,
                 base: 10,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW
             }
         ));
         let insn = parse(opcode::ST_STACK, 6, 1, -8, 0);
@@ -1037,7 +1152,8 @@ mod tests {
             BpfInsn::StMem {
                 src: 1,
                 base: 6,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW
             }
         ));
     }
@@ -1405,14 +1521,14 @@ mod tests {
         assert_eq!(
             err,
             DecodeError::ReservedFields {
-                message: "BPF_LDX uses reserved fields"
+                message: "memory access uses reserved fields"
             }
         );
         let err = parse_insn(&insn_bytes(opcode::ST_STACK, 10, 1, -8, 1)).unwrap_err();
         assert_eq!(
             err,
             DecodeError::ReservedFields {
-                message: "BPF_STX uses reserved fields"
+                message: "memory access uses reserved fields"
             }
         );
     }
@@ -1427,7 +1543,9 @@ mod tests {
             BpfInsn::LdMem {
                 dst: 0,
                 base: 1,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW,
+                sign_extend: false
             }
         ));
         let insn = parse_insn(&insn_bytes(opcode::ST_STACK, 1, 2, -8, 0)).unwrap();
@@ -1436,7 +1554,8 @@ mod tests {
             BpfInsn::StMem {
                 src: 2,
                 base: 1,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW
             }
         ));
     }
@@ -1470,8 +1589,8 @@ mod tests {
         // every unimplemented kernel opcode class gets a structured
         // Unsupported error with a reason
         let unsupported = [
-            // BPF_ST|BPF_MEM|BPF_DW (store-immediate)
-            (0x7a, "BPF_ST"),
+            // BPF_ST|BPF_XADD (store-immediate atomic, unmapped)
+            (0xc2, "BPF_ST"),
             // BPF_JMP32|BPF_JA
             (0x06, "BPF_JMP32"),
             // BPF_ALU64|BPF_MUL|BPF_K
@@ -1484,8 +1603,8 @@ mod tests {
             (0xb4, "MOV"),
             // BPF_JMP|BPF_JSET|BPF_K
             (0x45, "BPF_JSET"),
-            // BPF_LDX|BPF_MEM|BPF_W
-            (0x61, "loads"),
+            // BPF_LD|BPF_ABS (the legacy absolute load)
+            (0x60, "BPF_LD"),
             // BPF_STX|BPF_ATOMIC|BPF_DW
             (0xdb, "stores"),
         ];
@@ -1627,7 +1746,9 @@ mod tests {
             disassemble(&BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
-                offset: -8
+                offset: -8,
+                size: MemSize::DW,
+                sign_extend: false
             }),
             "r0 = [r10-8]"
         );
@@ -1635,7 +1756,8 @@ mod tests {
             disassemble(&BpfInsn::StMem {
                 src: 2,
                 base: 10,
-                offset: -16
+                offset: -16,
+                size: MemSize::DW
             }),
             "[r10-16] = r2"
         );
@@ -1643,7 +1765,9 @@ mod tests {
             disassemble(&BpfInsn::LdMem {
                 dst: 0,
                 base: 6,
-                offset: 0
+                offset: 0,
+                size: MemSize::DW,
+                sign_extend: false
             }),
             "r0 = [r6+0]"
         );

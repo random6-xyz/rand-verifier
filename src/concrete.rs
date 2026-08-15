@@ -17,8 +17,8 @@ use crate::helper::{ArgType, HelperPrototype, helper_prototype};
 use crate::insn::{BpfInsn, disassemble};
 use crate::liveness::{Liveness, analyze};
 use crate::state::{
-    ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOT_SIZE, STACK_SLOTS, ScalarBounds,
-    StackSlot, VerifierState,
+    ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOTS, ScalarBounds, StackByte,
+    VerifierState,
 };
 use crate::tnum::Tnum;
 
@@ -81,6 +81,18 @@ pub(crate) enum ConcreteValue {
     /// `PtrToMapValueOrNull`. NULL is `Scalar(0)` — matching the
     /// abstract null refinement.
     MapPtr(u64),
+}
+
+impl ConcreteValue {
+    /// The raw 64-bit value (pointers carry their address).
+    pub(crate) fn bits(self) -> u64 {
+        match self {
+            ConcreteValue::Scalar(v) => v,
+            ConcreteValue::StackPtr(v) => v,
+            ConcreteValue::CtxPtr(v) => v,
+            ConcreteValue::MapPtr(v) => v,
+        }
+    }
 }
 
 /// Concrete register/stack state: `None` = uninitialized, mirroring the
@@ -415,20 +427,34 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
             None => matches!(abstract_reg, RegState::Uninit),
             Some(value) => abstract_covers(*abstract_reg, *value),
         })
-        && abstract_state
+        && concrete
             .stack
-            .slots
             .iter()
-            .zip(&concrete.stack)
-            .all(|(abstract_slot, value)| match (abstract_slot, value) {
-                (StackSlot::Uninit, None) => true,
-                // a variable-offset store marks slots initialized
-                // without a value — any concrete value written into
-                // them (or nothing at all, on a path that did not hit
-                // the store) is covered (unknown scalar, #87)
-                (StackSlot::Initialized, _) => true,
-                (StackSlot::Spilled(reg), Some(value)) => abstract_covers(*reg, *value),
-                _ => false,
+            .enumerate()
+            .all(|(slot, value)| match value {
+                None => abstract_state.stack.bytes[slot * 8..slot * 8 + 8]
+                    .iter()
+                    .all(|b| matches!(b, StackByte::Invalid | StackByte::Misc)),
+                Some(value) => {
+                    let bytes = &abstract_state.stack.bytes[slot * 8..slot * 8 + 8];
+                    bytes.iter().enumerate().all(|(j, b)| match b {
+                        StackByte::Misc => true,
+                        // a zero-marked byte must hold 0; the abstract
+                        // frame byte j is the concrete slot-value byte
+                        // 7 - j (little-endian: the LSB at the lowest
+                        // address)
+                        StackByte::Zero => (value.bits() >> ((7 - j) * 8)) & 0xff == 0,
+                        // a spilled register covers the concrete value
+                        StackByte::Spill => matches!(
+                            abstract_state.stack.spilled[slot],
+                            Some(reg) if abstract_covers(reg, *value)
+                        ),
+                        // never-written bytes are fabricated as zero by
+                        // the concrete merge; they are never read (the
+                        // abstract rejects every access touching them)
+                        StackByte::Invalid => (value.bits() >> ((7 - j) * 8)) & 0xff == 0,
+                    })
+                }
             })
 }
 
@@ -457,17 +483,82 @@ fn read_concrete_reg(
     }
 }
 
-/// Map an r10-relative stack offset to a slot index, mirroring the
-/// abstract `stack_slot_index` checks (#19): offsets must point into the
-/// frame (r10-512..r10-8) and be 8-byte aligned.
-fn concrete_stack_slot(pc: u32, offset: i32) -> Result<usize, ConcreteFailure> {
+/// Map an r10-relative stack access to its slot and in-slot byte
+/// offset, mirroring the abstract checks (#100): the access must point
+/// into the frame (r10-512..r10-8) and be aligned to its size.
+fn concrete_stack_range(
+    pc: u32,
+    offset: i32,
+    size: usize,
+) -> Result<(usize, usize), ConcreteFailure> {
     if offset >= 0 || offset < -(STACK_SIZE as i32) {
         return Err(ConcreteFailure::StackOutOfFrame { pc, offset });
     }
-    if offset % (STACK_SLOT_SIZE as i32) != 0 {
+    if offset.rem_euclid(size as i32) != 0 {
         return Err(ConcreteFailure::MisalignedStackAccess { pc, offset });
     }
-    Ok(((-offset) as usize - 8) / STACK_SLOT_SIZE)
+    if offset + size as i32 > 0 {
+        return Err(ConcreteFailure::StackOutOfFrame { pc, offset });
+    }
+    // the kernel's slot = (-off - 1) / 8; the in-slot position of the
+    // access's LSB (byte 0 = the lowest address of the slot)
+    let b = (-offset - 1) as usize;
+    Ok((b / 8, 7 - (b % 8)))
+}
+
+/// Merge a partial store into a slot value: the covered bytes are
+/// overwritten; the uncovered bytes keep their previous value (or zero
+/// on an unwritten slot — covered by the abstract MISC mark).
+fn concrete_merge(
+    state: &mut ConcreteState,
+    slot: usize,
+    in_slot: usize,
+    size: usize,
+    value: ConcreteValue,
+) {
+    // a full-slot aligned store preserves the value (and its pointer
+    // kind) for the round-trip (#30)
+    if in_slot == 0 && size == 8 {
+        state.stack[slot] = Some(value);
+        return;
+    }
+    let bits = size * 8;
+    let low_mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let raw = value.bits() & low_mask;
+    let existing = state.stack[slot].map(|v| v.bits()).unwrap_or(0);
+    let lo_bit = in_slot * 8;
+    let merged = (existing & !(low_mask << lo_bit)) | (raw << lo_bit);
+    state.stack[slot] = Some(ConcreteValue::Scalar(merged));
+}
+
+/// Extract the covered bytes of a slot value, zero/sign-extended to 64
+/// bits (the concrete mirror of the abstract `coerce_scalar`, #100).
+fn concrete_extract(
+    value: ConcreteValue,
+    in_slot: usize,
+    size: usize,
+    sign_extend: bool,
+) -> ConcreteValue {
+    if in_slot == 0 && size == 8 {
+        return value;
+    }
+    let bits = (size * 8) as u32;
+    let low_mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let raw = (value.bits() >> (in_slot * 8)) & low_mask;
+    let ext = if sign_extend && raw & (1u64 << (bits - 1)) != 0 {
+        (raw as i64) | (!low_mask as i64)
+    } else {
+        raw as i64
+    };
+    ConcreteValue::Scalar(ext as u64)
 }
 
 /// The exact bit-level ALU result for a width: delegates to the same
@@ -846,23 +937,55 @@ pub(crate) fn concrete_step(
         // [base + off] = rY → spill the value and its pointer kind
         // (#30); the base must be a stack pointer and the access is
         // validated at access time (#87)
-        BpfInsn::StMem { src, base, offset } => {
+        BpfInsn::StMem {
+            src,
+            base,
+            offset,
+            size,
+        } => {
             let base_value = read_concrete_reg(pc, state, *base)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
-            let slot = concrete_stack_slot(pc, offset)?;
+            let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
             let value = read_concrete_reg(pc, state, *src)?;
             let mut next = *state;
-            next.stack[slot] = Some(value);
+            concrete_merge(&mut next, slot, in_slot, size.bytes(), value);
             Ok(next)
         }
-        // rX = [base + off] → load a stack slot; a slot must have been
-        // written before it is read (write-before-read, #18). The value
-        // and its pointer kind are restored (#30).
-        BpfInsn::LdMem { dst, base, offset } => {
+        // [base + off] = imm → store an immediate (#100)
+        BpfInsn::StMemImm {
+            imm,
+            base,
+            offset,
+            size,
+        } => {
+            let base_value = read_concrete_reg(pc, state, *base)?;
+            let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
+            let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
+            let mut next = *state;
+            concrete_merge(
+                &mut next,
+                slot,
+                in_slot,
+                size.bytes(),
+                ConcreteValue::Scalar(*imm as i64 as u64),
+            );
+            Ok(next)
+        }
+        // rX = [base + off] → load the covered bytes; a slot must have
+        // been written before it is read (write-before-read, #18). The
+        // value and its pointer kind are restored for full-slot loads
+        // (#30); partial loads extract and extend (#100).
+        BpfInsn::LdMem {
+            dst,
+            base,
+            offset,
+            size,
+            sign_extend,
+        } => {
             check_concrete_reg(pc, *dst)?;
             let base_value = read_concrete_reg(pc, state, *base)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
-            let slot = concrete_stack_slot(pc, offset)?;
+            let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
             let value = match state.stack[slot] {
                 None => {
                     return Err(ConcreteFailure::UninitializedStackRead { pc, offset });
@@ -870,7 +993,8 @@ pub(crate) fn concrete_step(
                 Some(value) => value,
             };
             let mut next = *state;
-            next.regs[*dst as usize] = Some(value);
+            next.regs[*dst as usize] =
+                Some(concrete_extract(value, in_slot, size.bytes(), *sign_extend));
             Ok(next)
         }
     }
@@ -1182,7 +1306,9 @@ fn concrete_successors(
                 Some(ConcreteValue::MapPtr(map_region_base(*fd) + *offset as u64));
             Ok(vec![(pc + 1, next)])
         }
-        BpfInsn::LdMem { dst, base, offset } => {
+        BpfInsn::LdMem {
+            dst, base, offset, ..
+        } => {
             if let Some(ConcreteValue::MapPtr(_)) = state.regs[*base as usize] {
                 concrete_map_access(
                     pc,
@@ -1197,7 +1323,9 @@ fn concrete_successors(
                 Ok(vec![(pc + 1, concrete_step(pc, state, insn)?)])
             }
         }
-        BpfInsn::StMem { src, base, offset } => {
+        BpfInsn::StMem {
+            src, base, offset, ..
+        } => {
             if let Some(ConcreteValue::MapPtr(_)) = state.regs[*base as usize] {
                 concrete_map_access(
                     pc,
@@ -1456,14 +1584,13 @@ fn concrete_map_buffer(
         return Err(ConcreteFailure::UnsupportedHelperReturn { pc, imm: 0 });
     }
     let offset = (addr as i64 - STACK_BASE as i64) as i32;
-    let slot = concrete_stack_slot(pc, offset)?;
+    let (slot, in_slot) = concrete_stack_range(pc, offset, size as usize)?;
     match state.stack[slot] {
         None => Err(ConcreteFailure::UninitializedStackRead { pc, offset }),
-        Some(ConcreteValue::Scalar(v)) => Ok(match size {
-            8 => v,
-            _ => v & ((1u64 << (size * 8)) - 1),
-        }),
-        Some(_) => Err(ConcreteFailure::PointerArithmetic { pc, reg }),
+        Some(value) => match concrete_extract(value, in_slot, size as usize, false) {
+            ConcreteValue::Scalar(v) => Ok(v),
+            _ => Err(ConcreteFailure::PointerArithmetic { pc, reg }),
+        },
     }
 }
 
@@ -2015,7 +2142,9 @@ mod tests {
         // they cover both an untouched (None) and a written (Some)
         // concrete slot (#87)
         let mut abstract_state = VerifierState::initial();
-        abstract_state.stack.slots[3] = StackSlot::Initialized;
+        for b in abstract_state.stack.bytes[24..32].iter_mut() {
+            *b = StackByte::Misc;
+        }
         let mut concrete = ConcreteState::initial();
         assert!(state_covers(&abstract_state, &concrete));
         concrete.stack[3] = Some(ConcreteValue::Scalar(0));
@@ -2054,8 +2183,10 @@ mod tests {
         // abstract: slot 0 spilled with the constant 42 (a stack
         // store/load round-trip, #30); concrete: the same slot holds 42
         let mut abstract_state = VerifierState::initial();
-        abstract_state.stack.slots[0] =
-            StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(42)));
+        for b in abstract_state.stack.bytes[0..8].iter_mut() {
+            *b = StackByte::Spill;
+        }
+        abstract_state.stack.spilled[0] = Some(RegState::Scalar(ScalarBounds::constant(42)));
         let mut concrete = ConcreteState::initial();
         concrete.stack[0] = Some(ConcreteValue::Scalar(42));
 
@@ -2112,6 +2243,7 @@ mod tests {
                 src: 3,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::Call { imm: 1 },
             BpfInsn::JeqImm {
@@ -2123,6 +2255,8 @@ mod tests {
                 dst: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovImm { dst: 0, imm: 1 },
             BpfInsn::Exit,
@@ -2161,6 +2295,7 @@ mod tests {
                 src: 3,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::Call { imm: 1 },
             BpfInsn::JeqImm {
@@ -2173,11 +2308,14 @@ mod tests {
                 src: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovReg { dst: 0, src: 4 },
             BpfInsn::Exit,
@@ -2592,11 +2730,14 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         ]);
         assert_eq!(state.regs[0], Some(ConcreteValue::Scalar(42)));
@@ -2607,11 +2748,14 @@ mod tests {
                 src: 10,
                 base: 10,
                 offset: -16,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
                 offset: -16,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         ]);
         assert_eq!(state.regs[0], Some(ConcreteValue::StackPtr(STACK_BASE - 8)));
@@ -2626,6 +2770,8 @@ mod tests {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -2641,6 +2787,7 @@ mod tests {
                 src: 3,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -2657,6 +2804,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -2669,6 +2817,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -520,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -2687,6 +2836,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -7,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -3125,6 +3275,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::MovImm { dst: 0, imm: 42 },
             BpfInsn::Exit,

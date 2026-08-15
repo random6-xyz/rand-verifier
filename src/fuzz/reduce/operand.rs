@@ -302,6 +302,7 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
             used[*src as usize] = true;
         }
         BpfInsn::StMem { src, .. } => used[*src as usize] = true,
+        BpfInsn::StMemImm { .. } => {}
         BpfInsn::Jeq { dst, src, .. }
         | BpfInsn::Jne { dst, src, .. }
         | BpfInsn::Jgt { dst, src, .. }
@@ -517,6 +518,7 @@ mod tests {
                     src,
                     base: 10,
                     offset,
+                    size: crate::insn::MemSize::DW,
                 } => {
                     assert_eq!(offset, -8);
                     assert_ne!(src, 10);
@@ -525,6 +527,8 @@ mod tests {
                     dst,
                     base: 10,
                     offset,
+                    size: crate::insn::MemSize::DW,
+                    sign_extend: false,
                 } => {
                     assert_eq!(offset, -8);
                     assert_eq!(dst, 0);

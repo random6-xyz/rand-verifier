@@ -49,6 +49,11 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // "invalid indirect read from stack ... spilled ..." — the
         // kernel rejects variable-offset reads over spilled registers
         ReasonCategory::UninitRead
+    } else if msg.contains("invalid size of register fill")
+        || msg.contains("corrupt spilled pointer")
+    {
+        // the kernel's -EACCES fill/spill corruption family (#100)
+        ReasonCategory::UninitRead
     } else if msg.contains("stack access") || msg.contains("stack pointer") {
         // "stack access at r10 ... exceeds/points away",
         // "stack access at r6+0 with base offsets ...",
@@ -237,6 +242,10 @@ pub fn whitelisted(
                 // programs without a mini reason (fuzzer seeds); this name
                 // entry keeps the corpus fixture stable.
                 "stack_write_before_read" => Some(
+                    "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
+                ),
+                // the same family for the narrow-read fixture (#100)
+                "narrow_read_uninit" => Some(
                     "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
                 ),
                 _ => None,
