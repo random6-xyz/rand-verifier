@@ -111,12 +111,15 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | ldimm64_const               | `r2 = 0x1234567890abcdef; r0 = r2; exit`                          | ldimm64 64-bit constant (#89) |
 | ldimm64_map_fd              | `r1 = map_fd(1); r0 = 0; exit`                                    | CONST_PTR_TO_MAP from a map fd (#89) |
 | map_lookup_null_check       | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +2; r4 = [r0]; r0 = 1; exit; exit` | map_lookup → NULL check → value load (#89) |
+| subprog_call                 | `r1 = 5; call sub @4; r0 = r0; exit; r0 = r1; r0 += 1; exit` | BPF-to-BPF call: arg passing + return value (#100) |
+| null_alias_refinement        | `r1 = map_fd(1); r2 = r10-8; r3 = 0; [r10-8] = r3; call 1; r7 = r0; if r0 == 0 goto +3; r4 = [r7]; r0 = r4; exit; r0 = 0; exit` | NULL check on one alias refines the copy (id, #99) |
 | map_value_access            | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +4; r4 = 42; [r0] = r4; r4 = [r0]; r0 = r4; exit; exit` | map value store/load roundtrip (#89) |
 | map_update_basic            | `r1 = map_fd(1); r2 = r10-8; r3 = r10-16; [r10-8] = 0; [r10-16] = 0; call 2; r0 = 0; exit` | map_update key/value buffers (#89) |
 | computed_offset_misaligned  | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = 1; exit` | computed offset alignment tracked, not rejected (#87) |
 | computed_offset_out_of_frame | `r6 = r10; r6 += -32; call 7; r2 = r0; r3 = 255; jsle r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = 1; exit` | computed out-of-frame offset without access (#87) |
 | ctx_arith_bounded            | `r0 = 0; r1 += 1; exit`                              | ctx ADD with a sane offset (kernel PTR_TO_CTX, #90) |
 | bounded_loop                | `r0 = 0; r2 = 100; r1 = 0; r1 += 1; jlt r1, r2, -2; exit`            | bounded counter loop (100 iterations) |
+| complexity_limit              | 11 stacked diamonds (2^11 states)                   | dead-slot pruning explores all paths within the limits (#97) |
 | jne_branch               | `r1 = 5; r2 = 7; jne r1, r2, +2; r0 = 0; exit; r0 = 1; exit`  | JNE always-taken pruning        |
 | unsigned_compare         | `r1 = -1; r2 = 0; jgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | unsigned comparison (u64 view)  |
 | signed_compare           | `r1 = -1; r2 = 0; jsgt r1, r2, +2; r0 = 0; exit; r0 = 1; exit` | signed comparison (i64 view)   |
@@ -143,7 +146,6 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | uninit_register_on_path       | `jeq r10, r10, +1; r2 = 5; r0 = r2; exit`           | uninitialized register on a path    |
 | invalid_helper_argument       | `call 1; exit`                                     | helper argument type mismatch       |
 | invalid_pointer_arithmetic    | `r1 += 8; exit`                                     | context pointer arithmetic          |
-| complexity_limit              | 11 stacked diamonds (2^11 states)                   | exploration complexity limit        |
 | sub_on_pointer                | `r10 -= 8; exit`                                    | SUB on a stack pointer              |
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
 | alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |

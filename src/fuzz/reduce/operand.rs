@@ -166,7 +166,7 @@ fn apply_def(known: &mut [Option<i32>; 11], insn: &BpfInsn) {
     match insn {
         BpfInsn::MovImm { dst, imm } => known[*dst as usize] = Some(*imm),
         BpfInsn::MovReg { dst, src } => known[*dst as usize] = known[*src as usize],
-        BpfInsn::Call { .. } => {
+        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
             for slot in known.iter_mut().take(6) {
                 *slot = None;
             }
@@ -325,7 +325,11 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::JsgeImm { dst, .. }
         | BpfInsn::JsltImm { dst, .. }
         | BpfInsn::JsleImm { dst, .. } => used[*dst as usize] = true,
-        BpfInsn::Jmp { .. } | BpfInsn::Call { .. } | BpfInsn::Exit => {}
+        BpfInsn::Jmp { .. }
+        | BpfInsn::Call { .. }
+        | BpfInsn::CallSub { .. }
+        | BpfInsn::CallKfunc { .. }
+        | BpfInsn::Exit => {}
     }
 }
 

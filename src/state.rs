@@ -34,6 +34,23 @@ pub(crate) struct ScalarBounds {
     /// top of the ranges. Kept consistent with the ranges by the sync
     /// (the tnum is intersected with the range in `synced`).
     pub(crate) tnum: Tnum,
+    /// Kernel scalar precision bit (#98): false by default; set only by
+    /// precision backtracking on stored checkpoint states. Execution
+    /// never sets it (the kernel: "don't set precise flag in current
+    /// state, as precision tracking in the current state is
+    /// unnecessary"). Never participates in value comparisons — the
+    /// exactness levels ignore it (regs_exact in state_eq.rs), like the
+    /// kernel's regs_exact()/states_maybe_looping() memcmp ranges.
+    pub(crate) precise: bool,
+    /// Kernel scalar linking id (#99): registers copied from the same
+    /// source share an id, and a branch refinement of one is synced to
+    /// the others (`sync_linked_regs`). 0 = not linked. `delta` is the
+    /// constant offset of this register from the base of its link
+    /// group (the kernel's BPF_ADD_CONST + delta). The idmap check in
+    /// the state equality (state_eq.rs) requires id relationships to
+    /// be preserved across pruning.
+    pub(crate) id: u32,
+    pub(crate) delta: i32,
 }
 
 impl ScalarBounds {
@@ -49,6 +66,9 @@ impl ScalarBounds {
             u32_min: value as u64 as u32,
             u32_max: value as u64 as u32,
             tnum: Tnum::constant(value as u64),
+            precise: false,
+            id: 0,
+            delta: 0,
         }
     }
 
@@ -71,6 +91,9 @@ impl ScalarBounds {
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
+                precise: false,
+                id: 0,
+                delta: 0,
             }
         } else {
             // both interpretations are the same bit range
@@ -84,6 +107,9 @@ impl ScalarBounds {
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
+                precise: false,
+                id: 0,
+                delta: 0,
             }
         };
         bounds.synced()
@@ -117,6 +143,9 @@ impl ScalarBounds {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
+            id: 0,
+            delta: 0,
         }
     }
 
@@ -226,18 +255,24 @@ pub(crate) enum RegState {
     },
     /// A pointer into a map value (non-null) — an offset interval
     /// within the value; bounds are validated at access time against
-    /// `value_size` (#89, kernel check_map_access).
+    /// `value_size` (#89, kernel check_map_access). `id` is the lookup
+    /// identity (#99): registers derived from the same lookup share it,
+    /// so a NULL check on one refines all aliases (kernel
+    /// mark_ptr_or_null_regs).
     PtrToMapValue {
         min_offset: i32,
         max_offset: i32,
         /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
         align_off: u8,
         value_size: u32,
+        id: u32,
     },
     /// Nullable map value pointer; must pass a NULL check before use
-    /// (#27). Carries the map's value size for the refinement (#89).
+    /// (#27). Carries the map's value size for the refinement (#89)
+    /// and the lookup identity (`id`, #99).
     PtrToMapValueOrNull {
         value_size: u32,
+        id: u32,
     },
 }
 
@@ -282,7 +317,7 @@ impl std::fmt::Display for RegState {
                     )
                 }
             }
-            RegState::PtrToMapValueOrNull { value_size } => {
+            RegState::PtrToMapValueOrNull { value_size, .. } => {
                 write!(f, "PTR_MAP_VALUE_OR_NULL(sz:{})", value_size)
             }
         }
@@ -357,13 +392,51 @@ impl StackState {
 
 // ── Verifier state (v0.2 Micro) ──────────────────────────────────────────────
 
+/// Maximum number of active verifier frames (kernel MAX_CALL_FRAMES).
+pub(crate) const MAX_CALL_FRAMES: usize = 16;
+
+/// The abstract state of one verifier frame (the kernel's
+/// `bpf_func_state`, #100): registers plus stack. `ret_pc` is this
+/// frame's return address — where the execution continues when THIS
+/// frame returns (the kernel's per-frame `callsite` + 1); each frame
+/// carries its own, so nested calls return correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameState {
+    pub(crate) regs: [RegState; NUM_REGS],
+    pub(crate) stack: StackState,
+    pub(crate) ret_pc: u32,
+}
+
+impl FrameState {
+    /// A fresh frame: R10 = the frame pointer, everything else
+    /// uninitialized (the kernel's `init_func_state`).
+    pub(crate) fn new() -> Self {
+        Self {
+            regs: initial_reg_state(),
+            stack: StackState::new(),
+            ret_pc: 0,
+        }
+    }
+}
+
 /// Unified verifier state carried through instruction simulation.
 ///
-/// Holds the abstract state of all 11 registers plus the stack.
+/// `regs`/`stack` are the CURRENT (deepest) frame — the kernel's
+/// `frame[curframe]` — so every existing access site keeps meaning
+/// "the executing frame". `saved` holds the caller frames of
+/// BPF-to-BPF calls (#100): `saved[i]` is the frame at depth `i`
+/// (Some while a call is active below it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VerifierState {
     pub(crate) regs: [RegState; NUM_REGS],
     pub(crate) stack: StackState,
+    /// The caller frames of active BPF-to-BPF calls (#100).
+    pub(crate) saved: [Option<FrameState>; MAX_CALL_FRAMES - 1],
+    /// The current frame's depth (0 = the main program; the kernel's
+    /// `curframe`).
+    pub(crate) curframe: u8,
+    /// The current frame's return address (#100).
+    pub(crate) ret_pc: u32,
 }
 
 impl VerifierState {
@@ -373,7 +446,54 @@ impl VerifierState {
         Self {
             regs: initial_reg_state(),
             stack: StackState::new(),
+            saved: [None; MAX_CALL_FRAMES - 1],
+            curframe: 0,
+            ret_pc: 0,
         }
+    }
+
+    /// Enter a subprogram call (#100): save the current frame and set
+    /// up a fresh callee frame with R1..R5 as the arguments (the
+    /// kernel's `__check_func_call`). The callee-saved registers
+    /// R6..R9 of the caller survive via the saved frame.
+    pub(crate) fn call_subprog(&mut self, return_pc: u32) -> Result<(), &'static str> {
+        if self.curframe as usize >= MAX_CALL_FRAMES - 1 {
+            return Err("the call stack of 16 frames is too deep");
+        }
+        self.saved[self.curframe as usize] = Some(FrameState {
+            regs: self.regs,
+            stack: self.stack,
+            ret_pc: self.ret_pc,
+        });
+        let args: [RegState; 5] = self.regs[1..=5].try_into().unwrap();
+        self.curframe += 1;
+        let mut callee = FrameState::new();
+        callee.regs[1..=5].copy_from_slice(&args);
+        self.regs = callee.regs;
+        self.stack = callee.stack;
+        self.ret_pc = return_pc;
+        Ok(())
+    }
+
+    /// Return from a subprogram call (#100): restore the caller frame
+    /// with the callee's R0 as the return value (the kernel's
+    /// `check_func_call` return handling). The caller's argument
+    /// registers R1..R5 are clobbered by the call, like helper calls.
+    pub(crate) fn return_from_subprog(&mut self) -> Option<()> {
+        if self.curframe == 0 {
+            return None;
+        }
+        let ret = self.regs[0];
+        self.curframe -= 1;
+        let caller = self.saved[self.curframe as usize].take()?;
+        self.ret_pc = caller.ret_pc;
+        self.regs = caller.regs;
+        self.stack = caller.stack;
+        self.regs[0] = ret;
+        for r in 1..=5 {
+            self.regs[r] = RegState::Uninit;
+        }
+        Some(())
     }
 }
 
@@ -517,12 +637,17 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             }
             .to_string(),
             "PTR_MAP_VALUE(0,sz:8)"
         );
         assert_eq!(
-            RegState::PtrToMapValueOrNull { value_size: 8 }.to_string(),
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            }
+            .to_string(),
             "PTR_MAP_VALUE_OR_NULL(sz:8)"
         );
     }
@@ -605,6 +730,9 @@ mod tests {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
+            id: 0,
+            delta: 0,
         }
         .synced()
         .synced()
@@ -622,6 +750,9 @@ mod tests {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
+            id: 0,
+            delta: 0,
         }
         .synced()
         .synced()
@@ -777,7 +908,10 @@ mod tests {
         // an OrNull pointer survives spill/fill — the NULL check is still
         // required after the fill
         let mut state = VerifierState::initial();
-        state.regs[0] = RegState::PtrToMapValueOrNull { value_size: 8 };
+        state.regs[0] = RegState::PtrToMapValueOrNull {
+            value_size: 8,
+            id: 0,
+        };
         let state = step(
             0,
             &state,
@@ -800,7 +934,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             next.regs[5],
-            RegState::PtrToMapValueOrNull { value_size: 8 }
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            }
         );
     }
 

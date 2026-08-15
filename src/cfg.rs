@@ -3,15 +3,28 @@
 use crate::error::VerificationFailure;
 use crate::insn::BpfInsn;
 
-/// Collect subprogram entry points.
-///
-/// BPF-to-BPF calls (BPF_PSEUDO_CALL) are rejected at decode time
-/// (issue #56), so every program is a single subprogram: the main
-/// program at index 0. The subprogram machinery (the boundary checks
-/// in `visit_insn`) stays in place — with `subprogs == [0]` the
-/// boundaries are simply the whole program.
-pub(crate) fn add_subprog(_insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
-    Ok(vec![0u32])
+/// Collect subprogram entry points (#100): the main program at index 0
+/// plus every BPF_PSEUDO_CALL target, sorted (the kernel's
+/// `subprog_info` / find_subprog). A call target beyond the program or
+/// inside a function body (not an entry) is rejected here.
+pub fn add_subprog(insns: &[BpfInsn]) -> Result<Vec<u32>, VerificationFailure> {
+    let mut starts = vec![0u32];
+    for (pc, insn) in insns.iter().enumerate() {
+        if let BpfInsn::CallSub { offset } = insn {
+            let target = (pc as i32 + 1 + *offset) as u32;
+            if target as usize >= insns.len() {
+                return Err(VerificationFailure::new(
+                    pc as u32,
+                    format!("call target {} is out of the program", target),
+                ));
+            }
+            if !starts.contains(&target) {
+                starts.push(target);
+            }
+        }
+    }
+    starts.sort_unstable();
+    Ok(starts)
 }
 
 /// Return the [start, end) range of the subprogram that contains `insn_idx`.
@@ -48,8 +61,24 @@ pub(crate) fn visit_insn(
     let (start, end) = find_subprog_range(idx, subprogs, insn_cnt);
 
     let nexts = match &insns[idx as usize] {
-        // terminal — no successors
-        BpfInsn::Exit => vec![],
+        // the main program's exit is terminal; a subprogram's exit
+        // returns to every call site + 1 (#100)
+        BpfInsn::Exit => {
+            if start == 0 {
+                vec![]
+            } else {
+                let mut returns = Vec::new();
+                for (pc, insn) in insns.iter().enumerate() {
+                    if let BpfInsn::CallSub { offset } = insn {
+                        let target = (pc as i32 + 1 + *offset) as u32;
+                        if target == start {
+                            returns.push(pc as u32 + 1);
+                        }
+                    }
+                }
+                returns
+            }
+        }
         // unconditional jump — no fall-through
         BpfInsn::Jmp { offset } => {
             // BPF branch target is PC-relative to the next insn: idx + 1 + offset
@@ -102,8 +131,23 @@ pub(crate) fn visit_insn(
             vec![target, idx + 1]
         }
         // helper calls (imm = helper id, kernel convention) fall
-        // straight through; BPF-to-BPF calls are rejected at decode
+        // straight through
         BpfInsn::Call { .. } => vec![idx + 1],
+        // BPF-to-BPF calls: the target must be a subprogram entry
+        // (#100); the call itself falls into the callee
+        BpfInsn::CallSub { offset } => {
+            let target = (idx as i32 + 1 + *offset) as u32;
+            if !subprogs.contains(&target) {
+                return Err(VerificationFailure::new(
+                    idx,
+                    format!(
+                        "call target {} is not a subprogram entry {:?}",
+                        target, subprogs
+                    ),
+                ));
+            }
+            vec![target]
+        }
         // everything else — straight-line fall-through
         _ => vec![idx + 1],
     };
@@ -153,15 +197,15 @@ fn check_ldimm64_target(
 /// a node stays "Discovering" (gray) until all of its children are fully
 /// explored, so an edge to a gray node is exactly a back edge. Returns the
 /// loop heads (the targets of back edges) for the path exploration.
-pub(crate) fn check_cfg(
-    insns: &[BpfInsn],
-    subprogs: &[u32],
-) -> Result<Vec<u32>, VerificationFailure> {
+pub fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<Vec<u32>, VerificationFailure> {
     let insn_cnt = insns.len();
 
     // every subprogram must end with EXIT (cf. the kernel's "last insn
     // is not exit"): this is what guarantees that accepted programs
     // actually reach an exit, even when the CFG contains loops
+    if insns.is_empty() {
+        return Err(VerificationFailure::new(0, "empty program"));
+    }
     for (i, &start) in subprogs.iter().enumerate() {
         let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt as u32);
         if !matches!(insns[(end - 1) as usize], BpfInsn::Exit) {
@@ -219,80 +263,6 @@ pub(crate) fn check_cfg(
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
-
-/// The set of instructions that lie on a cycle (#90): a revisited
-/// state at one of these pcs is an infinite loop (the kernel rejects
-/// with "infinite loop detected", states.c). Computed as the union,
-/// over every back edge (a -> b), of the nodes reachable from the head
-/// `b` that can still reach the back edge's source `a`.
-pub(crate) fn compute_loop_pcs(
-    insns: &[BpfInsn],
-    subprogs: &[u32],
-    loop_heads: &[u32],
-) -> Vec<u32> {
-    // the back-edge sources: every jump/branch whose target is a loop head
-    let mut back_sources = Vec::new();
-    for (idx, _insn) in insns.iter().enumerate() {
-        let idx = idx as u32;
-        let nexts = match visit_insn(idx, insns, subprogs) {
-            Ok(nexts) => nexts,
-            Err(_) => continue,
-        };
-        for nxt in nexts {
-            if loop_heads.contains(&nxt) {
-                back_sources.push(idx);
-            }
-        }
-    }
-    let mut in_loop = vec![false; insns.len()];
-    for &head in loop_heads {
-        // nodes forward-reachable from the head
-        let mut fwd = vec![false; insns.len()];
-        let mut stack = vec![head];
-        fwd[head as usize] = true;
-        while let Some(v) = stack.pop() {
-            if let Ok(nexts) = visit_insn(v, insns, subprogs) {
-                for nxt in nexts {
-                    if !fwd[nxt as usize] {
-                        fwd[nxt as usize] = true;
-                        stack.push(nxt);
-                    }
-                }
-            }
-        }
-        // nodes backward-reachable to some back-edge source of this head
-        for &src in &back_sources {
-            let mut bwd = vec![false; insns.len()];
-            let mut stack = vec![src];
-            bwd[src as usize] = true;
-            while let Some(v) = stack.pop() {
-                for (idx, _) in insns.iter().enumerate() {
-                    let idx = idx as u32;
-                    if bwd[idx as usize] {
-                        continue;
-                    }
-                    if let Ok(nexts) = visit_insn(idx, insns, subprogs)
-                        && nexts.contains(&v)
-                    {
-                        bwd[idx as usize] = true;
-                        stack.push(idx);
-                    }
-                }
-            }
-            for (i, f) in fwd.iter().enumerate() {
-                if *f && bwd[i] {
-                    in_loop[i] = true;
-                }
-            }
-        }
-    }
-    in_loop
-        .iter()
-        .enumerate()
-        .filter(|(_, in_loop)| **in_loop)
-        .map(|(i, _)| i as u32)
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {

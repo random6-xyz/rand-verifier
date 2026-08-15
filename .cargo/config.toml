@@ -1,0 +1,6 @@
+# The verifier state grew with the multi-frame support (#100): the
+# debug build's stack frames (unoptimized 60KB states) exceed the
+# default 8MB test-thread stack in a few deep pipelines. Raise the
+# stack for all cargo invocations.
+[env]
+RUST_MIN_STACK = "33554432"

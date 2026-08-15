@@ -15,6 +15,7 @@ use crate::env::MapInfo;
 use crate::exec::{AluOp, AluWidth, CondOp, alu_const32, alu_const64, branch_target};
 use crate::helper::{ArgType, HelperPrototype, helper_prototype};
 use crate::insn::{BpfInsn, disassemble};
+use crate::liveness::{Liveness, analyze};
 use crate::state::{
     ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOT_SIZE, STACK_SLOTS, ScalarBounds,
     StackSlot, VerifierState,
@@ -89,12 +90,46 @@ pub(crate) enum ConcreteValue {
 /// value where the abstract side is uninitialized is an immediate
 /// coverage violation (#52), so no value is ever invented for an
 /// uninitialized register.
+/// One concrete verifier frame (registers + stack), #100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConcreteFrame {
+    pub(crate) regs: [Option<ConcreteValue>; NUM_REGS],
+    pub(crate) stack: [Option<ConcreteValue>; STACK_SLOTS],
+    pub(crate) ret_pc: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConcreteState {
     pub(crate) regs: [Option<ConcreteValue>; NUM_REGS],
     /// One slot per 8-byte cell of the 512-byte frame, like the abstract
     /// `StackState`.
     pub(crate) stack: [Option<ConcreteValue>; STACK_SLOTS],
+    /// The caller frames of active BPF-to-BPF calls (#100), mirroring
+    /// the abstract `VerifierState::saved` + `curframe`.
+    pub(crate) saved: [Option<ConcreteFrame>; crate::state::MAX_CALL_FRAMES - 1],
+    pub(crate) curframe: u8,
+    pub(crate) ret_pc: u32,
+}
+
+/// Clean a concrete state with its pc's liveness masks, mirroring the
+/// abstract side's `clean_state` (issue #97): registers and stack slots
+/// that are dead before `pc` are dropped, so the abstract↔concrete
+/// coverage containment holds after both sides clean their recorded
+/// states the same way. The frame pointer R10 is never cleaned (like
+/// the abstract side).
+fn clean_concrete_state(state: &mut ConcreteState, pc: u32, liveness: &Liveness) {
+    let live_regs = liveness.live_regs_before(pc);
+    for r in 0..NUM_REGS {
+        if r != 10 && live_regs & (1 << r) == 0 {
+            state.regs[r] = None;
+        }
+    }
+    let live_stack = liveness.live_stack_before(pc);
+    for i in 0..STACK_SLOTS {
+        if live_stack & (1 << i) == 0 {
+            state.stack[i] = None;
+        }
+    }
 }
 
 impl ConcreteState {
@@ -109,7 +144,52 @@ impl ConcreteState {
         Self {
             regs,
             stack: [None; STACK_SLOTS],
+            saved: [None; crate::state::MAX_CALL_FRAMES - 1],
+            curframe: 0,
+            ret_pc: 0,
         }
+    }
+
+    /// Enter a subprogram call (#100): save the current frame, set up
+    /// the callee frame with R1..R5 as the arguments.
+    pub(crate) fn call_subprog(&mut self, return_pc: u32) -> Result<(), ConcreteFailure> {
+        if self.curframe as usize >= crate::state::MAX_CALL_FRAMES - 1 {
+            return Err(ConcreteFailure::InternalError { pc: 0 });
+        }
+        self.saved[self.curframe as usize] = Some(ConcreteFrame {
+            regs: self.regs,
+            stack: self.stack,
+            ret_pc: self.ret_pc,
+        });
+        let args = self.regs[1..=5].to_vec();
+        self.curframe += 1;
+        self.regs = [None; NUM_REGS];
+        self.stack = [None; STACK_SLOTS];
+        for (i, v) in args.into_iter().enumerate() {
+            self.regs[1 + i] = v;
+        }
+        self.regs[10] = Some(ConcreteValue::StackPtr(STACK_BASE));
+        self.ret_pc = return_pc;
+        Ok(())
+    }
+
+    /// Return from a subprogram call (#100): restore the caller frame
+    /// with the callee's R0.
+    pub(crate) fn return_from_subprog(&mut self) -> Option<()> {
+        if self.curframe == 0 {
+            return None;
+        }
+        let ret = self.regs[0];
+        self.curframe -= 1;
+        let caller = self.saved[self.curframe as usize].take()?;
+        self.ret_pc = caller.ret_pc;
+        self.regs = caller.regs;
+        self.stack = caller.stack;
+        self.regs[0] = ret;
+        for r in 1..=5 {
+            self.regs[r] = None;
+        }
+        Some(())
     }
 }
 
@@ -136,6 +216,8 @@ pub(crate) enum ConcreteFailure {
     InvalidShiftAmount { pc: u32, amount: u64 },
     /// An unknown helper id (mirrors the abstract "unknown helper").
     UnknownHelper { pc: u32, imm: i32 },
+    /// A kfunc call (no BTF support, #101).
+    UnsupportedKfunc { pc: u32 },
     /// A helper argument that does not match the prototype (mirrors
     /// `check_helper_args`, #28).
     HelperArgMismatch { pc: u32, arg: u8 },
@@ -193,6 +275,9 @@ impl std::fmt::Display for ConcreteFailure {
                 write!(f, "at insn {}: invalid shift amount {}", pc, amount)
             }
             Self::UnknownHelper { pc, imm } => write!(f, "at insn {}: unknown helper {}", pc, imm),
+            Self::UnsupportedKfunc { pc } => {
+                write!(f, "at insn {}: unknown kfunc (no BTF support, #101)", pc)
+            }
             Self::HelperArgMismatch { pc, arg } => {
                 write!(
                     f,
@@ -627,7 +712,9 @@ pub(crate) fn concrete_step(
         | BpfInsn::JsgeImm { .. }
         | BpfInsn::JsltImm { .. }
         | BpfInsn::JsleImm { .. }
-        | BpfInsn::Call { .. } => {
+        | BpfInsn::Call { .. }
+        | BpfInsn::CallSub { .. }
+        | BpfInsn::CallKfunc { .. } => {
             unreachable!(
                 "exit, control flow and calls are expanded by the explorer (#51), not concrete_step()"
             )
@@ -867,17 +954,25 @@ pub(crate) fn run_concrete_with_limits(
 
 /// `run_concrete_with_limits` with the map registry (#89). Map values
 /// live in a per-run memory; ARRAY values are zero-initialized.
+///
+/// The recorded visited states are cleaned with their pc's liveness
+/// masks (like the abstract side's coverage states, #97): dead
+/// registers and dead stack slots are dropped, so the abstract↔concrete
+/// coverage containment holds after the abstract side started cleaning
+/// its stored states the same way.
 pub(crate) fn run_concrete_with_maps(
     program: &[BpfInsn],
     loop_heads: &[u32],
     limits: &ConcreteLimits,
     maps: &HashMap<u32, MapInfo>,
 ) -> Result<ConcreteRun, ConcreteFailure> {
+    let liveness = analyze(program);
     let mut mem = MapMem::default();
     let mut worklist = vec![(0u32, ConcreteState::initial())];
     // states already visited at each pc, for exact-state deduplication
     let mut visited: HashMap<u32, Vec<ConcreteState>> = HashMap::new();
-    // visit order of the distinct states — the input of #52
+    // visit order of the distinct states — the input of #52 (cleaned
+    // with the pc's liveness, mirroring the abstract coverage states)
     let mut visited_order: Vec<(u32, ConcreteState)> = Vec::new();
     // distinct re-visits per loop head (#46): exceeding the budget means
     // the loop never converges → inconclusive (concrete cannot prove
@@ -905,7 +1000,11 @@ pub(crate) fn run_concrete_with_maps(
             continue;
         }
         seen.push(state);
-        visited_order.push((pc, state));
+        // record the state cleaned with its pc's liveness (the abstract
+        // side records its coverage states the same way, #97)
+        let mut cleaned = state;
+        clean_concrete_state(&mut cleaned, pc, &liveness);
+        visited_order.push((pc, cleaned));
 
         // loop-head budget: a head that keeps producing new states is
         // not converging
@@ -935,11 +1034,19 @@ pub(crate) fn run_concrete_with_maps(
             .get(pc as usize)
             .ok_or(ConcreteFailure::InternalError { pc })?;
 
-        // a path ends at exit; R0 must hold a valid value there (mirror
-        // of the abstract "r0 is uninitialized at exit")
+        // a subprogram's exit returns to the caller (#100); the
+        // outermost exit ends the path (R0 must hold a valid value
+        // there — mirror of the abstract "r0 is uninitialized at exit")
         if matches!(insn, BpfInsn::Exit) {
             read_concrete_reg(pc, &state, 0)
                 .map_err(|_| ConcreteFailure::UninitializedRead { pc, reg: 0 })?;
+            if state.curframe > 0 {
+                let return_pc = state.ret_pc;
+                let mut returned = state;
+                returned.return_from_subprog();
+                worklist.push((return_pc, returned));
+                continue;
+            }
             // deduplicate identical exit states (e.g. converging seeds)
             if !outcomes.iter().any(|o| o.state == state) {
                 outcomes.push(ConcreteOutcome { pc, state });
@@ -976,7 +1083,22 @@ fn concrete_successors(
     mem: &mut MapMem,
 ) -> Result<Vec<(u32, ConcreteState)>, ConcreteFailure> {
     match insn {
-        BpfInsn::Exit => Ok(vec![]),
+        // a subprogram's exit returns to the caller (#100)
+        BpfInsn::Exit => {
+            if state.curframe == 0 {
+                Ok(vec![])
+            } else {
+                let mut returned = *state;
+                returned.return_from_subprog();
+                Ok(vec![(pc + 1, returned)])
+            }
+        }
+        BpfInsn::CallSub { offset } => {
+            let mut callee = *state;
+            callee.call_subprog(pc + 1)?;
+            Ok(vec![((pc as i32 + 1 + *offset) as u32, callee)])
+        }
+        BpfInsn::CallKfunc { .. } => Err(ConcreteFailure::UnsupportedKfunc { pc }),
         BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
         BpfInsn::Jeq { dst, src, offset } => {
             concrete_cond(pc, *dst, *src, *offset, CondOp::Eq, state)
@@ -1616,6 +1738,7 @@ pub(crate) fn render_coverage_report(
 mod tests {
     use super::*;
     use crate::state::ScalarBounds;
+    use crate::state_eq::clean_state;
 
     // ── concrete state model (#49) ──────────────────────────────────────
 
@@ -1787,8 +1910,12 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0,
+            },
         ];
         for reg in regs {
             for value in [
@@ -1801,7 +1928,10 @@ mod tests {
         }
         // the nullable form covers the NULL scalar 0 (#89)
         assert!(abstract_covers(
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            },
             ConcreteValue::Scalar(0)
         ));
     }
@@ -1825,6 +1955,7 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
             ConcreteValue::MapPtr(region)
         ));
@@ -1834,11 +1965,15 @@ mod tests {
                 max_offset: 0,
                 align_off: 0,
                 value_size: 8,
+                id: 0,
             },
             ConcreteValue::MapPtr(region + 8)
         ));
         assert!(abstract_covers(
-            RegState::PtrToMapValueOrNull { value_size: 8 },
+            RegState::PtrToMapValueOrNull {
+                value_size: 8,
+                id: 0
+            },
             ConcreteValue::MapPtr(region + 8)
         ));
     }
@@ -2913,12 +3048,26 @@ mod tests {
     // ── abstract↔concrete coverage checker (#52) ─────────────────────────
 
     /// The abstract states for `[r0 = 42, exit]`: initial at pc 0, a
-    /// state with `r0 = 42` at pc 1.
+    /// state with `r0 = 42` at pc 1 — cleaned with each pc's liveness
+    /// masks, exactly like the mini's coverage states (#97).
     fn abstract_states_for_constant_program(r0_at_exit: i64) -> HashMap<u32, Vec<VerifierState>> {
+        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        let liveness = analyze(&program);
         let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        abstract_states.insert(0, vec![VerifierState::initial()]);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
+        abstract_states.insert(0, vec![initial]);
         let mut at_exit = VerifierState::initial();
         at_exit.regs[0] = RegState::Scalar(ScalarBounds::constant(r0_at_exit));
+        clean_state(
+            &mut at_exit,
+            liveness.live_regs_before(1),
+            liveness.live_stack_before(1),
+        );
         abstract_states.insert(1, vec![at_exit]);
         abstract_states
     }
@@ -2948,9 +3097,17 @@ mod tests {
     fn check_coverage_detects_missing_pc() {
         let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
         let run = run_concrete(&program, &[]).unwrap();
-        // pc 1 (exit) is missing from the abstract side
+        // pc 1 (exit) is missing from the abstract side (the pc 0 entry
+        // is the cleaned initial state, like the mini's coverage map)
+        let liveness = analyze(&program);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
         let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        abstract_states.insert(0, vec![VerifierState::initial()]);
+        abstract_states.insert(0, vec![initial]);
         let violations = check_coverage(&abstract_states, &run);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].pc, 1);
@@ -2960,15 +3117,33 @@ mod tests {
 
     #[test]
     fn check_coverage_initial_mismatch() {
-        // abstract pc 0 has R0 initialized, concrete initial R0 is None
-        let program = [BpfInsn::MovImm { dst: 0, imm: 42 }, BpfInsn::Exit];
+        // abstract pc 0 has the WRONG type for a register that is live
+        // there (R1 is read by the store), the concrete has the context
+        // pointer → NotCovered at pc 0
+        let program = [
+            BpfInsn::StMem {
+                src: 1,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 42 },
+            BpfInsn::Exit,
+        ];
         let run = run_concrete(&program, &[]).unwrap();
-        let mut abstract_states = abstract_states_for_constant_program(42);
+        let liveness = analyze(&program);
         let mut wrong_initial = VerifierState::initial();
-        wrong_initial.regs[0] = RegState::Scalar(ScalarBounds::constant(0));
+        wrong_initial.regs[1] = RegState::Scalar(ScalarBounds::constant(0));
+        clean_state(
+            &mut wrong_initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
+        let mut abstract_states: HashMap<u32, Vec<VerifierState>> = HashMap::new();
         abstract_states.insert(0, vec![wrong_initial]);
         let violations = check_coverage(&abstract_states, &run);
-        assert_eq!(violations.len(), 1);
+        // pc 0 is the intended mismatch; pcs 1-2 are missed (the map
+        // only covers pc 0)
+        assert_eq!(violations.len(), 3);
         assert_eq!(violations[0].pc, 0);
         assert_eq!(violations[0].kind, CoverageKind::NotCovered);
     }
@@ -3022,9 +3197,17 @@ mod tests {
         assert!(report.contains("NOT COVERED"));
         assert!(!report.contains("ABSTRACT MISSED PC"));
 
-        // precision case: the abstract never visited pc 1
+        // precision case: the abstract never visited pc 1 (the pc 0
+        // entry is the cleaned initial state)
+        let liveness = analyze(&program);
+        let mut initial = VerifierState::initial();
+        clean_state(
+            &mut initial,
+            liveness.live_regs_before(0),
+            liveness.live_stack_before(0),
+        );
         let mut missing: HashMap<u32, Vec<VerifierState>> = HashMap::new();
-        missing.insert(0, vec![VerifierState::initial()]);
+        missing.insert(0, vec![initial]);
         let precision = check_coverage(&missing, &run);
         assert_eq!(precision.len(), 1);
         assert_eq!(precision[0].kind, CoverageKind::AbstractMissedPc);

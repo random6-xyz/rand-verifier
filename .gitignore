@@ -13,3 +13,4 @@
 
 # Fuzz campaign results (local runs only — tools/fuzz-kernel.sh)
 /fuzz-out
+.pi/

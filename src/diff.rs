@@ -227,13 +227,6 @@ pub fn whitelisted(
                 );
             }
             match name {
-                // mini's state budget is 1024 vs the kernel's limits
-                // (BPF_COMPLEXITY_LIMIT_JMP_SEQ 8192, STATES 64, INSNS —
-                // kernel/bpf/verifier.c) — an intentional design limit,
-                // not a bug
-                "complexity_limit" => {
-                    Some("mini max_states=1024 vs kernel state limits — intentional (§6)")
-                }
                 // privileged load: allow_uninit_stack is
                 // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
                 // CAP_SYS_ADMIN as a superset of every BPF capability
@@ -435,9 +428,12 @@ mod tests {
             category: ReasonCategory::Complexity,
         };
         let acc = SideVerdict::Accept;
-        // the documented mini-limit difference is whitelisted — by
-        // category, so fuzzer-generated complexity programs are treated
-        // like the corpus fixture (#90)
+        // mini's exploration budget (max_states 1024 / max_steps) vs
+        // the kernel's much larger limits is whitelisted — by category,
+        // so fuzzer-generated complexity programs are treated alike
+        // (the complexity_limit corpus fixture itself moved to accept
+        // in #97: kernel-style dead-slot pruning explores it within
+        // the limits, like the privileged kernel)
         assert!(whitelisted("complexity_limit", &rej, &acc, None).is_some());
         assert!(whitelisted("seed-1-3", &rej, &acc, None).is_some());
         // other categories under any name stay findings

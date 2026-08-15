@@ -102,6 +102,8 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         // control
         BpfInsn::Jmp { offset } => (opcode::JMP, 0, 0, *offset, 0),
         BpfInsn::Call { imm } => (opcode::CALL, 0, 0, 0, *imm),
+        BpfInsn::CallSub { offset } => (opcode::CALL, 0, 1, 0, *offset),
+        BpfInsn::CallKfunc { btf_id } => (opcode::CALL, 0, 2, 0, *btf_id),
         BpfInsn::Exit => (opcode::EXIT, 0, 0, 0, 0),
     };
     let mut b = [0u8; 8];
@@ -358,6 +360,7 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::LdMapValue { .. }
         | BpfInsn::LdImm64Second { .. } => "ldimm64",
         BpfInsn::Call { .. } => "helper",
+        BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => "subcall",
         BpfInsn::Jmp { .. } => "jmp",
         BpfInsn::Exit => "exit",
     }

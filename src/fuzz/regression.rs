@@ -101,7 +101,7 @@ fn campaign_invariants() {
     // name-whitelisted design difference) when the kernel accepts —
     // never a kernel soundness finding. Generated programs always pass
     // the nano checks, so concrete-safe rejects only exist in the
-    // corpus (e.g. unreachable, complexity_limit).
+    // corpus (e.g. unreachable, invalid_helper_argument).
     let dir = std::path::Path::new("tests/programs/reject");
     let mut gap_fixtures = 0;
     for entry in std::fs::read_dir(dir).unwrap() {

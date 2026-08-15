@@ -384,6 +384,21 @@ pub enum BpfInsn {
     Call {
         imm: i32,
     },
+    /// `BPF_PSEUDO_CALL`: a call to a subprogram (the kernel's
+    /// BPF-to-BPF calls, #100). `offset` is the pc-relative imm; the
+    /// absolute target is `pc + 1 + offset`, resolved by the cfg pass,
+    /// which also checks it is a subprogram entry.
+    CallSub {
+        offset: i32,
+    },
+    /// `BPF_PSEUDO_KFUNC_CALL`: a call to a kernel function resolved
+    /// by its BTF id (#101). The mini has no BTF support, so the
+    /// verification rejects every kfunc call ("unknown kfunc") — a
+    /// documented gap; the kernel resolves the BTF id and validates
+    /// the kfunc's arguments and return.
+    CallKfunc {
+        btf_id: i32,
+    },
     Exit,
 }
 
@@ -685,14 +700,8 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
             }
             match src {
                 0 => Ok(BpfInsn::Call { imm }),
-                1 => Err(DecodeError::Unsupported {
-                    op,
-                    reason: "BPF-to-BPF calls (BPF_PSEUDO_CALL) are not implemented",
-                }),
-                2 => Err(DecodeError::Unsupported {
-                    op,
-                    reason: "kfunc calls (BPF_PSEUDO_KFUNC_CALL) are not implemented",
-                }),
+                1 => Ok(BpfInsn::CallSub { offset: imm }),
+                2 => Ok(BpfInsn::CallKfunc { btf_id: imm }),
                 _ => Err(DecodeError::ReservedFields {
                     message: "BPF_CALL uses reserved fields",
                 }),
@@ -948,6 +957,8 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         }
         BpfInsn::Jmp { offset } => format!("goto {:+}", offset),
         BpfInsn::Call { imm } => format!("call {}", imm),
+        BpfInsn::CallSub { offset } => format!("call subprog +{}", offset),
+        BpfInsn::CallKfunc { btf_id } => format!("call kfunc#{}", btf_id),
         BpfInsn::Exit => "exit".to_string(),
     }
 }
@@ -1432,12 +1443,18 @@ mod tests {
 
     #[test]
     fn parse_insn_call_src_reg_rules() {
-        // src_reg 1/2 are BPF_PSEUDO_CALL / BPF_PSEUDO_KFUNC_CALL —
-        // valid kernel calls, not implemented here
-        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 1, 0, 7)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x85, .. }));
-        let err = parse_insn(&insn_bytes(opcode::CALL, 0, 2, 0, 7)).unwrap_err();
-        assert!(matches!(err, DecodeError::Unsupported { op: 0x85, .. }));
+        // src_reg 1 is BPF_PSEUDO_CALL — decoded as a subprogram call
+        // with the pc-relative offset (#100)
+        assert_eq!(
+            parse_insn(&insn_bytes(opcode::CALL, 0, 1, 0, 7)).unwrap(),
+            BpfInsn::CallSub { offset: 7 }
+        );
+        // src_reg 2 is BPF_PSEUDO_KFUNC_CALL — decoded as a kfunc call
+        // with the BTF id (#101)
+        assert_eq!(
+            parse_insn(&insn_bytes(opcode::CALL, 0, 2, 0, 7)).unwrap(),
+            BpfInsn::CallKfunc { btf_id: 7 }
+        );
         // src_reg 3+ is a reserved field violation
         let err = parse_insn(&insn_bytes(opcode::CALL, 0, 3, 0, 7)).unwrap_err();
         assert_eq!(
