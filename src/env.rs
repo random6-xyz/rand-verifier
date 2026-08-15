@@ -275,10 +275,13 @@ impl BpfVerifierEnv {
                     }
                     Ok(run) => {
                         report.inconclusive = run.inconclusive;
+                        report.no_exit = run.no_exit;
                         report.violations = check_coverage(&abstract_states, &run);
                         report.verdict = if run.inconclusive {
                             ConcreteVerdict::Inconclusive
-                        } else if !report.violations.is_empty() {
+                        } else if !report.violations.is_empty() || run.no_exit {
+                            // no_exit: mini accepted a program that never
+                            // reaches exit concretely — a model bug
                             ConcreteVerdict::Unsafe
                         } else {
                             ConcreteVerdict::Safe
@@ -324,6 +327,15 @@ impl BpfVerifierEnv {
                         .to_string(),
                 );
                 report.verdict = ConcreteVerdict::Inconclusive;
+            }
+            Ok(run) if run.no_exit => {
+                // every path converges into a deduplicated loop — the
+                // program never reaches an exit
+                report.no_exit = true;
+                report.reject_note = Some(
+                    "concrete cross-check: never reaches exit (non-terminating loop)".to_string(),
+                );
+                report.verdict = ConcreteVerdict::Unsafe;
             }
             Ok(_) => {
                 report.reject_note = Some(

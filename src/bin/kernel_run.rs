@@ -163,7 +163,22 @@ fn main() {
                 run_program(&path, false, false);
             }
         }
-        Some(path) => run_program(Path::new(path), dump_log || debug_log, debug_log),
+        Some(path) => {
+            // Accept multiple program files after the flags: each is
+            // loaded and reported in order.
+            let paths: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| *a != "--strict" && *a != "--log" && *a != "--log2" && *a != "--")
+                .collect();
+            if paths.len() == 1 {
+                run_program(Path::new(path), dump_log || debug_log, debug_log);
+            } else {
+                for p in paths {
+                    run_program(Path::new(p), dump_log || debug_log, debug_log);
+                }
+            }
+        }
         None => usage(),
     }
 }
