@@ -478,6 +478,24 @@ mod tests {
     }
 
     #[test]
+    fn verify_mini_base_helpers_accepted() {
+        // the kernel's bpf_base_func_proto family (no-argument scalar
+        // returns) — ktime_get_ns (5), get_smp_processor_id (8),
+        // get_numa_node_id (10), ktime_get_boot_ns (125),
+        // ktime_get_coarse_ns (160), ktime_get_tai_ns (208) — must be
+        // accepted like get_prandom_u32 (7); the kernel accepts them
+        // even under unprivileged-equivalent rules (mseed-52555-5091
+        // shape, mseed-65537-4391 socket-filter set)
+        for imm in [5, 7, 8, 10, 125, 160, 208] {
+            let program = vec![BpfInsn::Call { imm }, BpfInsn::Exit];
+            assert!(
+                verify_mini(&program, &[]).is_ok(),
+                "helper {imm} should be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn verify_mini_jmp_out_of_range() {
         // branch target beyond the program → defensive error
         let program = vec![BpfInsn::Jmp { offset: 100 }, BpfInsn::Exit];

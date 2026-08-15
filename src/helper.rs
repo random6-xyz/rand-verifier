@@ -22,6 +22,11 @@ pub(crate) struct HelperPrototype {
     pub(crate) return_type: RegState,
 }
 
+/// The register state after a helper with an unknown scalar return
+/// (the kernel's RET_INTEGER family — the full range, so every
+/// concrete return value is covered).
+const UNKNOWN_SCALAR: RegState = RegState::Scalar(ScalarBounds::unknown());
+
 /// The helper table: id → prototype (#28). The immediate of a
 /// `BPF_JMP|BPF_CALL` instruction is the helper id (kernel convention);
 /// BPF-to-BPF calls are rejected at decode time.
@@ -54,52 +59,43 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 tnum: Tnum { value: 0, mask: 0 },
             }),
         }),
-        // BPF_FUNC_get_prandom_u32: no arguments, unknown scalar
+        // BPF_FUNC_ktime_get_ns: no arguments, unknown u64 scalar
+        // (kernel RET_INTEGER, bpf_base_func_proto)
+        5 => Some(&HelperPrototype {
+            args: &[],
+            return_type: UNKNOWN_SCALAR,
+        }),
+        // BPF_FUNC_get_prandom_u32: no arguments, unknown u32 scalar
         7 => Some(&HelperPrototype {
             args: &[],
-            return_type: RegState::Scalar(ScalarBounds {
-                smin: i64::MIN,
-                smax: i64::MAX,
-                umin: 0,
-                umax: u64::MAX,
-                s32_min: i32::MIN,
-                s32_max: i32::MAX,
-                u32_min: 0,
-                u32_max: u32::MAX,
-                tnum: Tnum {
-                    value: 0,
-                    mask: 0xFFFF_FFFF_FFFF_FFFF,
-                },
-            }),
+            return_type: UNKNOWN_SCALAR,
         }),
-        // No-argument scalar-returning helpers of the socket-filter
-        // set (net/core/filter.c: sk_filter_func_proto +
-        // bpf_sk_base_func_proto): the fuzzer's mutator rewrites the
+        // BPF_FUNC_get_smp_processor_id: no arguments, unknown scalar
+        // (kernel RET_INTEGER, bpf_base_func_proto — allowed
+        // unprivileged; mseed-52555-5091/-5206/-5265)
+        8 => Some(&HelperPrototype {
+            args: &[],
+            return_type: UNKNOWN_SCALAR,
+        }),
+        // BPF_FUNC_get_numa_node_id: no arguments, unknown scalar
+        // (kernel RET_INTEGER, bpf_base_func_proto)
+        10 => Some(&HelperPrototype {
+            args: &[],
+            return_type: UNKNOWN_SCALAR,
+        }),
+        // BPF_FUNC_ktime_get_boot_ns (125), BPF_FUNC_ktime_get_coarse_ns
+        // (160), BPF_FUNC_ktime_get_tai_ns (208): no-argument
+        // scalar-returning helpers of the socket-filter set
+        // (net/core/filter.c: sk_filter_func_proto +
+        // bpf_sk_base_func_proto). The fuzzer's mutator rewrites the
         // call immediate to any helper id, and the kernel accepts every
         // helper in the set — mini must mirror the set instead of
         // reporting "unknown helper" for valid ids (campaign finding
         // mseed-65537-4391: call 8 was rejected by mini, accepted by
         // the kernel).
-        // BPF_FUNC_ktime_get_ns (5), BPF_FUNC_get_smp_processor_id (8),
-        // BPF_FUNC_ktime_get_boot_ns (125), BPF_FUNC_ktime_get_coarse_ns
-        // (160), BPF_FUNC_ktime_get_tai_ns (208): all take no arguments
-        // and return an unknown scalar, so they share one prototype.
-        5 | 8 | 125 | 160 | 208 => Some(&HelperPrototype {
+        125 | 160 | 208 => Some(&HelperPrototype {
             args: &[],
-            return_type: RegState::Scalar(ScalarBounds {
-                smin: i64::MIN,
-                smax: i64::MAX,
-                umin: 0,
-                umax: u64::MAX,
-                s32_min: i32::MIN,
-                s32_max: i32::MAX,
-                u32_min: 0,
-                u32_max: u32::MAX,
-                tnum: Tnum {
-                    value: 0,
-                    mask: 0xFFFF_FFFF_FFFF_FFFF,
-                },
-            }),
+            return_type: UNKNOWN_SCALAR,
         }),
         _ => None,
     }

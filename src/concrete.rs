@@ -2713,6 +2713,33 @@ mod tests {
     }
 
     #[test]
+    fn run_base_helper_seed_fork() {
+        // the no-argument base helpers (5, 8, 10, 125, 160, 208) fork
+        // over the same default seeds as get_prandom_u32 (7) — mirrors
+        // the abstract unknown-scalar return (mseed-52555-5091 shape,
+        // mseed-65537-4391 socket-filter set)
+        for imm in [5, 8, 10, 125, 160, 208] {
+            let program = vec![BpfInsn::Call { imm }, BpfInsn::Exit];
+            let run = run_concrete(&program, &[]).unwrap();
+            assert!(!run.inconclusive, "helper {imm}");
+            let mut r0s: Vec<Option<ConcreteValue>> =
+                run.outcomes.iter().map(|o| o.state.regs[0]).collect();
+            r0s.sort_by_key(|r| match r {
+                Some(ConcreteValue::Scalar(v)) => *v,
+                _ => u64::MAX,
+            });
+            assert_eq!(r0s.len(), 3, "helper {imm}");
+            assert_eq!(r0s[0], Some(ConcreteValue::Scalar(0)), "helper {imm}");
+            assert_eq!(r0s[1], Some(ConcreteValue::Scalar(1)), "helper {imm}");
+            assert_eq!(
+                r0s[2],
+                Some(ConcreteValue::Scalar(u64::MAX)),
+                "helper {imm}"
+            );
+        }
+    }
+
+    #[test]
     fn run_helper_call_clobbers_args() {
         let program = vec![
             BpfInsn::MovImm { dst: 2, imm: 5 },
