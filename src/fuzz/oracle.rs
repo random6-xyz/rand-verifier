@@ -201,9 +201,7 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // design behaviour even when mini's category differs
                 // (e.g. the kernel log noise hides the reason in Other)
                 if matches!(category, ReasonCategory::Loop)
-                    && mini_reason.is_some_and(|m| {
-                        m.contains("loop") || m.contains("back edge")
-                    })
+                    && mini_reason.is_some_and(|m| m.contains("loop") || m.contains("back edge"))
                 {
                     return Finding::Whitelisted;
                 }
@@ -218,7 +216,7 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // same program).
                 if *strict
                     && matches!(category, ReasonCategory::Loop)
-                    && matches!(mini, SideVerdict::Accept { .. })
+                    && matches!(mini, SideVerdict::Accept)
                 {
                     return Finding::Whitelisted;
                 }
@@ -265,22 +263,18 @@ pub fn classify_env(
     // gap, not evidence that a kernel-accepted program is unsafe —
     // exclude these from soundness candidates.
     if let Some(report) = env.concrete_report.as_ref() {
-        let unsupported = report
-            .unexpected_failure
+        let unsupported = report.unexpected_failure.as_ref().is_some_and(|f| {
+            matches!(
+                f,
+                ConcreteFailure::UnknownHelper { .. }
+                    | ConcreteFailure::UnsupportedHelperReturn { .. }
+                    | ConcreteFailure::NonStackBase { .. }
+                    | ConcreteFailure::HelperArgMismatch { .. }
+            )
+        }) || report
+            .reject_note
             .as_ref()
-            .is_some_and(|f| {
-                matches!(
-                    f,
-                    ConcreteFailure::UnknownHelper { .. }
-                        | ConcreteFailure::UnsupportedHelperReturn { .. }
-                        | ConcreteFailure::NonStackBase { .. }
-                        | ConcreteFailure::HelperArgMismatch { .. }
-                )
-            })
-            || report
-                .reject_note
-                .as_ref()
-                .is_some_and(|n| n.contains("unknown helper") || n.contains("not supported"));
+            .is_some_and(|n| n.contains("unknown helper") || n.contains("not supported"));
         if unsupported && matches!(concrete, ConcreteSide::Unsafe) {
             return Finding::Whitelisted;
         }

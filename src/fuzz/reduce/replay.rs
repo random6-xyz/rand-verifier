@@ -597,11 +597,7 @@ mod tests {
         // kernel now accepts — the finding is gone
         assert!(!inv.preserves(
             "seed-0-1",
-            &sides_of(
-                SideVerdict::Accept,
-                ConcreteSide::Safe,
-                SideVerdict::Accept
-            ),
+            &sides_of(SideVerdict::Accept, ConcreteSide::Safe, SideVerdict::Accept),
             false
         ));
         // concrete now unsafe — no longer a precision candidate

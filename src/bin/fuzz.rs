@@ -72,7 +72,11 @@ struct QemuBatch {
 }
 
 /// One kernel query: program bytes + a channel the worker replies on.
-type QemuJob = (String, Vec<u8>, std::sync::mpsc::Sender<Result<(SideVerdict, Option<String>), String>>);
+type QemuJob = (
+    String,
+    Vec<u8>,
+    std::sync::mpsc::Sender<Result<(SideVerdict, Option<String>), String>>,
+);
 
 impl QemuBatch {
     fn new(dir: PathBuf, strict: bool) -> Self {
@@ -113,7 +117,9 @@ impl QemuBatch {
 impl Drop for QemuBatch {
     fn drop(&mut self) {
         // disconnect the channel so the worker drains and exits
-        let _ = self.tx.send(("__flush__".into(), Vec::new(), std::sync::mpsc::channel().0));
+        let _ = self
+            .tx
+            .send(("__flush__".into(), Vec::new(), std::sync::mpsc::channel().0));
         let _ = self.handle.take().map(|h| h.join());
     }
 }
@@ -180,7 +186,7 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
     // clear stale results
     if let Ok(entries) = fs::read_dir(&out) {
         for e in entries.flatten() {
-            let _ = fs::remove_file(&e.path());
+            let _ = fs::remove_file(e.path());
         }
     }
     // write the batch + the run script
@@ -262,14 +268,10 @@ fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> {
             .map(|(r, _)| r)
             .unwrap_or(reason);
         let category = categorize_reason(reason);
-        return Some((
-            SideVerdict::Reject { category },
-            Some(reason.to_string()),
-        ));
+        return Some((SideVerdict::Reject { category }, Some(reason.to_string())));
     }
     None
 }
-
 
 struct Args {
     seed: u64,
@@ -381,7 +383,10 @@ fn main() -> anyhow::Result<()> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut mutations = MutStats::default();
     let mut flips: Vec<(String, String, String)> = Vec::new(); // (name, before, after)
-    let mut qemu = args.qemu_dir.as_ref().map(|d| QemuBatch::new(d.clone(), args.strict));
+    let mut qemu = args
+        .qemu_dir
+        .as_ref()
+        .map(|d| QemuBatch::new(d.clone(), args.strict));
 
     if args.mode == "mutation" {
         run_mutation_campaign(
