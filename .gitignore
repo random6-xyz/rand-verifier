@@ -6,6 +6,7 @@
 
 # Study notes and planning docs (kept local only)
 /docs
+/lab
 
 # Editor / OS junk
 .DS_Store
