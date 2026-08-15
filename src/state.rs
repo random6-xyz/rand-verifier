@@ -106,8 +106,7 @@ impl ScalarBounds {
     }
 
     /// The full range (a completely unknown value).
-    #[allow(dead_code)] // used by tests; helper returns construct it inline
-    pub(crate) fn unknown() -> Self {
+    pub(crate) const fn unknown() -> Self {
         Self {
             smin: i64::MIN,
             smax: i64::MAX,

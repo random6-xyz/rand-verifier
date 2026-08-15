@@ -19,7 +19,7 @@ impl Tnum {
     }
 
     /// A fully unknown value (every bit may be anything).
-    pub(crate) fn unknown() -> Self {
+    pub(crate) const fn unknown() -> Self {
         Self {
             value: 0,
             mask: u64::MAX,
