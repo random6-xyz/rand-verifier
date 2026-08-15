@@ -566,11 +566,6 @@ fn alu_reg(
         }
     }
     let s = read_scalar(pc, state, src)?;
-    // shifts require a provable amount below the width (kernel
-    // check_alu_op: "< 64 range, for 32-bit < 32 range")
-    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
-        check_shift_amount(pc, s, width)?;
-    }
     let next_bounds = apply_alu(op, width, d, s);
     let mut next = *state;
     next.regs[dst as usize] = RegState::Scalar(next_bounds);
@@ -1004,6 +999,24 @@ fn add_scalar_to_map_value_ptr(
 /// is re-synced (kernel reg_bounds_sync) so the two interpretations stay
 /// consistent.
 fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> ScalarBounds {
+    // Register shifts: the kernel does not reject out-of-range amounts
+    // (check_alu_op only validates *immediate* shifts); the hardware
+    // masks the amount (count & 63 / count & 31) and the kernel tracks
+    // a fully unknown result when the amount may exceed the width
+    // (scalar_min_max_lsh etc. — "if we might shift our top bit out,
+    // then we know nothing"). Mirror that: an amount outside
+    // [0, bitness) makes the result unbounded, exactly like the kernel
+    // (verified: mseed-20260815-11800/12244/13658/16476/19084/4208/6247
+    // — kernel ACCEPTs `r0 = 1; r1 = -1; r0 s>>= r1` etc.).
+    if matches!(op, AluOp::Lsh | AluOp::Rsh | AluOp::Arsh) {
+        let bitness: i64 = match width {
+            AluWidth::W64 => 64,
+            AluWidth::W32 => 32,
+        };
+        if s.smin < 0 || s.smax >= bitness {
+            return ScalarBounds::unknown();
+        }
+    }
     // exact constants propagate bit-exactly in both interpretations
     if d.is_constant() && s.is_constant() {
         let bits = match width {
@@ -1170,9 +1183,11 @@ pub(crate) fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::And => a & b,
         AluOp::Or => a | b,
         AluOp::Xor => a ^ b,
+        // hardware semantics: the shift amount is masked (count & 63),
+        // which is also what the kernel's JIT/interpreter does
         AluOp::Lsh => a.wrapping_shl(b as u32),
         AluOp::Rsh => a.wrapping_shr(b as u32),
-        AluOp::Arsh => ((a as i64) >> b) as u64,
+        AluOp::Arsh => ((a as i64) >> (b & 63)) as u64,
     }
 }
 
@@ -1187,11 +1202,10 @@ pub(crate) fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::And => a & b,
         AluOp::Or => a | b,
         AluOp::Xor => a ^ b,
-        AluOp::Lsh => a.checked_shl(b).unwrap_or(0),
-        AluOp::Rsh => a.checked_shr(b).unwrap_or(0),
-        AluOp::Arsh => (a as i32)
-            .checked_shr(b)
-            .unwrap_or(if (a as i32) < 0 { -1 } else { 0 }) as u32,
+        // hardware semantics: 32-bit shifts mask the amount (& 31)
+        AluOp::Lsh => a.wrapping_shl(b & 31),
+        AluOp::Rsh => a.wrapping_shr(b & 31),
+        AluOp::Arsh => ((a as i32) >> (b & 31)) as u32,
     };
     r as u64
 }
@@ -1200,24 +1214,6 @@ pub(crate) fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
 /// provably below the width (check_alu_op's "invalid shift": "< 64
 /// range, for 32-bit < 32 range"). Both interpretations are consulted
 /// so a diverged state cannot smuggle an invalid amount.
-fn check_shift_amount(
-    pc: u32,
-    s: ScalarBounds,
-    width: AluWidth,
-) -> Result<(), VerificationFailure> {
-    let bitness: i64 = match width {
-        AluWidth::W64 => 64,
-        AluWidth::W32 => 32,
-    };
-    if s.smin < 0 || s.smax >= bitness || s.umax >= bitness as u64 {
-        return Err(VerificationFailure::new(
-            pc,
-            format!("invalid shift amount range [{}, {}]", s.smin, s.smax),
-        ));
-    }
-    Ok(())
-}
-
 /// 64-bit signed-family range arithmetic (#39, the signed view of #40).
 ///
 /// Constants propagate exactly; ranges get a sound over-approximation
@@ -2637,17 +2633,25 @@ mod tests {
 
     #[test]
     fn step_shift_imm_out_of_range_rejected() {
-        // shifts by >= 64 or negative amounts are invalid (kernel check_alu_op)
+        // shifts by >= 64 or negative amounts are invalid (kernel
+        // check_alu_op: only *immediate* shifts are rejected)
         let state = VerifierState::initial();
         let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 1 }).unwrap();
         for imm in [64, 100, -1] {
             let err = step(0, &state, &BpfInsn::LshImm { dst: 1, imm }).unwrap_err();
             assert!(err.message.contains("invalid shift"), "imm {}", imm);
         }
-        // a register shift amount that may exceed 63 is rejected too
+        // a register shift amount that may exceed 63 is NOT rejected
+        // (kernel check_alu_op skips register shifts; the hardware
+        // masks the amount) — the result becomes unbounded instead,
+        // like the kernel's scalar_min_max_lsh
         let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 64 }).unwrap();
-        let err = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap_err();
-        assert!(err.message.contains("invalid shift"));
+        let next = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::unknown()));
+        // negative register shift amounts are unbounded too
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: -1 }).unwrap();
+        let next = step(0, &state, &BpfInsn::LshReg { dst: 1, src: 2 }).unwrap();
+        assert_eq!(next.regs[1], RegState::Scalar(ScalarBounds::unknown()));
     }
 
     #[test]

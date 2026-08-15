@@ -574,11 +574,11 @@ mod tests {
             finding: Finding::PrecisionCandidate,
             kernel_category: Some(ReasonCategory::StackBounds),
         };
-        // the same finding with the same kernel category passes
+        // the same finding (mini accepts, kernel rejects) passes
         assert!(inv.preserves(
             "seed-0-1",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
                 reject(ReasonCategory::StackBounds)
             ),
@@ -588,7 +588,7 @@ mod tests {
         assert!(!inv.preserves(
             "seed-0-1",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
                 reject(ReasonCategory::PointerArith)
             ),
@@ -598,7 +598,7 @@ mod tests {
         assert!(!inv.preserves(
             "seed-0-1",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
                 SideVerdict::Accept
             ),
@@ -608,7 +608,7 @@ mod tests {
         assert!(!inv.preserves(
             "seed-0-1",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Unsafe,
                 reject(ReasonCategory::StackBounds)
             ),
@@ -618,7 +618,7 @@ mod tests {
         assert!(!inv.preserves(
             "seed-0-1",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
                 SideVerdict::Skipped
             ),
@@ -720,10 +720,12 @@ mod tests {
             ),
             true
         ));
+        // default mode: a mini-accepting precision candidate is NOT
+        // whitelisted (the strict `!root` rules only apply in strict)
         assert!(!inv.preserves(
             "seed-1-3",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
                 reject(ReasonCategory::PointerArith)
             ),

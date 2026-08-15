@@ -35,7 +35,7 @@ use rand_verifier::fuzz::mutator::Mutator;
 use rand_verifier::fuzz::oracle::{Finding, classify_env, first_violation_pc};
 use rand_verifier::fuzz::triage::{Candidate, Divergence, Group, group};
 use rand_verifier::insn::BpfInsn;
-use rand_verifier::klog::ReasonCategory;
+use rand_verifier::klog::{ReasonCategory, categorize_reason};
 use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel};
 
 /// Share of idiom-template programs in a generation campaign — the
@@ -44,6 +44,232 @@ const IDIOM_RATIO_PERCENT: u64 = 30;
 /// Mutation-mode pool size cap: the corpus plus the most recent
 /// campaign programs.
 const POOL_CAP: usize = 200;
+/// qemu batch size: programs sent to the guest per round-trip.
+const QEMU_BATCH: usize = 100;
+
+/// The script the guest runs for one batch: verify every job file,
+/// write `out/<name>.out`, then signal completion with the
+/// `batch-done` marker.
+const QEMU_RUN_SCRIPT: &str = r###"#!/bin/sh
+STRICT=""
+[ -f /mnt/host/strict ] && STRICT="--strict"
+for f in /mnt/host/job/*.bin; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f" .bin)
+    /sbin/agent "$f" $STRICT > "/mnt/host/out/$b.out" 2>&1
+    rm -f "$f"
+done
+touch /mnt/host/batch-done
+"###;
+
+/// Batch kernel-verdict queries to the qemu guest via the 9p share:
+/// the guest's init loop picks up `job/<name>.bin`, runs the agent,
+/// and writes the verdict to `out/<name>.out`. The host polls until
+/// every result is back (or times out), then classifies.
+struct QemuBatch {
+    tx: std::sync::mpsc::Sender<QemuJob>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One kernel query: program bytes + a channel the worker replies on.
+type QemuJob = (String, Vec<u8>, std::sync::mpsc::Sender<Result<(SideVerdict, Option<String>), String>>);
+
+impl QemuBatch {
+    fn new(dir: PathBuf, strict: bool) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        let handle = std::thread::spawn(move || qemu_worker(worker_dir, strict, rx));
+        Self {
+            tx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Queue one program and block until the guest kernel verdict is
+    /// back. The worker batches queries and flushes them to the guest
+    /// every `QEMU_BATCH` jobs or ~30ms, whichever comes first.
+    fn ask(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<(SideVerdict, Option<String>, Option<u32>)> {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        self.tx.send((name.to_string(), bytes.to_vec(), rtx))?;
+        match rrx.recv()? {
+            Ok((v, m)) => Ok((v, m, None)),
+            Err(e) => Ok((SideVerdict::Skipped, Some(e), None)),
+        }
+    }
+
+    /// Flush any remaining tail batch (campaign end).
+    fn flush(&mut self) -> anyhow::Result<()> {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        self.tx.send(("__flush__".into(), Vec::new(), rtx))?;
+        rrx.recv()?.map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+}
+
+impl Drop for QemuBatch {
+    fn drop(&mut self) {
+        // disconnect the channel so the worker drains and exits
+        let _ = self.tx.send(("__flush__".into(), Vec::new(), std::sync::mpsc::channel().0));
+        let _ = self.handle.take().map(|h| h.join());
+    }
+}
+/// Worker thread: collect queries, flush them to the guest in batches,
+/// and deliver every verdict to its query channel.
+fn qemu_worker(dir: PathBuf, strict: bool, rx: std::sync::mpsc::Receiver<QemuJob>) {
+    let mut pending: Vec<QemuJob> = Vec::new();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(30)) {
+            Ok((name, bytes, resp)) => {
+                if name == "__flush__" {
+                    flush_batch(&dir, strict, &mut pending);
+                    let _ = resp.send(Ok((SideVerdict::Accept, None)));
+                } else {
+                    pending.push((name, bytes, resp));
+                    if pending.len() >= QEMU_BATCH {
+                        flush_batch(&dir, strict, &mut pending);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !pending.is_empty() {
+                    flush_batch(&dir, strict, &mut pending);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                flush_batch(&dir, strict, &mut pending);
+                break;
+            }
+        }
+    }
+}
+
+/// Send one batch to the guest and deliver the parsed verdicts.
+fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
+    if pending.is_empty() {
+        return;
+    }
+    let job = dir.join("job");
+    let out = dir.join("out");
+    let done_marker = dir.join("batch-done");
+    if fs::create_dir_all(&job).is_err() || fs::create_dir_all(&out).is_err() {
+        fail_all(pending, "qemu: cannot create share dirs");
+        return;
+    }
+    // strict mode is signalled to the guest via a marker file
+    let strict_marker = dir.join("strict");
+    if strict {
+        let _ = fs::write(&strict_marker, b"1");
+    } else {
+        let _ = fs::remove_file(&strict_marker);
+    }
+
+    // wait for the previous batch's completion marker
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while done_marker.exists() {
+        if std::time::Instant::now() > deadline {
+            eprintln!("qemu: previous batch never finished; clearing marker");
+            let _ = fs::remove_file(&done_marker);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // clear stale results
+    if let Ok(entries) = fs::read_dir(&out) {
+        for e in entries.flatten() {
+            let _ = fs::remove_file(&e.path());
+        }
+    }
+    // write the batch + the run script
+    let mut ok = true;
+    for (name, bytes, _) in pending.iter() {
+        if fs::write(job.join(format!("{name}.bin")), bytes).is_err() {
+            ok = false;
+            break;
+        }
+    }
+    if ok {
+        ok = fs::write(dir.join("run.sh"), QEMU_RUN_SCRIPT).is_ok();
+    }
+    if !ok {
+        fail_all(pending, "qemu: cannot write batch");
+        return;
+    }
+    // poll until the guest signals completion
+    let want = pending.len();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !done_marker.exists() {
+        if std::time::Instant::now() > deadline {
+            eprintln!("qemu: timeout waiting for {want} results; marking rest skipped");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = fs::remove_file(&done_marker);
+    // parse the results and reply
+    for (name, _, resp) in pending.drain(..) {
+        let p = out.join(format!("{name}.out"));
+        // the guest may still be writing the last file: retry a few
+        // times before giving up
+        let mut parsed = None;
+        for _ in 0..10 {
+            let text = fs::read_to_string(&p).unwrap_or_default();
+            if text.trim().is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            parsed = parse_agent_verdict(&text);
+            break;
+        }
+        let first_line = fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            .unwrap_or_else(|| "<no file>".into());
+        let _ = fs::remove_file(&p);
+        match parsed {
+            Some((v, m)) => {
+                let _ = resp.send(Ok((v, m)));
+            }
+            None => {
+                eprintln!("qemu: parse failure for {name}: {first_line:?}");
+                let _ = resp.send(Err("qemu: parse/read failure".into()));
+            }
+        }
+    }
+}
+
+fn fail_all(pending: &mut Vec<QemuJob>, why: &str) {
+    for (name, _, resp) in pending.drain(..) {
+        eprintln!("qemu: {why} for {name}");
+        let _ = resp.send(Err(why.into()));
+    }
+}
+
+/// Parse one agent output file: `ACCEPT` or `REJECT <reason> errno=<n>`.
+fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> {
+    let first = text.lines().find(|l| !l.trim().is_empty())?;
+    if first.trim() == "ACCEPT" {
+        return Some((SideVerdict::Accept, None));
+    }
+    let rest = first.trim();
+    if let Some(reason) = rest.strip_prefix("REJECT ") {
+        // strip the trailing "errno=<n>"
+        let reason = reason
+            .rsplit_once(" errno=")
+            .map(|(r, _)| r)
+            .unwrap_or(reason);
+        let category = categorize_reason(reason);
+        return Some((
+            SideVerdict::Reject { category },
+            Some(reason.to_string()),
+        ));
+    }
+    None
+}
+
 
 struct Args {
     seed: u64,
@@ -56,13 +282,20 @@ struct Args {
     tolerate_findings: bool,
     mode: String,
     mutate_ratio: u64,
+    /// Extra seed directories for mutation mode (raw bytecode files).
+    corpus_dirs: Vec<PathBuf>,
+    /// Generation mode: save every generated program here as `.bin`.
+    save_corpus: Option<PathBuf>,
+    /// Kernel column via the qemu guest agent (9p share dir).
+    qemu_dir: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: fuzz --seed <u64> [--iters <n>] [--min-len <n>] [--max-len <n>]\n\
          \x20            [--out-dir <dir>] [--strict] [--kernel] [--tolerate-findings]\n\
-         \x20            [--mode generation|mutation] [--mutate-ratio <0-100>]"
+         \x20            [--mode generation|mutation] [--mutate-ratio <0-100>]\n\
+         \x20            [--corpus-dir <dir>]... [--save-corpus <dir>] [--qemu-dir <dir>]"
     );
     process::exit(2);
 }
@@ -79,6 +312,9 @@ fn parse_args() -> Args {
         tolerate_findings: false,
         mode: "generation".to_string(),
         mutate_ratio: 80,
+        corpus_dirs: Vec::new(),
+        save_corpus: None,
+        qemu_dir: None,
     };
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -96,6 +332,9 @@ fn parse_args() -> Args {
             "--out-dir" => args.out_dir = value().into(),
             "--mode" => args.mode = value(),
             "--mutate-ratio" => args.mutate_ratio = value().parse().unwrap_or_else(|_| usage()),
+            "--corpus-dir" => args.corpus_dirs.push(value().into()),
+            "--save-corpus" => args.save_corpus = Some(value().into()),
+            "--qemu-dir" => args.qemu_dir = Some(value().into()),
             "--strict" => args.strict = true,
             "--kernel" => args.kernel = true,
             "--tolerate-findings" => args.tolerate_findings = true,
@@ -142,6 +381,7 @@ fn main() -> anyhow::Result<()> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut mutations = MutStats::default();
     let mut flips: Vec<(String, String, String)> = Vec::new(); // (name, before, after)
+    let mut qemu = args.qemu_dir.as_ref().map(|d| QemuBatch::new(d.clone(), args.strict));
 
     if args.mode == "mutation" {
         run_mutation_campaign(
@@ -154,6 +394,7 @@ fn main() -> anyhow::Result<()> {
             &mut candidates,
             &mut mutations,
             &mut flips,
+            qemu.as_mut(),
         )?;
     } else {
         for i in 0..args.iters {
@@ -162,7 +403,14 @@ fn main() -> anyhow::Result<()> {
             // determines the program and every rand-verifier verdict
             let mut generator = Generator::new(args.seed.wrapping_add(i as u64));
             let insns = generator.gen_mixed_program(&cfg, IDIOM_RATIO_PERCENT);
-            let out = run_program(&args, &name, &insns)?;
+            // optional corpus persistence: every generated program
+            // becomes a future mutation seed (raw bytecode, .bin)
+            if let Some(save_dir) = &args.save_corpus {
+                fs::create_dir_all(save_dir)?;
+                let bytes: Vec<u8> = insns.iter().flat_map(insn_lib::encode).collect();
+                fs::write(save_dir.join(format!("gen-{}-{}.bin", args.seed, i)), bytes)?;
+            }
+            let out = run_program(&args, &name, &insns, qemu.as_mut())?;
             handle_outcome(
                 &mut counts,
                 &mut coverage,
@@ -197,6 +445,11 @@ fn main() -> anyhow::Result<()> {
         &mutations,
         &flips,
     )?;
+
+    // flush the qemu batch tail so every kernel verdict is in
+    if let Some(qemu) = qemu.as_mut() {
+        qemu.flush()?;
+    }
 
     println!(
         "campaign done: seed {} iters {} mode {}",
@@ -247,8 +500,10 @@ fn run_mutation_campaign(
     candidates: &mut Vec<Candidate>,
     mutations: &mut MutStats,
     flips: &mut Vec<(String, String, String)>,
+    mut qemu: Option<&mut QemuBatch>,
 ) -> anyhow::Result<()> {
-    let corpus = load_corpus_seeds()?;
+    let corpus = load_corpus_seeds(args)?;
+    let corpus_len = corpus.len();
     let mut pool: Vec<(String, Vec<BpfInsn>, &'static str)> = corpus;
 
     for i in 0..args.iters {
@@ -276,7 +531,7 @@ fn run_mutation_campaign(
             (generator.gen_mixed_program(cfg, IDIOM_RATIO_PERCENT), None)
         };
 
-        let out = run_program(args, &name, &insns)?;
+        let out = run_program(args, &name, &insns, qemu.as_deref_mut())?;
 
         // a verdict flip is high-value: it exposes a boundary in the
         // verifier's reasoning — persisted separately from findings
@@ -302,11 +557,12 @@ fn run_mutation_campaign(
             }
         }
 
-        // the pool grows with campaign programs (cap keeps it bounded;
-        // the corpus entries drain first — deterministic)
+        // the pool grows with campaign programs; only the campaign
+        // tail is drained — the corpus seeds stay in the pool for the
+        // whole campaign (AGENTS.md: seed >= 1000 must be exercised)
         pool.push((name.clone(), out.insns.clone(), out.mini.name()));
-        if pool.len() > POOL_CAP {
-            pool.drain(0..pool.len() - POOL_CAP);
+        if pool.len() > corpus_len + POOL_CAP {
+            pool.drain(corpus_len..pool.len() - POOL_CAP);
         }
 
         handle_outcome(counts, coverage, findings, candidates, findings_dir, out)?;
@@ -316,7 +572,7 @@ fn run_mutation_campaign(
 
 /// The corpus fixtures as decoded mutation seeds, with their known
 /// mini verdicts ("ACCEPT" / "REJECT").
-fn load_corpus_seeds() -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str)>> {
+fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str)>> {
     let mut seeds = Vec::new();
     for (dir, verdict) in [
         ("tests/programs/accept", "ACCEPT"),
@@ -332,6 +588,39 @@ fn load_corpus_seeds() -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str
             // there is no instruction stream to mutate from
             let Ok(insns) = rand_verifier::insn::decode_program(&bytes) else {
                 continue;
+            };
+            seeds.push((
+                path.file_stem().unwrap().to_string_lossy().into_owned(),
+                insns,
+                verdict,
+            ));
+        }
+    }
+    // extra corpus directories: verdicts are computed with mini here
+    for dir in &args.corpus_dirs {
+        if !dir.is_dir() {
+            anyhow::bail!("corpus dir not found: {}", dir.display());
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            // accept `.bin` files only in extra dirs (meta files are
+            // skipped by the extension check)
+            let ext = path.extension();
+            if ext.is_none() || ext.unwrap() != "bin" {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let Ok(insns) = rand_verifier::insn::decode_program(&bytes) else {
+                continue;
+            };
+            let mut env = BpfVerifierEnv::new();
+            env.setup_prog_bytes(&bytes)?;
+            let verdict = match env.verify()? {
+                Verdict::Safe => "ACCEPT",
+                Verdict::Unsafe(_) => "REJECT",
             };
             seeds.push((
                 path.file_stem().unwrap().to_string_lossy().into_owned(),
@@ -378,7 +667,12 @@ struct Outcome {
 
 /// One program through the whole pipeline: verify (mini + concrete),
 /// optional kernel load, oracle classification.
-fn run_program(args: &Args, name: &str, insns: &[BpfInsn]) -> anyhow::Result<Outcome> {
+fn run_program(
+    args: &Args,
+    name: &str,
+    insns: &[BpfInsn],
+    qemu: Option<&mut QemuBatch>,
+) -> anyhow::Result<Outcome> {
     let bytes: Vec<u8> = insns.iter().flat_map(insn_lib::encode).collect();
 
     // rand-verifier side (mini + concrete)
@@ -397,8 +691,10 @@ fn run_program(args: &Args, name: &str, insns: &[BpfInsn]) -> anyhow::Result<Out
         }
     };
 
-    // kernel side (optional)
-    let (kernel, kernel_message, kernel_insn) = if args.kernel {
+    // kernel side: qemu guest agent (preferred) or host kernel
+    let (kernel, kernel_message, kernel_insn) = if let Some(qemu) = qemu {
+        qemu.ask(name, &bytes)?
+    } else if args.kernel {
         kernel_side_of(&load_with_kernel(&bytes))
     } else {
         (SideVerdict::Skipped, None, None)
