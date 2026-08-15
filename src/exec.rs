@@ -4,8 +4,8 @@ use crate::error::VerificationFailure;
 use crate::helper::{check_helper_args, helper_prototype};
 use crate::insn::BpfInsn;
 use crate::state::{
-    ALIGN_UNKNOWN, RegState, STACK_SIZE, STACK_SLOT_SIZE, ScalarBounds, StackSlot, VerifierState,
-    check_reg, read_reg, read_scalar,
+    ALIGN_UNKNOWN, RegState, STACK_SIZE, STACK_SLOT_SIZE, ScalarBounds, StackByte, StackState,
+    VerifierState, check_reg, read_reg, read_scalar,
 };
 use crate::tnum::Tnum;
 
@@ -198,112 +198,41 @@ pub(crate) fn step(
         BpfInsn::Arsh32Reg { dst, src } => {
             alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
-        // [base + off] = rY → spill the source's full abstract state,
-        // including pointers and scalar ranges (#30). The base must be
-        // a stack pointer; bounds and alignment are validated at access
-        // time (#87, kernel check_mem_access →
-        // check_stack_access_within_bounds). A variable-offset store
-        // only initializes the covered slots — the spill info is
-        // destroyed (kernel: "Variable offset writes destroy any spilled
-        // pointers in range").
-        BpfInsn::StMem { src, base, offset } => {
-            let base_state = read_reg(pc, state, *base)?;
-            match base_state {
-                RegState::PtrToStack { .. } => {
-                    let slots = stack_access_range(pc, *base, state, *offset)?;
-                    let src_state = read_reg(pc, state, *src)?;
-                    let mut next = *state;
-                    if slots.0 == slots.1 {
-                        // exact base: the full spilled state is preserved (#30)
-                        next.stack.slots[slots.0] = StackSlot::Spilled(src_state);
-                    } else {
-                        for slot in slots.0..=slots.1 {
-                            next.stack.slots[slot] = StackSlot::Initialized;
-                        }
-                    }
-                    Ok(next)
-                }
-                // stores into map values leave no abstract state — the
-                // concrete engine tracks the bytes (#89)
-                RegState::PtrToMapValue { .. } => {
-                    map_value_access_check(pc, *base, base_state, *offset)?;
-                    Ok(*state)
-                }
-                _ => Err(non_stack_base_error(pc, *base, "store")),
-            }
-        }
-        // rX = [base + off] → load a stack slot; a slot must have been
-        // written before it is read (write-before-read, #18). The full
-        // spilled register state is restored, pointers included (#30).
-        // A variable-offset load requires every covered slot to be
-        // initialized and rejects ranges holding spilled pointers
-        // (kernel: "invalid indirect read from stack"); the result is
-        // an unknown scalar.
-        BpfInsn::LdMem { dst, base, offset } => {
+        // [base + off] = rY → write the source's state to the stack
+        // (#100: partial widths allowed; the kernel's
+        // check_stack_write_fixed_off). The base must be a stack
+        // pointer; bounds and alignment are validated at access time
+        // (#87).
+        BpfInsn::StMem {
+            src,
+            base,
+            offset,
+            size,
+        } => stack_write(pc, *base, state, *offset, *size, Some(*src), None),
+        // [base + off] = imm → store an immediate (#100, kernel BPF_ST)
+        BpfInsn::StMemImm {
+            imm,
+            base,
+            offset,
+            size,
+        } => stack_write(pc, *base, state, *offset, *size, None, Some(*imm)),
+        // [base + off] → rY: load the covered bytes (#100; the kernel's
+        // check_stack_read_fixed_off — spills restore the full state,
+        // narrow loads of spilled scalars truncate, MISC/ZERO yield
+        // unknown/zero). Map value loads yield an unknown scalar (the
+        // bytes are tracked by the concrete engine, #89).
+        BpfInsn::LdMem {
+            dst,
+            base,
+            offset,
+            size,
+            sign_extend,
+        } => {
             check_reg(pc, *dst)?;
-            let base_state = read_reg(pc, state, *base)?;
-            match base_state {
-                RegState::PtrToStack { .. } => {
-                    let slots = stack_access_range(pc, *base, state, *offset)?;
-                    let mut next = *state;
-                    if slots.0 == slots.1 {
-                        let spilled = match next.stack.slots[slots.0] {
-                            StackSlot::Uninit => {
-                                return Err(VerificationFailure::new(
-                                    pc,
-                                    format!(
-                                        "stack slot at offset {} is uninitialized (write before read)",
-                                        offset
-                                    ),
-                                ));
-                            }
-                            StackSlot::Spilled(spilled) => spilled,
-                            StackSlot::Initialized => RegState::Scalar(ScalarBounds::unknown()),
-                        };
-                        next.regs[*dst as usize] = spilled;
-                    } else {
-                        for slot in slots.0..=slots.1 {
-                            match next.stack.slots[slot] {
-                                StackSlot::Uninit => {
-                                    return Err(VerificationFailure::new(
-                                        pc,
-                                        format!(
-                                            "stack slot at offset {} is uninitialized (write before read)",
-                                            slot_offset(slot)
-                                        ),
-                                    ));
-                                }
-                                StackSlot::Initialized => {}
-                                StackSlot::Spilled(spilled) => {
-                                    if !matches!(spilled, RegState::Scalar(_)) {
-                                        return Err(VerificationFailure::new(
-                                            pc,
-                                            format!(
-                                                "invalid indirect read from stack at r{}{:+}: spilled {} at offset {}",
-                                                base,
-                                                offset,
-                                                spilled,
-                                                slot_offset(slot)
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::unknown());
-                    }
-                    Ok(next)
-                }
-                // loads from map values yield an unknown scalar (the
-                // bytes are tracked by the concrete engine, #89)
-                RegState::PtrToMapValue { .. } => {
-                    map_value_access_check(pc, *base, base_state, *offset)?;
-                    let mut next = *state;
-                    next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::unknown());
-                    Ok(next)
-                }
-                _ => Err(non_stack_base_error(pc, *base, "load")),
-            }
+            let loaded = stack_read(pc, *base, state, *offset, *size, *sign_extend)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = loaded;
+            Ok(next)
         }
         // helper call: validate R1..R5 against the helper prototype, then
         // apply the eBPF calling convention (#28/#29): R1..R5 are
@@ -609,6 +538,44 @@ fn alu_reg(
 
 /// The base-register error for a memory access whose base is neither a
 /// stack pointer nor a map value pointer (#89).
+/// The frame-bounds failure for a stack access (#87).
+fn stack_bounds_error(
+    pc: u32,
+    base: u8,
+    offset: i16,
+    min_offset: i32,
+    max_offset: i32,
+    min_off: i64,
+) -> VerificationFailure {
+    if min_off >= 0 {
+        if base == 10 && min_offset == 0 && max_offset == 0 {
+            VerificationFailure::new(
+                pc,
+                format!(
+                    "stack access at r10{:+} points away from the frame (valid: r10-512..r10-8)",
+                    offset
+                ),
+            )
+        } else {
+            VerificationFailure::new(
+                pc,
+                format!(
+                    "stack access at r{}{:+} with base offsets {}..{} exceeds the 512 byte frame",
+                    base, offset, min_offset, max_offset
+                ),
+            )
+        }
+    } else {
+        VerificationFailure::new(
+            pc,
+            format!(
+                "stack access at r{}{:+} with base offsets {}..{} exceeds the 512 byte frame",
+                base, offset, min_offset, max_offset
+            ),
+        )
+    }
+}
+
 fn non_stack_base_error(pc: u32, reg: u8, kind: &str) -> VerificationFailure {
     VerificationFailure::new(
         pc,
@@ -759,32 +726,32 @@ fn check_map_buffer(
             ),
         ));
     }
-    // the covered slots must be initialized; spilled pointers are not
-    // readable as buffer bytes (kernel: "invalid indirect read from
-    // stack")
-    let low = (-(off + size) / STACK_SLOT_SIZE as i64) as usize;
-    let high = ((-off - 1) / STACK_SLOT_SIZE as i64) as usize;
-    for slot in low..=high {
-        match state.stack.slots[slot] {
-            StackSlot::Uninit => {
+    // the covered bytes must be initialized (MISC/ZERO); spilled bytes
+    // are not readable as buffer bytes (kernel: "invalid indirect read
+    // from stack" — check_stack_range_initialized)
+    let lo = stack_byte_index(off + size);
+    let hi = stack_byte_index(off);
+    for i in lo..=hi {
+        match state.stack.bytes[i] {
+            StackByte::Invalid => {
                 return Err(VerificationFailure::new(
                     pc,
                     format!(
                         "stack slot at offset {} is uninitialized (write before read)",
-                        slot_offset(slot)
+                        off
                     ),
                 ));
             }
-            StackSlot::Initialized => {}
-            StackSlot::Spilled(spilled) => {
-                if !matches!(spilled, RegState::Scalar(_)) {
+            StackByte::Misc | StackByte::Zero => {}
+            StackByte::Spill => {
+                // scalar spills are readable buffer bytes (kernel
+                // check_stack_range_initialized); pointers are not
+                if !matches!(state.stack.spilled[i / 8], Some(RegState::Scalar(_))) {
                     return Err(VerificationFailure::new(
                         pc,
                         format!(
-                            "invalid indirect read from stack at r{}: spilled {} at offset {}",
-                            reg,
-                            spilled,
-                            slot_offset(slot)
+                            "invalid indirect read from stack at r{}: spilled register at offset {}",
+                            reg, off
                         ),
                     ));
                 }
@@ -794,16 +761,428 @@ fn check_map_buffer(
     Ok(())
 }
 
-/// The access-time checks for `[base + off]` (#87): every possible
-/// concrete offset (the base's interval plus the fixed offset) must
-/// stay within the 512-byte frame and be 8-byte aligned; the covered
-/// slot range (inclusive) is returned. Mirrors the kernel's
-/// `check_stack_access_within_bounds` + alignment requirement.
+/// The frame byte index of an r10-relative offset (must lie in
+/// [-512, 0)): `b(o) = -o - 1`, counting from the top of the frame —
+/// byte 0 is the MSB of the slot at r10-8, byte 7 its LSB, byte 8 the
+/// MSB of the slot at r10-16 (the kernel's `slot = -off - 1`).
+fn stack_byte_index(off: i64) -> usize {
+    (-off - 1) as usize
+}
+
+/// The covered frame byte range `[lo, hi]` (inclusive, LSB of the
+/// access first) of the access `[min_off, max_off)`.
+fn stack_byte_range(min_off: i64, max_off: i64) -> (usize, usize) {
+    (stack_byte_index(max_off - 1), stack_byte_index(min_off))
+}
+
+/// Truncate a scalar to `size` bytes and extend into the 64-bit
+/// register (the kernel's `coerce_reg_to_size` + zero/sign-extension,
+/// #100): constants stay exact; non-constants keep the low-bit tnum and
+/// the width's domain.
+fn coerce_scalar(b: ScalarBounds, size: usize, sign_extend: bool) -> ScalarBounds {
+    if size >= 8 {
+        return b;
+    }
+    let bits = (size * 8) as u32;
+    let low_mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    if b.is_constant() {
+        let v = b.smin as u64 & low_mask;
+        let ext = if sign_extend && v & (1u64 << (bits - 1)) != 0 {
+            (v as i64) | (!low_mask as i64)
+        } else {
+            v as i64
+        };
+        return ScalarBounds::constant(ext);
+    }
+    if sign_extend {
+        // sign bit unknown: full range, low-bit tnum preserved
+        let mut out = ScalarBounds::unknown();
+        out.tnum = Tnum {
+            value: b.tnum.value & low_mask,
+            mask: (b.tnum.mask & low_mask) | !low_mask,
+        };
+        out
+    } else {
+        ScalarBounds {
+            smin: 0,
+            smax: low_mask as i64,
+            umin: 0,
+            umax: low_mask,
+            s32_min: 0,
+            s32_max: low_mask.min(u32::MAX as u64) as i32,
+            u32_min: 0,
+            u32_max: low_mask.min(u32::MAX as u64) as u32,
+            tnum: Tnum {
+                value: b.tnum.value & low_mask,
+                mask: (b.tnum.mask & low_mask) | !low_mask,
+            },
+            precise: b.precise,
+            id: 0,
+            delta: 0,
+        }
+    }
+}
+
+/// The kernel's stack read (check_stack_read_fixed_off, #100): loads
+/// from a full spill restore the register state; narrow loads of
+/// spilled scalars truncate; MISC/ZERO bytes yield an unknown scalar or
+/// zero; INVALID bytes are an uninitialized read; variable-offset reads
+/// over spilled slots are rejected ("invalid indirect read").
+fn stack_read(
+    pc: u32,
+    base: u8,
+    state: &VerifierState,
+    offset: i16,
+    size: crate::insn::MemSize,
+    sign_extend: bool,
+) -> Result<RegState, VerificationFailure> {
+    let base_state = read_reg(pc, state, base)?;
+    match base_state {
+        RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } => {
+            let size = size.bytes() as i64;
+            let off64 = offset as i64;
+            let min_off = min_offset as i64 + off64;
+            let max_off = max_offset as i64 + off64 + size;
+            // alignment: the access must be aligned to its size (kernel
+            // check_stack_access_within_bounds; checked before the
+            // frame bounds, like the historical model)
+            if align_off == ALIGN_UNKNOWN {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "stack pointer r{} alignment is not provable (computed offsets must be {}-byte aligned)",
+                        base, size
+                    ),
+                ));
+            }
+            if (align_off as i64 + off64).rem_euclid(size) != 0 || min_off.rem_euclid(size) != 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "stack access at r{}{:+} is not {}-byte aligned",
+                        base, offset, size
+                    ),
+                ));
+            }
+            // frame bounds
+            if min_off < -(STACK_SIZE as i64) || max_off > 0 {
+                return Err(stack_bounds_error(
+                    pc, base, offset, min_offset, max_offset, min_off,
+                ));
+            }
+            let (lo, hi) = stack_byte_range(min_off, max_off);
+            if min_offset == max_offset {
+                // a fixed access: single position
+                fixed_stack_read(
+                    pc,
+                    base,
+                    offset,
+                    &state.stack,
+                    lo,
+                    hi,
+                    min_off,
+                    size,
+                    sign_extend,
+                )
+            } else {
+                // variable-offset read: every covered byte must be
+                // MISC/ZERO (SPILL is rejected — the kernel's "invalid
+                // variable-offset read from stack")
+                let mut unknown = false;
+                for i in lo..=hi {
+                    match state.stack.bytes[i] {
+                        StackByte::Invalid => {
+                            return Err(VerificationFailure::new(
+                                pc,
+                                format!(
+                                    "stack access at r{}{:+} with base offsets {}..{} reads uninitialized stack",
+                                    base, offset, min_offset, max_offset
+                                ),
+                            ));
+                        }
+                        StackByte::Misc | StackByte::Zero => unknown = true,
+                        StackByte::Spill => {
+                            // scalar spills are readable bytes (kernel
+                            // check_stack_range_initialized); pointers
+                            // are not ("invalid indirect read")
+                            match state.stack.spilled[i / 8] {
+                                Some(RegState::Scalar(_)) => unknown = true,
+                                _ => {
+                                    return Err(VerificationFailure::new(
+                                        pc,
+                                        format!(
+                                            "invalid indirect read from stack at r{}{:+}: spilled register in the covered range",
+                                            base, offset
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(RegState::Scalar(if unknown {
+                    ScalarBounds::unknown()
+                } else {
+                    ScalarBounds::constant(0)
+                }))
+            }
+        }
+        // loads from map values yield an unknown scalar (the bytes are
+        // tracked by the concrete engine, #89)
+        RegState::PtrToMapValue { .. } => {
+            map_value_access_check(pc, base, base_state, offset)?;
+            Ok(RegState::Scalar(ScalarBounds::unknown()))
+        }
+        _ => Err(non_stack_base_error(pc, base, "load")),
+    }
+}
+
+/// A fixed-position stack read: the kernel's spill branch
+/// (check_stack_read_fixed_off, #100). A full 8-byte load of a
+/// spilled slot restores the register; a narrow fill at the slot's LSB
+/// (8-byte aligned) truncates a spilled scalar (the kernel's
+/// `bpf_stack_narrow_access_ok`); anything else walks the covered
+/// bytes — spilled bytes count as unknown unless the whole access is
+/// a constant-zero spill, all-ZERO reads are zero, and INVALID bytes
+/// are an uninitialized read.
+#[allow(clippy::too_many_arguments)]
+fn fixed_stack_read(
+    pc: u32,
+    base: u8,
+    offset: i16,
+    stack: &StackState,
+    lo: usize,
+    hi: usize,
+    min_off: i64,
+    size: i64,
+    sign_extend: bool,
+) -> Result<RegState, VerificationFailure> {
+    let slot = hi / 8;
+    let all = |b: StackByte| stack.bytes[lo..=hi].iter().all(|x| *x == b);
+    if all(StackByte::Spill)
+        && let Some(spilled) = stack.spilled[slot]
+    {
+        // full-slot load: the register is restored as-is
+        if size == 8 {
+            return Ok(spilled);
+        }
+        // narrow fill: scalars only, at the slot's LSB (the
+        // kernel: "invalid size of register fill" otherwise)
+        if min_off.rem_euclid(8) == 0 {
+            let RegState::Scalar(b) = spilled else {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "invalid size of register fill at r{}{:+}: spilled {}",
+                        base, offset, spilled
+                    ),
+                ));
+            };
+            return Ok(RegState::Scalar(coerce_scalar(
+                b,
+                size as usize,
+                sign_extend,
+            )));
+        }
+    }
+    // the byte walk (the kernel's spill_cnt/zero_cnt logic)
+    let mut spill_cnt = 0usize;
+    let mut zero_cnt = 0usize;
+    let mut invalid = None;
+    for i in lo..=hi {
+        match stack.bytes[i] {
+            StackByte::Spill => spill_cnt += 1,
+            StackByte::Zero => zero_cnt += 1,
+            StackByte::Misc => {}
+            StackByte::Invalid => {
+                invalid = Some(());
+                break;
+            }
+        }
+    }
+    if invalid.is_some() {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "stack slot at offset {} is uninitialized (write before read)",
+                offset
+            ),
+        ));
+    }
+    let n = hi - lo + 1;
+    let constant_zero_spill = spill_cnt == n
+        && matches!(stack.spilled[slot], Some(RegState::Scalar(b)) if b.is_constant() && b.smin == 0);
+    if zero_cnt == n || constant_zero_spill {
+        Ok(RegState::Scalar(ScalarBounds::constant(0)))
+    } else {
+        Ok(RegState::Scalar(ScalarBounds::unknown()))
+    }
+}
+
+/// The kernel's stack write (check_stack_write_fixed_off, #100): full
+/// 8-byte aligned stores spill the register (or record STACK_ZERO for
+/// zero values); partial writes scrub the covered bytes to MISC (or
+/// ZERO for the immediate 0) and destroy spill metadata; a partial
+/// write of a pointer is rejected ("invalid size of register spill").
+fn stack_write(
+    pc: u32,
+    base: u8,
+    state: &VerifierState,
+    offset: i16,
+    size: crate::insn::MemSize,
+    src: Option<u8>,
+    imm: Option<i32>,
+) -> Result<VerifierState, VerificationFailure> {
+    let base_state = read_reg(pc, state, base)?;
+    match base_state {
+        RegState::PtrToStack {
+            min_offset,
+            max_offset,
+            align_off,
+        } => {
+            let size = size.bytes() as i64;
+            let off64 = offset as i64;
+            let min_off = min_offset as i64 + off64;
+            let max_off = max_offset as i64 + off64 + size;
+            if align_off == ALIGN_UNKNOWN {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "stack pointer r{} alignment is not provable (computed offsets must be {}-byte aligned)",
+                        base, size
+                    ),
+                ));
+            }
+            if (align_off as i64 + off64).rem_euclid(size) != 0 || min_off.rem_euclid(size) != 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "stack access at r{}{:+} is not {}-byte aligned",
+                        base, offset, size
+                    ),
+                ));
+            }
+            if min_off < -(STACK_SIZE as i64) || max_off > 0 {
+                return Err(stack_bounds_error(
+                    pc, base, offset, min_offset, max_offset, min_off,
+                ));
+            }
+            let (lo, hi) = stack_byte_range(min_off, max_off);
+            let mut next = *state;
+            let fixed = min_offset == max_offset;
+            // the stored value is read after the access checks (kernel
+            // check_stack_write_fixed_off); the corrupt-spill check for
+            // partial writes runs before the read
+            let value: Option<RegState> = if fixed && min_off.rem_euclid(8) == 0 {
+                match src {
+                    Some(s) => Some(read_reg(pc, state, s)?),
+                    None => Some(RegState::Scalar(ScalarBounds::constant(
+                        imm.expect("an immediate store carries an imm") as i64,
+                    ))),
+                }
+            } else {
+                // partial or variable-offset write: the kernel's "attempt
+                // to corrupt spilled pointer on stack" check first
+                for s in lo / 8..=hi / 8 {
+                    if let Some(v) = next.stack.spilled[s]
+                        && !matches!(v, RegState::Scalar(_))
+                    {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            format!(
+                                "attempt to corrupt spilled pointer on stack at r{}{:+} (spilled {} at slot {})",
+                                base, offset, v, s
+                            ),
+                        ));
+                    }
+                }
+                match src {
+                    Some(s) => Some(read_reg(pc, state, s)?),
+                    None => Some(RegState::Scalar(ScalarBounds::constant(
+                        imm.expect("an immediate store carries an imm") as i64,
+                    ))),
+                }
+            };
+            if fixed && min_off.rem_euclid(8) == 0 {
+                // an aligned store: a `size`-byte spill anchored at the
+                // slot's LSB (kernel save_register_state: the low
+                // `size` bytes become STACK_SPILL, the rest of the slot
+                // STACK_MISC). Pointers require the full 8 bytes
+                // ("invalid size of register spill").
+                if let Some(v) = value
+                    && !matches!(v, RegState::Scalar(_))
+                    && size != 8
+                {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "invalid size of register spill at r{}{:+}: cannot spill {} partially",
+                            base, offset, v
+                        ),
+                    ));
+                }
+                let slot = hi / 8;
+                for i in lo..=hi {
+                    next.stack.bytes[i] = StackByte::Spill;
+                }
+                // the rest of the slot is initialized-but-unknown
+                // (kernel mark_stack_slot_misc)
+                for i in slot * 8..lo {
+                    next.stack.bytes[i] = StackByte::Misc;
+                }
+                if let Some(v) = value {
+                    next.stack.spilled[slot] = Some(v);
+                }
+                return Ok(next);
+            }
+            // partial or variable-offset write: the kernel's else
+            // branch — the covered bytes become MISC (or ZERO for zero
+            // values). The spilled register is kept — reads of the
+            // untouched bytes still see it (the kernel never clears
+            // spilled_ptr).
+            let zero = match value {
+                Some(RegState::Scalar(b)) => b.is_constant() && b.smin == 0,
+                _ => false,
+            };
+            for i in lo..=hi {
+                next.stack.bytes[i] = if zero {
+                    StackByte::Zero
+                } else {
+                    StackByte::Misc
+                };
+            }
+            Ok(next)
+        }
+        // stores into map values leave no abstract state — the concrete
+        // engine tracks the bytes (#89)
+        RegState::PtrToMapValue { .. } => {
+            map_value_access_check(pc, base, base_state, offset)?;
+            Ok(*state)
+        }
+        _ => Err(non_stack_base_error(pc, base, "store")),
+    }
+}
+
+/// The covered slot range (inclusive) of `[base + off]` of the given
+/// size, after the access-time checks (#87/#100): every possible
+/// concrete offset must stay within the 512-byte frame and be
+/// size-aligned. Mirrors the kernel's `check_stack_access_within_bounds`
+/// and alignment requirement. Used by the backtracking machinery (the
+/// covered slots of a stack access).
 pub(crate) fn stack_access_range(
     pc: u32,
     base: u8,
     state: &VerifierState,
     off: i16,
+    size: usize,
 ) -> Result<(usize, usize), VerificationFailure> {
     let RegState::PtrToStack {
         min_offset,
@@ -815,21 +1194,24 @@ pub(crate) fn stack_access_range(
     };
     let off64 = off as i64;
     let min_off = min_offset as i64 + off64;
-    let max_off = max_offset as i64 + off64 + STACK_SLOT_SIZE as i64;
-    // alignment: every possible concrete offset must be 8-byte aligned
+    let max_off = max_offset as i64 + off64 + size as i64;
+    // alignment: every possible concrete offset must be size-aligned
     if align_off == ALIGN_UNKNOWN {
         return Err(VerificationFailure::new(
             pc,
             format!(
-                "stack pointer r{} alignment is not provable (computed offsets must be 8-byte aligned)",
-                base
+                "stack pointer r{} alignment is not provable (computed offsets must be {}-byte aligned)",
+                base, size
             ),
         ));
     }
-    if (align_off as i32 + off.rem_euclid(8) as i32).rem_euclid(8) != 0 {
+    if (align_off as i64 + off64).rem_euclid(size as i64) != 0 {
         return Err(VerificationFailure::new(
             pc,
-            format!("stack access at r{}{:+} is not 8-byte aligned", base, off),
+            format!(
+                "stack access at r{}{:+} is not {}-byte aligned",
+                base, off, size
+            ),
         ));
     }
     // bounds: the whole access range must lie within [-512, 0)
@@ -874,11 +1256,6 @@ pub(crate) fn stack_access_range(
     let low = (-max_off / STACK_SLOT_SIZE as i64) as usize;
     let high = ((-min_off - 1) / STACK_SLOT_SIZE as i64) as usize;
     Ok((low, high))
-}
-
-/// The r10-relative offset of a stack slot index.
-fn slot_offset(slot: usize) -> i32 {
-    -(((slot + 1) * STACK_SLOT_SIZE) as i32)
 }
 
 /// `PtrToStack + ScalarRange` (#87): the offset interval is widened by
@@ -2131,27 +2508,34 @@ fn sync_linked_scalars(state: &mut VerifierState, id: u32, known_delta: i32, kno
         shifted.delta = b.delta;
         *b = shifted;
     }
-    for slot in state.stack.slots.iter_mut() {
-        let StackSlot::Spilled(RegState::Scalar(b)) = slot else {
-            continue;
-        };
-        if b.id != id {
-            continue;
+    for (slot, spilled) in state.stack.spilled.iter_mut().enumerate() {
+        if let Some(RegState::Scalar(b)) = spilled {
+            if b.id != id {
+                continue;
+            }
+            // only fully spilled slots take part in the sync (a partial
+            // write destroyed the spill metadata)
+            if state.stack.bytes[slot * 8..slot * 8 + 8]
+                .iter()
+                .any(|x| *x != StackByte::Spill)
+            {
+                continue;
+            }
+            let shift = (b.delta as i64) - (known_delta as i64);
+            let mut shifted = if shift == 0 {
+                known
+            } else {
+                apply_alu(
+                    AluOp::Add,
+                    AluWidth::W64,
+                    known,
+                    ScalarBounds::constant(shift),
+                )
+            };
+            shifted.id = b.id;
+            shifted.delta = b.delta;
+            *spilled = Some(RegState::Scalar(shifted));
         }
-        let shift = (b.delta as i64) - (known_delta as i64);
-        let mut shifted = if shift == 0 {
-            known
-        } else {
-            apply_alu(
-                AluOp::Add,
-                AluWidth::W64,
-                known,
-                ScalarBounds::constant(shift),
-            )
-        };
-        shifted.id = b.id;
-        shifted.delta = b.delta;
-        *slot = StackSlot::Spilled(RegState::Scalar(shifted));
     }
 }
 
@@ -2251,12 +2635,14 @@ fn cond_branch_impl(
                             *reg = RegState::Scalar(ScalarBounds::constant(0));
                         }
                     }
-                    for slot in null_state.stack.slots.iter_mut() {
-                        if let StackSlot::Spilled(RegState::PtrToMapValueOrNull { id: rid, .. }) =
-                            slot
+                    for (slot, spilled) in null_state.stack.spilled.iter_mut().enumerate() {
+                        if let Some(RegState::PtrToMapValueOrNull { id: rid, .. }) = spilled
                             && *rid == id
+                            && null_state.stack.bytes[slot * 8..slot * 8 + 8]
+                                .iter()
+                                .all(|x| *x == StackByte::Spill)
                         {
-                            *slot = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+                            *spilled = Some(RegState::Scalar(ScalarBounds::constant(0)));
                         }
                     }
                     for reg in valid.regs.iter_mut() {
@@ -2275,14 +2661,17 @@ fn cond_branch_impl(
                             };
                         }
                     }
-                    for slot in valid.stack.slots.iter_mut() {
-                        if let StackSlot::Spilled(RegState::PtrToMapValueOrNull {
+                    for (slot, spilled) in valid.stack.spilled.iter_mut().enumerate() {
+                        if let Some(RegState::PtrToMapValueOrNull {
                             value_size: vs,
                             id: rid,
-                        }) = slot
+                        }) = spilled
                             && *rid == id
+                            && valid.stack.bytes[slot * 8..slot * 8 + 8]
+                                .iter()
+                                .all(|x| *x == StackByte::Spill)
                         {
-                            *slot = StackSlot::Spilled(RegState::PtrToMapValue {
+                            *spilled = Some(RegState::PtrToMapValue {
                                 min_offset: 0,
                                 max_offset: 0,
                                 align_off: 0,
@@ -2377,6 +2766,14 @@ fn cond_branch_impl(
 
 #[cfg(test)]
 mod tests {
+
+    /// Test helper: mark a full 8-byte slot as a spill of `reg`.
+    fn spill_full(state: &mut VerifierState, slot: usize, reg: RegState) {
+        for b in state.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+            *b = StackByte::Spill;
+        }
+        state.stack.spilled[slot] = Some(reg);
+    }
     use super::*;
     use crate::insn::*;
     use crate::state::*;
@@ -3259,6 +3656,7 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -3269,6 +3667,8 @@ mod tests {
                 dst: 3,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap();
@@ -4025,6 +4425,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -4050,6 +4452,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -4062,6 +4466,7 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -4,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -4084,6 +4489,8 @@ mod tests {
                 dst: 3,
                 base: 1,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -4095,6 +4502,7 @@ mod tests {
                 src: 2,
                 base: 1,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap_err();
@@ -4116,6 +4524,7 @@ mod tests {
                 src: 2,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -4126,6 +4535,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap();
@@ -4150,17 +4561,14 @@ mod tests {
                 src: 2,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
         for slot in 0..=31 {
-            assert_eq!(
-                next.stack.slots[slot],
-                StackSlot::Initialized,
-                "slot {slot}"
-            );
+            assert_eq!(next.stack.bytes[slot * 8], StackByte::Misc, "slot {slot}");
         }
-        assert_eq!(next.stack.slots[32], StackSlot::Uninit);
+        assert_eq!(next.stack.bytes[32 * 8], StackByte::Invalid);
         // an exact load from a covered slot yields an unknown scalar
         let loaded = step(
             1,
@@ -4169,6 +4577,8 @@ mod tests {
                 dst: 3,
                 base: 10,
                 offset: -16,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap();
@@ -4190,6 +4600,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -4209,6 +4621,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -4225,6 +4638,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -4244,6 +4659,7 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -4254,6 +4670,7 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -16,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -4270,6 +4687,8 @@ mod tests {
                 dst: 3,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap();
@@ -5375,7 +5794,7 @@ mod tests {
             value_size: 8,
         };
         state.regs[2] = ptr_stack(-8);
-        state.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+        spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
         let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         assert_eq!(
             next.regs[0],
@@ -5408,8 +5827,8 @@ mod tests {
         state.regs[2] = ptr_stack(-8);
         state.regs[3] = ptr_stack(-16);
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
-        state.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
-        state.stack.slots[1] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+        spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
+        spill_full(&mut state, 1, RegState::Scalar(ScalarBounds::constant(0)));
         let next = step(0, &state, &BpfInsn::Call { imm: 2 }).unwrap();
         assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
     }
@@ -5423,7 +5842,7 @@ mod tests {
             value_size: 8,
         };
         state.regs[2] = ptr_stack(-8);
-        state.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+        spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
         let err = step(0, &state, &BpfInsn::Call { imm: 2 }).unwrap_err();
         assert!(err.message.contains("uninitialized"));
     }
@@ -5440,7 +5859,7 @@ mod tests {
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("uninitialized"), "{}", err.message);
         // a spilled pointer is not readable as a key buffer
-        state.stack.slots[0] = StackSlot::Spilled(RegState::PtrToCtx);
+        spill_full(&mut state, 0, RegState::PtrToCtx);
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("indirect read"), "{}", err.message);
     }
@@ -5486,6 +5905,8 @@ mod tests {
                 dst: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap();
@@ -5497,6 +5918,8 @@ mod tests {
                 dst: 4,
                 base: 0,
                 offset: 8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -5508,6 +5931,8 @@ mod tests {
                 dst: 4,
                 base: 0,
                 offset: -1,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -5525,6 +5950,7 @@ mod tests {
                 src: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
         )
         .unwrap();
@@ -5549,6 +5975,8 @@ mod tests {
                 dst: 4,
                 base: 0,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
         )
         .unwrap_err();
@@ -5617,7 +6045,7 @@ mod tests {
             value_size: 8,
         };
         state.regs[2] = ptr_stack(-8);
-        state.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+        spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(1));
         state.regs[4] = RegState::Scalar(ScalarBounds::constant(2));
         state.regs[5] = RegState::Scalar(ScalarBounds::constant(3));

@@ -6,7 +6,7 @@ use crate::error::VerificationFailure;
 use crate::exec::successors;
 use crate::insn::BpfInsn;
 use crate::liveness::{Liveness, analyze};
-use crate::state::{RegState, StackSlot, VerifierState, read_reg};
+use crate::state::{RegState, VerifierState, read_reg};
 use crate::state_eq::{ExactLevel, clean_state, states_equal, states_maybe_looping};
 
 /// Bounds for the exploration (#32, #46): exceeding any of them rejects
@@ -240,6 +240,14 @@ fn backtrack_insn(
                 }
             }
         }
+        // `[base+off] = K`: the constant resolves the requirement
+        BpfInsn::StMemImm { .. } => {
+            if let Some((lo, hi)) = slots {
+                for s in lo..=hi {
+                    bt.slots &= !(1u64 << s);
+                }
+            }
+        }
         // ldimm64 family: constants/pointers resolve the requirement
         BpfInsn::LdImm64 { dst, .. }
         | BpfInsn::LdMapFd { dst, .. }
@@ -315,7 +323,11 @@ fn mark_checkpoint(checkpoints: &mut [Checkpoint], cp_idx: usize, bt: &mut Backt
             continue;
         }
         bt.slots &= !(1 << s);
-        if let StackSlot::Spilled(RegState::Scalar(b)) = &mut cp.state.stack.slots[s] {
+        if cp.state.stack.bytes[s * 8..s * 8 + 8]
+            .iter()
+            .all(|x| *x == crate::state::StackByte::Spill)
+            && let Some(RegState::Scalar(b)) = &mut cp.state.stack.spilled[s]
+        {
             b.precise = true;
         }
     }
@@ -331,8 +343,12 @@ fn mark_all_scalars_precise(checkpoints: &mut [Checkpoint], mut last_cp: Option<
                 b.precise = true;
             }
         }
-        for slot in cp.state.stack.slots.iter_mut() {
-            if let StackSlot::Spilled(RegState::Scalar(b)) = slot {
+        for (slot, spilled) in cp.state.stack.spilled.iter_mut().enumerate() {
+            if cp.state.stack.bytes[slot * 8..slot * 8 + 8]
+                .iter()
+                .all(|x| *x == crate::state::StackByte::Spill)
+                && let Some(RegState::Scalar(b)) = spilled
+            {
                 b.precise = true;
             }
         }
@@ -914,10 +930,17 @@ fn verify_mini_core(
         let hist_entry = HistEntry {
             pc,
             slots: match insn {
-                BpfInsn::LdMem { base, offset, .. } | BpfInsn::StMem { base, offset, .. }
-                    if matches!(item.state.regs[*base as usize], RegState::PtrToStack { .. }) =>
-                {
-                    crate::exec::stack_access_range(pc, *base, &item.state, *offset).ok()
+                BpfInsn::LdMem {
+                    base, offset, size, ..
+                }
+                | BpfInsn::StMem {
+                    base, offset, size, ..
+                }
+                | BpfInsn::StMemImm {
+                    base, offset, size, ..
+                } if matches!(item.state.regs[*base as usize], RegState::PtrToStack { .. }) => {
+                    crate::exec::stack_access_range(pc, *base, &item.state, *offset, size.bytes())
+                        .ok()
                 }
                 _ => None,
             },
@@ -991,6 +1014,8 @@ mod tests {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -1018,11 +1043,14 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovImm { dst: 5, imm: 0 },
             BpfInsn::Exit,
@@ -1177,6 +1205,7 @@ mod tests {
                 src: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::MovImm { dst: 1, imm: 1 },
             BpfInsn::MovImm { dst: 3, imm: 1 },
@@ -1189,12 +1218,16 @@ mod tests {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Jmp { offset: 1 },
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -1579,6 +1612,8 @@ mod tests {
                 dst: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -1641,6 +1676,7 @@ mod tests {
                 src: 4,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::MovReg { dst: 5, src: 0 },
             BpfInsn::MovImm { dst: 6, imm: 15 },
@@ -1659,6 +1695,8 @@ mod tests {
                 dst: 2,
                 base: 0,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovReg { dst: 0, src: 2 },
             BpfInsn::Exit,
@@ -1720,6 +1758,8 @@ mod tests {
                 dst: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovReg { dst: 0, src: 9 },
             BpfInsn::Exit,
@@ -1887,6 +1927,7 @@ mod tests {
                 src: 7,
                 base: 10,
                 offset: -16,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::MovImm { dst: 0, imm: 0 },
             BpfInsn::Jmp { offset: 0 },
@@ -1894,6 +1935,8 @@ mod tests {
                 dst: 2,
                 base: 6,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::MovReg { dst: 0, src: 2 },
             BpfInsn::Exit,

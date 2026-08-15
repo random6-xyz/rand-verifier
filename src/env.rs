@@ -560,6 +560,16 @@ mod tests {
     /// Every program under tests/programs/reject/ must fail verification.
 
     #[test]
+    fn dbg_st_imm_w() {
+        let mut env = BpfVerifierEnv::new();
+        env.setup_prog("tests/programs/accept/st_imm_w".to_string())
+            .unwrap();
+        match env.verify() {
+            Ok(v) => eprintln!("verdict {:?}", v),
+            Err(e) => eprintln!("verify error: {}", e),
+        }
+    }
+    #[test]
     fn corpus_reject_all() {
         let dir = std::path::Path::new("tests/programs/reject");
         let mut count = 0;

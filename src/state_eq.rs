@@ -32,7 +32,8 @@
 // relationships to be preserved across pruning (#99).
 
 use crate::state::{
-    ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SLOTS, StackSlot, StackState, VerifierState,
+    ALIGN_UNKNOWN, NUM_REGS, RegState, STACK_SIZE, STACK_SLOTS, ScalarBounds, StackByte,
+    StackState, VerifierState,
 };
 
 /// The exactness level of a state comparison (kernel states.c
@@ -312,63 +313,113 @@ pub(crate) fn stacksafe(
     exact: ExactLevel,
     idmap: &mut IdMap,
 ) -> bool {
-    for i in 0..STACK_SLOTS {
-        let o = &old.slots[i];
+    let mut i = 0usize;
+    while i < STACK_SIZE {
+        let o = old.bytes[i];
+        let im = i % 8;
+        let spi = i / 8;
         if exact == ExactLevel::Exact {
-            // slot types must match; the kernel treats STACK_POISON as
+            // byte types must match; the kernel treats STACK_POISON as
             // STACK_INVALID for the comparison (both are "never used")
-            if !slot_types_equal_exact(o, &new.slots[i]) {
+            if o != new.bytes[i] {
                 return false;
             }
+        }
+        if o == StackByte::Invalid {
+            // the explored state never used this byte — ignore it
+            i += 1;
             continue;
         }
-        match o {
-            StackSlot::Uninit => {
-                // the explored state never used this slot — ignore it
-            }
-            StackSlot::Initialized => {
-                // old MISC: safe with another MISC slot, a
-                // zero-initialized slot ("if old state was safe with
-                // misc data in the stack it will be safe with
-                // zero-initialized stack. The opposite is not true" —
-                // kernel stacksafe), and — with the precise bit landed
-                // (#98) — any current SCALAR spill: the kernel compares
-                // the old MISC slot through the imprecise unbound_reg
-                // fake register (states.c scalar_reg_for_stack), which
-                // the NOT_EXACT imprecise shortcut matches against any
-                // scalar. A current pointer spill still never matches.
-                match &new.slots[i] {
-                    StackSlot::Initialized => {}
-                    StackSlot::Spilled(RegState::Scalar(_)) => {}
-                    _ => return false,
+        // the kernel's scalar_reg_for_stack pair at 64/32-bit
+        // boundaries: scalar spills vs MISC/ZERO/INVALID slots
+        // compare through an imprecise unbound fake scalar (so a
+        // MISC slot is safe with any scalar spill and vice versa)
+        if im == 0 || im == 4 {
+            let oreg = fake_scalar_for_stack(old, spi, im);
+            let creg = fake_scalar_for_stack(new, spi, im);
+            if let (Some(o), Some(c)) = (oreg, creg) {
+                if !regsafe(&o, &c, exact, idmap) {
+                    return false;
                 }
+                i += if im == 0 { 8 } else { 4 };
+                continue;
             }
-            StackSlot::Spilled(old_reg) => {
-                // both slots are spills: the spilled registers must be
-                // comparable (kernel: "check that stored pointers types
-                // are the same as well")
-                match &new.slots[i] {
-                    StackSlot::Spilled(new_reg) => {
-                        if !regsafe(old_reg, new_reg, exact, idmap) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
+        }
+        // "if old state was safe with misc data in the stack it will
+        // be safe with zero-initialized stack. The opposite is not
+        // true" (kernel stacksafe)
+        if o == StackByte::Misc && new.bytes[i] == StackByte::Zero {
+            i += 1;
+            continue;
+        }
+        if o != new.bytes[i] {
+            // Ex: old explored (safe) state has STACK_SPILL in this
+            // byte, but current has STACK_MISC → not equivalent
+            return false;
+        }
+        if im == 7 {
+            // both slots are fully spills: the spilled registers must
+            // be comparable (kernel: "check that stored pointers types
+            // are the same as well")
+            if o == StackByte::Spill {
+                let Some(old_spilled) = old.spilled[spi].as_ref() else {
+                    i += 1;
+                    continue;
+                };
+                let Some(new_spilled) = new.spilled[spi].as_ref() else {
+                    return false;
+                };
+                if !regsafe(old_spilled, new_spilled, exact, idmap) {
+                    return false;
                 }
             }
         }
+        i += 1;
     }
     true
 }
 
-/// Exact slot comparison: the types must be identical (a Spilled slot
-/// compares its spilled register exactly).
-fn slot_types_equal_exact(old: &StackSlot, new: &StackSlot) -> bool {
-    match (old, new) {
-        (StackSlot::Uninit, StackSlot::Uninit) => true,
-        (StackSlot::Initialized, StackSlot::Initialized) => true,
-        (StackSlot::Spilled(a), StackSlot::Spilled(b)) => regs_exact(a, b),
-        _ => false,
+/// The kernel's `scalar_reg_for_stack`: a scalar spill (at the 64-bit
+/// or 32-bit boundary) yields the spilled scalar; MISC/ZERO/INVALID
+/// bytes yield an imprecise unbound scalar (so loads from them produce
+/// an unbound scalar); pointer spills yield nothing.
+/// The kernel's `scalar_reg_for_stack` + `is_stack_misc_after` /
+/// `is_spilled_scalar_after`: a scalar spill covering `[im, 8)` yields
+/// the spilled scalar (the 64-bit view at im == 0, the 32-bit subreg
+/// at im == 4); all-MISC bytes from `im` to the slot end yield an
+/// imprecise unbound scalar; everything else (including ZERO bytes —
+/// "the opposite is not true") yields nothing.
+fn fake_scalar_for_stack(stack: &StackState, spi: usize, im: usize) -> Option<RegState> {
+    let bytes = &stack.bytes[spi * 8..spi * 8 + 8];
+    if bytes[im..].iter().all(|x| *x == StackByte::Spill) {
+        match stack.spilled[spi] {
+            Some(r @ RegState::Scalar(_)) => {
+                let s = match r {
+                    RegState::Scalar(b) => b,
+                    _ => unreachable!(),
+                };
+                if im == 0 {
+                    Some(RegState::Scalar(s))
+                } else {
+                    // the 32-bit view (kernel: reg32 of the spilled
+                    // register)
+                    let mut sub = s;
+                    sub.smin = sub.s32_min as i64;
+                    sub.smax = sub.s32_max as i64;
+                    sub.umin = sub.u32_min as u64;
+                    sub.umax = sub.u32_max as u64;
+                    sub.tnum = sub.tnum.subreg();
+                    Some(RegState::Scalar(sub))
+                }
+            }
+            _ => None,
+        }
+    } else if bytes[im..].iter().all(|x| *x == StackByte::Misc) {
+        let mut unbound = ScalarBounds::unknown();
+        unbound.precise = false;
+        Some(RegState::Scalar(unbound))
+    } else {
+        None
     }
 }
 
@@ -438,7 +489,10 @@ pub(crate) fn clean_state(state: &mut VerifierState, live_regs: u16, live_stack:
     }
     for i in 0..STACK_SLOTS {
         if live_stack & (1 << i) == 0 {
-            state.stack.slots[i] = StackSlot::Uninit;
+            for b in state.stack.bytes[i * 8..i * 8 + 8].iter_mut() {
+                *b = crate::state::StackByte::Invalid;
+            }
+            state.stack.spilled[i] = None;
         }
     }
 }
@@ -460,6 +514,21 @@ pub(crate) fn states_maybe_looping(old: &VerifierState, new: &VerifierState) -> 
 
 #[cfg(test)]
 mod tests {
+
+    /// Test helper: mark a full slot as a spill of `reg`.
+    fn spill_slot(state: &mut VerifierState, slot: usize, reg: RegState) {
+        for b in state.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+            *b = StackByte::Spill;
+        }
+        state.stack.spilled[slot] = Some(reg);
+    }
+
+    /// Test helper: mark a full slot as MISC.
+    fn misc_slot(state: &mut VerifierState, slot: usize) {
+        for b in state.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+            *b = StackByte::Misc;
+        }
+    }
     use super::*;
     use crate::state::ScalarBounds;
     use crate::testutil::*;
@@ -793,7 +862,7 @@ mod tests {
         // (INV, MISC) == (MISC, MISC)
         let old = VerifierState::initial();
         let mut new = VerifierState::initial();
-        new.stack.slots[1] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(7)));
+        spill_slot(&mut new, 1, RegState::Scalar(ScalarBounds::constant(7)));
         assert!(stacksafe(
             &old.stack,
             &new.stack,
@@ -814,11 +883,17 @@ mod tests {
     fn stacksafe_spill_comparison() {
         // the old spilled scalar is PRECISE (#98) — ranges are enforced
         let mut old = VerifierState::initial();
-        old.stack.slots[0] =
-            StackSlot::Spilled(RegState::Scalar(precise(ScalarBounds::from_signed(0, 100))));
+        spill_slot(
+            &mut old,
+            0,
+            RegState::Scalar(precise(ScalarBounds::from_signed(0, 100))),
+        );
         let mut new = VerifierState::initial();
-        new.stack.slots[0] =
-            StackSlot::Spilled(RegState::Scalar(ScalarBounds::from_signed(10, 20)));
+        spill_slot(
+            &mut new,
+            0,
+            RegState::Scalar(ScalarBounds::from_signed(10, 20)),
+        );
         assert!(stacksafe(
             &old.stack,
             &new.stack,
@@ -826,8 +901,11 @@ mod tests {
             &mut IdMap::default()
         ));
         // a wider current spill is not covered
-        new.stack.slots[0] =
-            StackSlot::Spilled(RegState::Scalar(ScalarBounds::from_signed(-50, 200)));
+        spill_slot(
+            &mut new,
+            0,
+            RegState::Scalar(ScalarBounds::from_signed(-50, 200)),
+        );
         assert!(!stacksafe(
             &old.stack,
             &new.stack,
@@ -835,8 +913,8 @@ mod tests {
             &mut IdMap::default()
         ));
         // spilled pointers must match types
-        old.stack.slots[1] = StackSlot::Spilled(RegState::PtrToCtx);
-        new.stack.slots[1] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
+        spill_slot(&mut old, 1, RegState::PtrToCtx);
+        spill_slot(&mut new, 1, RegState::Scalar(ScalarBounds::constant(1)));
         assert!(!stacksafe(
             &old.stack,
             &new.stack,
@@ -850,18 +928,26 @@ mod tests {
         // an explored MISC slot is safe with a current zero slot
         // ("the opposite is not true" — kernel stacksafe)
         let mut old = VerifierState::initial();
-        old.stack.slots[0] = StackSlot::Initialized;
+        misc_slot(&mut old, 0);
         let mut zero = VerifierState::initial();
-        zero.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(0)));
+        spill_slot(&mut zero, 0, RegState::Scalar(ScalarBounds::constant(0)));
         assert!(stacksafe(
             &old.stack,
             &zero.stack,
             ExactLevel::NotExact,
             &mut IdMap::default()
         ));
-        // the reverse never holds
+        // the reverse with a PRECISE spilled scalar never holds
+        // ("the opposite is not true" — kernel stacksafe; the
+        // imprecise shortcut would accept an imprecise spill)
+        let mut precise_zero = VerifierState::initial();
+        spill_slot(
+            &mut precise_zero,
+            0,
+            RegState::Scalar(precise(ScalarBounds::constant(0))),
+        );
         assert!(!stacksafe(
-            &zero.stack,
+            &precise_zero.stack,
             &old.stack,
             ExactLevel::NotExact,
             &mut IdMap::default()
@@ -870,7 +956,7 @@ mod tests {
         // kernel's imprecise unbound_reg fake, #98) — but a pointer
         // spill still is not
         let mut scalar = VerifierState::initial();
-        scalar.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
+        spill_slot(&mut scalar, 0, RegState::Scalar(ScalarBounds::constant(1)));
         assert!(stacksafe(
             &old.stack,
             &scalar.stack,
@@ -878,7 +964,7 @@ mod tests {
             &mut IdMap::default()
         ));
         let mut ptr = VerifierState::initial();
-        ptr.stack.slots[0] = StackSlot::Spilled(RegState::PtrToCtx);
+        spill_slot(&mut ptr, 0, RegState::PtrToCtx);
         assert!(!stacksafe(
             &old.stack,
             &ptr.stack,
@@ -891,9 +977,9 @@ mod tests {
     fn stacksafe_exact() {
         // EXACT: slot types must match and spills must be identical
         let mut old = VerifierState::initial();
-        old.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(7)));
+        spill_slot(&mut old, 0, RegState::Scalar(ScalarBounds::constant(7)));
         let mut same = VerifierState::initial();
-        same.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(7)));
+        spill_slot(&mut same, 0, RegState::Scalar(ScalarBounds::constant(7)));
         assert!(stacksafe(
             &old.stack,
             &same.stack,
@@ -901,7 +987,7 @@ mod tests {
             &mut IdMap::default()
         ));
         let mut diff = VerifierState::initial();
-        diff.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(8)));
+        spill_slot(&mut diff, 0, RegState::Scalar(ScalarBounds::constant(8)));
         assert!(!stacksafe(
             &old.stack,
             &diff.stack,
@@ -911,7 +997,7 @@ mod tests {
         // an unused slot in one state and a used slot in the other
         // never match exactly
         let mut used = VerifierState::initial();
-        used.stack.slots[1] = StackSlot::Initialized;
+        misc_slot(&mut used, 1);
         assert!(!stacksafe(
             &old.stack,
             &used.stack,
@@ -1016,18 +1102,25 @@ mod tests {
         state.regs[0] = RegState::Scalar(ScalarBounds::constant(1));
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(2));
         state.regs[6] = RegState::Scalar(ScalarBounds::constant(3));
-        state.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(4)));
-        state.stack.slots[1] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(5)));
+        for b in state.stack.bytes[0..8].iter_mut() {
+            *b = StackByte::Spill;
+        }
+        state.stack.spilled[0] = Some(RegState::Scalar(ScalarBounds::constant(4)));
+        for b in state.stack.bytes[8..16].iter_mut() {
+            *b = StackByte::Spill;
+        }
+        state.stack.spilled[1] = Some(RegState::Scalar(ScalarBounds::constant(5)));
         clean_state(&mut state, 1 << 1, 1 << 1);
         // live: r1, slot 1; dead: r0, r6, slot 0; R10 is never cleaned
         assert_eq!(state.regs[0], RegState::Uninit);
         assert_eq!(state.regs[1], RegState::Scalar(ScalarBounds::constant(2)));
         assert_eq!(state.regs[6], RegState::Uninit);
         assert_eq!(state.regs[10], ptr_stack(0));
-        assert_eq!(state.stack.slots[0], StackSlot::Uninit);
+        assert_eq!(state.stack.bytes[0], StackByte::Invalid);
+        assert_eq!(state.stack.bytes[8], StackByte::Spill);
         assert_eq!(
-            state.stack.slots[1],
-            StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(5)))
+            state.stack.spilled[1],
+            Some(RegState::Scalar(ScalarBounds::constant(5)))
         );
     }
 

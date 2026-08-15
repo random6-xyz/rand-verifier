@@ -192,15 +192,23 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         }
         // loads read the base pointer and define the destination
         // (kernel BPF_LDX: `def = dst, use = src`)
-        BpfInsn::LdMem { dst, base, offset } => {
+        BpfInsn::LdMem {
+            dst, base, offset, ..
+        } => {
             ud.use_regs = reg_bit(*base);
             ud.def_regs = reg_bit(*dst);
             ud.read_slots = read_slots_for(*base, *offset);
         }
         // stores read the value and the base pointer (kernel BPF_STX:
         // `use = dst | src`; BPF_ST: `use = dst`)
-        BpfInsn::StMem { src, base, offset } => {
+        BpfInsn::StMem {
+            src, base, offset, ..
+        } => {
             ud.use_regs = reg_bit(*src) | reg_bit(*base);
+            ud.write_slots = write_slots_for(*base, *offset);
+        }
+        BpfInsn::StMemImm { base, offset, .. } => {
+            ud.use_regs = reg_bit(*base);
             ud.write_slots = write_slots_for(*base, *offset);
         }
         // ldimm64 family: only the destination is defined (kernel
@@ -477,11 +485,14 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -502,6 +513,7 @@ mod tests {
                 src: 1,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::MovImm { dst: 1, imm: 7 },
             BpfInsn::Exit,
@@ -548,6 +560,8 @@ mod tests {
                 dst: 1,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -570,6 +584,8 @@ mod tests {
                 dst: 1,
                 base: 6,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
@@ -590,11 +606,14 @@ mod tests {
                 src: 1,
                 base: 6,
                 offset: 0,
+                size: crate::insn::MemSize::DW,
             },
             BpfInsn::LdMem {
                 dst: 2,
                 base: 10,
                 offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
             },
             BpfInsn::Exit,
         ];
