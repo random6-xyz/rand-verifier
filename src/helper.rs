@@ -57,6 +57,7 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
                 u32_min: 0,
                 u32_max: 0,
                 tnum: Tnum { value: 0, mask: 0 },
+                precise: false,
             }),
         }),
         // BPF_FUNC_ktime_get_ns: no arguments, unknown u64 scalar

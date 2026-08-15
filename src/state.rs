@@ -34,6 +34,14 @@ pub(crate) struct ScalarBounds {
     /// top of the ranges. Kept consistent with the ranges by the sync
     /// (the tnum is intersected with the range in `synced`).
     pub(crate) tnum: Tnum,
+    /// Kernel scalar precision bit (#98): false by default; set only by
+    /// precision backtracking on stored checkpoint states. Execution
+    /// never sets it (the kernel: "don't set precise flag in current
+    /// state, as precision tracking in the current state is
+    /// unnecessary"). Never participates in value comparisons — the
+    /// exactness levels ignore it (regs_exact in state_eq.rs), like the
+    /// kernel's regs_exact()/states_maybe_looping() memcmp ranges.
+    pub(crate) precise: bool,
 }
 
 impl ScalarBounds {
@@ -49,6 +57,7 @@ impl ScalarBounds {
             u32_min: value as u64 as u32,
             u32_max: value as u64 as u32,
             tnum: Tnum::constant(value as u64),
+            precise: false,
         }
     }
 
@@ -71,6 +80,7 @@ impl ScalarBounds {
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
+                precise: false,
             }
         } else {
             // both interpretations are the same bit range
@@ -84,6 +94,7 @@ impl ScalarBounds {
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
+                precise: false,
             }
         };
         bounds.synced()
@@ -117,6 +128,7 @@ impl ScalarBounds {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
         }
     }
 
@@ -605,6 +617,7 @@ mod tests {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
         }
         .synced()
         .synced()
@@ -622,6 +635,7 @@ mod tests {
             u32_min: 0,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
         }
         .synced()
         .synced()

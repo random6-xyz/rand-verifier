@@ -6,7 +6,7 @@ use crate::error::VerificationFailure;
 use crate::exec::successors;
 use crate::insn::BpfInsn;
 use crate::liveness::{Liveness, analyze};
-use crate::state::{RegState, VerifierState, read_reg};
+use crate::state::{RegState, StackSlot, VerifierState, read_reg};
 use crate::state_eq::{ExactLevel, clean_state, states_equal, states_maybe_looping};
 
 /// Bounds for the exploration (#32, #46): exceeding any of them rejects
@@ -39,19 +39,35 @@ impl Default for VerifierLimits {
     }
 }
 
+/// One executed instruction of a path segment: its pc and, for stack
+/// accesses through a stack-pointer base, the covered slot range
+/// (recorded at access time, so precision backtracking can resolve
+/// fills/stores through computed stack pointers — the kernel's
+/// jmp-history SPI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistEntry {
+    pc: u32,
+    slots: Option<(usize, usize)>,
+}
+
 /// One stored (checkpointed) state — the kernel's
 /// `bpf_verifier_state_list` entry (kernel/bpf/states.c).
 ///
 /// - `state` is the arrival state cleaned with its pc's liveness
-///   (kernel `clean_verifier_state` before storing);
+///   (kernel `clean_verifier_state` before storing); precision
+///   backtracking (#98) marks its scalars precise retroactively;
 /// - `parent` points at the checkpoint this path descended from
-///   (kernel `cur->parent = new` — the parent chain that issue #98's
-///   precision backtracking walks);
+///   (kernel `cur->parent = new` — the parent chain that precision
+///   backtracking walks);
 /// - `branches` counts the paths still pending under this checkpoint
 ///   (kernel `sl->state.branches`): a checkpoint with `branches == 0`
 ///   has been fully explored and proven safe, so it may prune
 ///   equivalent states; a checkpoint with `branches > 0` is still being
-///   explored and only participates in infinite-loop detection.
+///   explored and only participates in infinite-loop detection;
+/// - `segment` is the path segment ending at this checkpoint (the
+///   instructions executed since the previous checkpoint) — precision
+///   backtracking walks it when it moves to the parent state (the
+///   kernel's per-state jmp_history + first/last insn idx).
 struct Checkpoint {
     state: VerifierState,
     parent: Option<usize>,
@@ -61,15 +77,20 @@ struct Checkpoint {
     /// comparison list.
     hit_cnt: usize,
     miss_cnt: usize,
+    /// The executed instructions since the previous checkpoint.
+    segment: Vec<HistEntry>,
 }
 
 /// One worklist item: a path arriving at `pc` with abstract state
 /// `state`. `last_cp` is the deepest checkpoint on this path's parent
 /// chain — the checkpoint whose branch count this path belongs to.
+/// `history` is the path segment executed since `last_cp` (the kernel's
+/// jmp_history) — precision backtracking walks it (#98).
 struct WorkItem {
     pc: u32,
     state: VerifierState,
     last_cp: Option<usize>,
+    history: Vec<HistEntry>,
 }
 
 /// Adjust the branch count of every checkpoint on a path's parent
@@ -88,6 +109,286 @@ fn bump_branches(checkpoints: &mut [Checkpoint], mut last_cp: Option<usize>, del
         }
         last_cp = cp.parent;
     }
+}
+
+/// The kernel's scalar precision backtracking (#98, kernel/bpf/backtrack.c):
+///
+/// A value-dependent site (a static branch verdict, pointer+scalar ALU)
+/// requires the operand registers precise. The requirement is propagated
+/// BACKWARD through the path's executed instructions — each instruction
+/// transforms the required set (a constant assignment resolves it, a mov
+/// forwards it to the source, a stack fill forwards it to the slot, a
+/// stack store forwards it to the stored register) — and into every
+/// stored checkpoint on the parent chain, which is exactly what makes
+/// the NOT_EXACT imprecise scalar shortcut sound: a checkpoint whose
+/// scalar is precise enforces the range on future arrivals, so their
+/// value-dependent decisions cannot diverge.
+///
+/// If the requirement cannot be resolved (the chain is exhausted or a
+/// helper call consumed an argument), the conservative hammer is used:
+/// every scalar in every chain checkpoint becomes precise (kernel
+/// `bpf_mark_all_scalars_precise`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Backtrack {
+    regs: u16,
+    slots: u64,
+}
+
+impl Backtrack {
+    fn is_empty(&self) -> bool {
+        self.regs == 0 && self.slots == 0
+    }
+}
+
+enum BacktrackOutcome {
+    /// The requirement was fully resolved — stop the walk.
+    Resolved,
+    /// The instruction cannot be backtracked — fall back to marking
+    /// every scalar precise.
+    Fallback,
+    /// Continue walking backward.
+    Continue,
+}
+
+/// One instruction of the backward walk (kernel `backtrack_insn`).
+fn backtrack_insn(
+    insn: &BpfInsn,
+    slots: Option<(usize, usize)>,
+    bt: &mut Backtrack,
+) -> BacktrackOutcome {
+    let dst_bit = |r: u8| 1u16 << r;
+    match insn {
+        // `dreg = K` — a constant resolves the requirement
+        BpfInsn::MovImm { dst, .. } => bt.regs &= !dst_bit(*dst),
+        // `dreg = sreg` — the requirement moves to the source
+        BpfInsn::MovReg { dst, src } => {
+            if bt.regs & dst_bit(*dst) != 0 {
+                bt.regs &= !dst_bit(*dst);
+                if *src != 10 {
+                    bt.regs |= dst_bit(*src);
+                }
+            }
+        }
+        // `dreg op= K` — the result depends on dreg's old value
+        BpfInsn::AddImm { dst, .. }
+        | BpfInsn::SubImm { dst, .. }
+        | BpfInsn::AndImm { dst, .. }
+        | BpfInsn::OrImm { dst, .. }
+        | BpfInsn::XorImm { dst, .. }
+        | BpfInsn::LshImm { dst, .. }
+        | BpfInsn::RshImm { dst, .. }
+        | BpfInsn::ArshImm { dst, .. }
+        | BpfInsn::Add32Imm { dst, .. }
+        | BpfInsn::Sub32Imm { dst, .. }
+        | BpfInsn::And32Imm { dst, .. }
+        | BpfInsn::Or32Imm { dst, .. }
+        | BpfInsn::Xor32Imm { dst, .. }
+        | BpfInsn::Lsh32Imm { dst, .. }
+        | BpfInsn::Rsh32Imm { dst, .. }
+        | BpfInsn::Arsh32Imm { dst, .. } => {
+            let _ = dst;
+        }
+        // `dreg op= sreg` — both dreg (old value) and sreg contribute
+        BpfInsn::AddReg { dst, src }
+        | BpfInsn::SubReg { dst, src }
+        | BpfInsn::AndReg { dst, src }
+        | BpfInsn::OrReg { dst, src }
+        | BpfInsn::XorReg { dst, src }
+        | BpfInsn::LshReg { dst, src }
+        | BpfInsn::RshReg { dst, src }
+        | BpfInsn::ArshReg { dst, src }
+        | BpfInsn::Add32Reg { dst, src }
+        | BpfInsn::Sub32Reg { dst, src }
+        | BpfInsn::And32Reg { dst, src }
+        | BpfInsn::Or32Reg { dst, src }
+        | BpfInsn::Xor32Reg { dst, src }
+        | BpfInsn::Lsh32Reg { dst, src }
+        | BpfInsn::Rsh32Reg { dst, src }
+        | BpfInsn::Arsh32Reg { dst, src } => {
+            if bt.regs & dst_bit(*dst) != 0 && *src != 10 {
+                bt.regs |= dst_bit(*src);
+            }
+        }
+        // `dreg = [base+off]`: a stack fill forwards the requirement to
+        // the covered slots; a load from other memory has a
+        // path-independent result — the requirement is dropped (kernel:
+        // "Load from any other memory can be zero extended. No further
+        // tracking necessary")
+        BpfInsn::LdMem { dst, .. } => {
+            if bt.regs & dst_bit(*dst) != 0 {
+                bt.regs &= !dst_bit(*dst);
+                if let Some((lo, hi)) = slots {
+                    for s in lo..=hi {
+                        bt.slots |= 1u64 << s;
+                    }
+                }
+            }
+        }
+        // `[base+off] = sreg`: a stack store feeding a required slot
+        // forwards the requirement to the stored register
+        BpfInsn::StMem { src, .. } => {
+            if let Some((lo, hi)) = slots {
+                let mut hit = false;
+                for s in lo..=hi {
+                    if bt.slots & (1u64 << s) != 0 {
+                        bt.slots &= !(1u64 << s);
+                        hit = true;
+                    }
+                }
+                if hit && *src != 10 {
+                    bt.regs |= dst_bit(*src);
+                }
+            }
+        }
+        // ldimm64 family: constants/pointers resolve the requirement
+        BpfInsn::LdImm64 { dst, .. }
+        | BpfInsn::LdMapFd { dst, .. }
+        | BpfInsn::LdMapValue { dst, .. } => bt.regs &= !dst_bit(*dst),
+        BpfInsn::LdImm64Second { .. } => {}
+        // a helper call writes R0; the argument registers were either
+        // consumed by the call's own checks or are dead — a requirement
+        // still pending on them cannot be resolved here (kernel:
+        // verifier_bug; we fall back conservatively)
+        BpfInsn::Call { .. } => {
+            bt.regs &= !(1u16 << 0);
+            if bt.regs & 0b111110 != 0 {
+                return BacktrackOutcome::Fallback;
+            }
+        }
+        BpfInsn::Exit => {}
+        BpfInsn::Jmp { .. } => {}
+        // a conditional jump in the history: the branch operands'
+        // values determined the path's refinement — both contribute if
+        // either is required (kernel: `dreg <cond> sreg` → both need
+        // precision before this insn)
+        BpfInsn::Jeq { dst, src, .. }
+        | BpfInsn::Jne { dst, src, .. }
+        | BpfInsn::Jgt { dst, src, .. }
+        | BpfInsn::Jge { dst, src, .. }
+        | BpfInsn::Jlt { dst, src, .. }
+        | BpfInsn::Jle { dst, src, .. }
+        | BpfInsn::Jsgt { dst, src, .. }
+        | BpfInsn::Jsge { dst, src, .. }
+        | BpfInsn::Jslt { dst, src, .. }
+        | BpfInsn::Jsle { dst, src, .. } => {
+            if bt.regs & (dst_bit(*dst) | dst_bit(*src)) != 0 {
+                bt.regs |= dst_bit(*dst) | dst_bit(*src);
+            }
+        }
+        BpfInsn::JeqImm { dst, .. }
+        | BpfInsn::JneImm { dst, .. }
+        | BpfInsn::JgtImm { dst, .. }
+        | BpfInsn::JgeImm { dst, .. }
+        | BpfInsn::JltImm { dst, .. }
+        | BpfInsn::JleImm { dst, .. }
+        | BpfInsn::JsgtImm { dst, .. }
+        | BpfInsn::JsgeImm { dst, .. }
+        | BpfInsn::JsltImm { dst, .. }
+        | BpfInsn::JsleImm { dst, .. } => {
+            let _ = dst;
+        }
+    }
+    if bt.is_empty() {
+        BacktrackOutcome::Resolved
+    } else {
+        BacktrackOutcome::Continue
+    }
+}
+
+/// Mark the requirement in one stored checkpoint: required scalars
+/// become precise (already-precise ones and non-scalars leave the
+/// requirement).
+fn mark_checkpoint(checkpoints: &mut [Checkpoint], cp_idx: usize, bt: &mut Backtrack) {
+    let cp = &mut checkpoints[cp_idx];
+    for r in 0..crate::state::NUM_REGS {
+        if bt.regs & (1 << r) == 0 {
+            continue;
+        }
+        bt.regs &= !(1 << r);
+        if let RegState::Scalar(b) = &mut cp.state.regs[r] {
+            b.precise = true;
+        }
+    }
+    for s in 0..crate::state::STACK_SLOTS {
+        if bt.slots & (1 << s) == 0 {
+            continue;
+        }
+        bt.slots &= !(1 << s);
+        if let StackSlot::Spilled(RegState::Scalar(b)) = &mut cp.state.stack.slots[s] {
+            b.precise = true;
+        }
+    }
+}
+
+/// The conservative hammer (kernel `bpf_mark_all_scalars_precise`):
+/// every scalar in every checkpoint on the chain becomes precise.
+fn mark_all_scalars_precise(checkpoints: &mut [Checkpoint], mut last_cp: Option<usize>) {
+    while let Some(i) = last_cp {
+        let cp = &mut checkpoints[i];
+        for reg in cp.state.regs.iter_mut() {
+            if let RegState::Scalar(b) = reg {
+                b.precise = true;
+            }
+        }
+        for slot in cp.state.stack.slots.iter_mut() {
+            if let StackSlot::Spilled(RegState::Scalar(b)) = slot {
+                b.precise = true;
+            }
+        }
+        last_cp = cp.parent;
+    }
+}
+
+/// Walk the requirement backward through the path segments and mark the
+/// chain checkpoints (kernel `bpf_mark_chain_precision`).
+fn mark_chain_precision(
+    program: &[BpfInsn],
+    checkpoints: &mut [Checkpoint],
+    mut last_cp: Option<usize>,
+    segment: &[HistEntry],
+    regs: u16,
+) {
+    let mut bt = Backtrack { regs, slots: 0 };
+    if bt.is_empty() {
+        return;
+    }
+    // the segments of the chain, deepest first: the item's own history,
+    // then each checkpoint's segment
+    let mut segments: Vec<Vec<HistEntry>> = Vec::new();
+    segments.push(segment.to_vec());
+    let mut cp = last_cp;
+    while let Some(i) = cp {
+        segments.push(checkpoints[i].segment.clone());
+        cp = checkpoints[i].parent;
+    }
+    for seg in &segments {
+        let mut fallback = false;
+        for entry in seg.iter().rev() {
+            let insn = &program[entry.pc as usize];
+            match backtrack_insn(insn, entry.slots, &mut bt) {
+                BacktrackOutcome::Resolved => return,
+                BacktrackOutcome::Fallback => {
+                    fallback = true;
+                    break;
+                }
+                BacktrackOutcome::Continue => {}
+            }
+        }
+        if fallback {
+            break;
+        }
+        // mark the checkpoint this segment belongs to (the item's own
+        // history belongs to the deepest checkpoint)
+        let Some(i) = last_cp else {
+            break;
+        };
+        mark_checkpoint(checkpoints, i, &mut bt);
+        if bt.is_empty() {
+            return;
+        }
+        last_cp = checkpoints[i].parent;
+    }
+    mark_all_scalars_precise(checkpoints, last_cp);
 }
 
 /// The kernel's prune points (kernel/bpf/cfg.c): conditional jumps and
@@ -173,6 +474,111 @@ pub(crate) fn verify_mini_with_states(
     verify_mini_core(program, loop_heads, limits)
 }
 
+/// The destination register of an instruction (0 for insns without one).
+fn insn_dst(insn: &BpfInsn) -> u8 {
+    match insn {
+        BpfInsn::MovImm { dst, .. }
+        | BpfInsn::MovReg { dst, .. }
+        | BpfInsn::AddImm { dst, .. }
+        | BpfInsn::AddReg { dst, .. }
+        | BpfInsn::SubImm { dst, .. }
+        | BpfInsn::SubReg { dst, .. }
+        | BpfInsn::AndImm { dst, .. }
+        | BpfInsn::AndReg { dst, .. }
+        | BpfInsn::OrImm { dst, .. }
+        | BpfInsn::OrReg { dst, .. }
+        | BpfInsn::XorImm { dst, .. }
+        | BpfInsn::XorReg { dst, .. }
+        | BpfInsn::LshImm { dst, .. }
+        | BpfInsn::LshReg { dst, .. }
+        | BpfInsn::RshImm { dst, .. }
+        | BpfInsn::RshReg { dst, .. }
+        | BpfInsn::ArshImm { dst, .. }
+        | BpfInsn::ArshReg { dst, .. }
+        | BpfInsn::Add32Imm { dst, .. }
+        | BpfInsn::Add32Reg { dst, .. }
+        | BpfInsn::Sub32Imm { dst, .. }
+        | BpfInsn::Sub32Reg { dst, .. }
+        | BpfInsn::And32Imm { dst, .. }
+        | BpfInsn::And32Reg { dst, .. }
+        | BpfInsn::Or32Imm { dst, .. }
+        | BpfInsn::Or32Reg { dst, .. }
+        | BpfInsn::Xor32Imm { dst, .. }
+        | BpfInsn::Xor32Reg { dst, .. }
+        | BpfInsn::Lsh32Imm { dst, .. }
+        | BpfInsn::Lsh32Reg { dst, .. }
+        | BpfInsn::Rsh32Imm { dst, .. }
+        | BpfInsn::Rsh32Reg { dst, .. }
+        | BpfInsn::Arsh32Imm { dst, .. }
+        | BpfInsn::Arsh32Reg { dst, .. }
+        | BpfInsn::LdMem { dst, .. }
+        | BpfInsn::LdImm64 { dst, .. }
+        | BpfInsn::LdMapFd { dst, .. }
+        | BpfInsn::LdMapValue { dst, .. }
+        | BpfInsn::Jeq { dst, .. }
+        | BpfInsn::Jne { dst, .. }
+        | BpfInsn::Jgt { dst, .. }
+        | BpfInsn::Jge { dst, .. }
+        | BpfInsn::Jlt { dst, .. }
+        | BpfInsn::Jle { dst, .. }
+        | BpfInsn::Jsgt { dst, .. }
+        | BpfInsn::Jsge { dst, .. }
+        | BpfInsn::Jslt { dst, .. }
+        | BpfInsn::Jsle { dst, .. }
+        | BpfInsn::JeqImm { dst, .. }
+        | BpfInsn::JneImm { dst, .. }
+        | BpfInsn::JgtImm { dst, .. }
+        | BpfInsn::JgeImm { dst, .. }
+        | BpfInsn::JltImm { dst, .. }
+        | BpfInsn::JleImm { dst, .. }
+        | BpfInsn::JsgtImm { dst, .. }
+        | BpfInsn::JsgeImm { dst, .. }
+        | BpfInsn::JsltImm { dst, .. }
+        | BpfInsn::JsleImm { dst, .. } => *dst,
+        _ => 0,
+    }
+}
+
+/// The source register of a reg-reg instruction.
+fn insn_src(insn: &BpfInsn) -> Option<u8> {
+    match insn {
+        BpfInsn::MovReg { src, .. }
+        | BpfInsn::AddReg { src, .. }
+        | BpfInsn::SubReg { src, .. }
+        | BpfInsn::AndReg { src, .. }
+        | BpfInsn::OrReg { src, .. }
+        | BpfInsn::XorReg { src, .. }
+        | BpfInsn::LshReg { src, .. }
+        | BpfInsn::RshReg { src, .. }
+        | BpfInsn::ArshReg { src, .. }
+        | BpfInsn::Add32Reg { src, .. }
+        | BpfInsn::Sub32Reg { src, .. }
+        | BpfInsn::And32Reg { src, .. }
+        | BpfInsn::Or32Reg { src, .. }
+        | BpfInsn::Xor32Reg { src, .. }
+        | BpfInsn::Lsh32Reg { src, .. }
+        | BpfInsn::Rsh32Reg { src, .. }
+        | BpfInsn::Arsh32Reg { src, .. }
+        | BpfInsn::Jeq { src, .. }
+        | BpfInsn::Jne { src, .. }
+        | BpfInsn::Jgt { src, .. }
+        | BpfInsn::Jge { src, .. }
+        | BpfInsn::Jlt { src, .. }
+        | BpfInsn::Jle { src, .. }
+        | BpfInsn::Jsgt { src, .. }
+        | BpfInsn::Jsge { src, .. }
+        | BpfInsn::Jslt { src, .. }
+        | BpfInsn::Jsle { src, .. } => Some(*src),
+        _ => None,
+    }
+}
+
+/// Whether a register state is a pointer (precision sites mark only
+/// scalar operands — pointers are compared structurally).
+fn is_pointer(state: RegState) -> bool {
+    !matches!(state, RegState::Uninit | RegState::Scalar(_))
+}
+
 /// The shared exploration core: runs the worklist and collects the
 /// analyzed states per pc. Both public entry points are thin wrappers.
 fn verify_mini_core(
@@ -186,6 +592,7 @@ fn verify_mini_core(
         pc: 0,
         state: VerifierState::initial(),
         last_cp: None,
+        history: Vec::new(),
     }];
     // the stored checkpoints, indexed — one global pool so the parent
     // chain can span pcs (the kernel's explored-state list)
@@ -241,8 +648,13 @@ fn verify_mini_core(
             // processed (the kernel's "Do not add new state for future
             // pruning if the verifier hasn't seen at least 2 jumps and
             // at least 8 instructions")
-            let mut add_new_state = insn_processed - prev_insn_processed >= 8
-                && jmps_processed - prev_jmps_processed >= 2;
+            // the kernel forces a checkpoint when the jmp history grows
+            // too long (`cur->jmp_history_cnt > 40` — ours counts every
+            // instruction of the segment, so the bound is larger)
+            let force_new_state = item.history.len() >= 64;
+            let mut add_new_state = force_new_state
+                || (insn_processed - prev_insn_processed >= 8
+                    && jmps_processed - prev_jmps_processed >= 2);
             let mut pruned = false;
             let mut evict: Vec<usize> = Vec::new();
             if let Some(list) = visited.get(&pc) {
@@ -325,6 +737,7 @@ fn verify_mini_core(
                     branches: 0,
                     hit_cnt: 0,
                     miss_cnt: 0,
+                    segment: item.history.clone(),
                 });
                 visited.entry(pc).or_default().push(cp_idx);
                 prev_insn_processed = insn_processed;
@@ -393,15 +806,105 @@ fn verify_mini_core(
             continue;
         }
 
-        for (next_pc, next_state) in successors(pc, insn, &item.state)?.into_iter().rev() {
+        let nexts = successors(pc, insn, &item.state)?;
+
+        // ── precision requirements (#98) ─────────────────────────────
+        // A conditional branch with exactly ONE successor used the
+        // static verdict (is_branch_taken) to prune the other branch —
+        // the operands' ranges decided it, so they must be precise in
+        // the stored states (kernel check_cond_jmp_op: pred >= 0 →
+        // mark_chain_precision on both operands). Scalar ALU on a
+        // pointer destination derives the pointer's offset from the
+        // scalar — the scalar must be precise too (kernel
+        // adjust_reg_min_max_vals: mark_chain_precision(src)).
+        let mut precision_regs: u16 = 0;
+        if insn.is_conditional_branch() && nexts.len() == 1 {
+            precision_regs |= 1 << insn_dst(insn);
+            if let Some(src) = insn_src(insn) {
+                precision_regs |= 1 << src;
+            }
+        } else if let Some(src) = insn_src(insn)
+            && matches!(
+                insn,
+                BpfInsn::AddReg { .. }
+                    | BpfInsn::SubReg { .. }
+                    | BpfInsn::AndReg { .. }
+                    | BpfInsn::OrReg { .. }
+                    | BpfInsn::XorReg { .. }
+                    | BpfInsn::Add32Reg { .. }
+                    | BpfInsn::Sub32Reg { .. }
+            )
+            && is_pointer(item.state.regs[insn_dst(insn) as usize])
+            && matches!(item.state.regs[src as usize], RegState::Scalar(_))
+        {
+            precision_regs |= 1 << src;
+        } else if matches!(insn, BpfInsn::AddReg { .. })
+            && matches!(
+                item.state.regs[insn_dst(insn) as usize],
+                RegState::Scalar(_)
+            )
+            && is_pointer(item.state.regs[insn_src(insn).unwrap() as usize])
+        {
+            // `scalar += pointer`: the scalar's value determines the
+            // resulting pointer offset — it must be precise (kernel
+            // adjust_reg_min_max_vals: mark_chain_precision(dst_reg)
+            // for scalar += pointer)
+            precision_regs |= 1 << insn_dst(insn);
+        }
+        if precision_regs != 0 {
+            // the kernel links the freshly-stored checkpoint before the
+            // instruction runs (`cur->parent = new` in is_state_visited),
+            // so a value-dependent site at a store pc marks the NEW
+            // checkpoint. When a checkpoint was stored at this pc, its
+            // segment IS this item's history — pass the post-store chain
+            // with an empty item segment so the history is walked once.
+            let (mark_cp, mark_segment) = if item_last_cp != item.last_cp {
+                (item_last_cp, Vec::new())
+            } else {
+                (item.last_cp, item.history.clone())
+            };
+            mark_chain_precision(
+                program,
+                &mut checkpoints,
+                mark_cp,
+                &mark_segment,
+                precision_regs,
+            );
+        }
+        // the history entry for the current instruction: the covered
+        // slot range for stack accesses through a stack-pointer base
+        // (resolves precision backtracking through computed pointers)
+        let hist_entry = HistEntry {
+            pc,
+            slots: match insn {
+                BpfInsn::LdMem { base, offset, .. } | BpfInsn::StMem { base, offset, .. }
+                    if matches!(item.state.regs[*base as usize], RegState::PtrToStack { .. }) =>
+                {
+                    crate::exec::stack_access_range(pc, *base, &item.state, *offset).ok()
+                }
+                _ => None,
+            },
+        };
+        for (next_pc, next_state) in nexts.into_iter().rev() {
             // the kernel pushes the fall-through and continues with the
             // taken branch — with our LIFO worklist, pushing in reverse
             // reproduces that order (taken processed first)
             bump_branches(&mut checkpoints, item_last_cp, 1);
+            // the history resets at a stored checkpoint: the successors
+            // of the storing item start a new segment at this pc (the
+            // kernel clears the jmp history at is_state_visited)
+            let history = if item_last_cp != item.last_cp {
+                vec![hist_entry]
+            } else {
+                let mut h = item.history.clone();
+                h.push(hist_entry);
+                h
+            };
             worklist.push(WorkItem {
                 pc: next_pc,
                 state: next_state,
                 last_cp: item_last_cp,
+                history,
             });
         }
         // the item is consumed: its parent-chain branch counts drop by
@@ -900,20 +1403,18 @@ mod tests {
     }
 
     #[test]
-    fn verify_mini_dedup_distinct_join_states_not_merged() {
-        // different r0 values (live at exit) → the join states differ
-        // and both are stored
+    fn verify_mini_imprecise_join_difference_pruned() {
+        // the paths write different r0 values, but NO value-dependent
+        // use ever needs r0's range (the exit check is type-only): the
+        // scalar stays imprecise, so the join states are equal and the
+        // second arrival is pruned — the kernel's precision behavior
+        // (#98): "if (!rold->precise && exact == NOT_EXACT) return
+        // true"
         let program = diamond(2, 1);
-        // different r0 values (live at exit) → the join states differ,
-        // so the fall's arrival is ANALYZED (not pruned): TWO states at
-        // the join. The add_new_state heuristic still gates the third
-        // store (fewer than 8 insns since the fall's own pc 22
-        // checkpoint), so the checkpoint count stays 2 — like the
-        // kernel's total_states.
         let (count, states) =
             verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
         assert_eq!(count, 2);
-        assert_eq!(states.get(&25).unwrap().len(), 2);
+        assert_eq!(states.get(&25).unwrap().len(), 1);
     }
 
     #[test]
@@ -932,21 +1433,30 @@ mod tests {
     }
 
     #[test]
-    fn verify_mini_live_register_difference_blocks_dedup() {
-        // the same shape, but r7 is read on the shared tail after the
-        // join (25: r0 = r7; 26: exit): the paths' different r7 values
-        // are live at the join, so the join states differ and both are
-        // stored
+    fn verify_mini_precise_join_difference_blocks_dedup() {
+        // the same shape, but the shared tail's branch compares r7
+        // against a constant with a static verdict: the verdict's
+        // precision backtracking marks r7 precise in the stored join
+        // checkpoint, so the second arrival's different r7 is NOT
+        // pruned — the soundness anchor of the imprecise shortcut:
+        // 25: r0 = r7 ; 26: jgt r7, 100, +1 (always taken: 7/42 < 100)
+        // 27: exit ; 28: exit
         let mut program = diamond(1, 1);
         program.push(BpfInsn::MovReg { dst: 0, src: 7 });
+        program.push(BpfInsn::JgtImm {
+            dst: 7,
+            imm: 100,
+            offset: 1,
+        });
+        program.push(BpfInsn::Exit);
         program.push(BpfInsn::Exit);
         // retarget the jumps to the new join at 26
         program[21] = BpfInsn::Jmp { offset: 4 };
         program[24] = BpfInsn::Jmp { offset: 1 };
         let (count, states) =
             verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
-        // r7 is live at the join → the two arrivals differ → both are
-        // analyzed (TWO states at the join pc 26)
+        // r7 is precise at the join → the two arrivals differ → both
+        // are analyzed (TWO states at the join pc 26)
         assert_eq!(count, 2);
         assert_eq!(states.get(&26).unwrap().len(), 2);
     }
@@ -954,21 +1464,237 @@ mod tests {
     #[test]
     fn verify_mini_taken_branch_processed_first() {
         // the kernel processes the taken branch before the fall-through
-        // (check_cond_jmp_op pushes the fall-through): with different
-        // r0 values the join stores both checkpoints, and the coverage
-        // map records the taken path's arrival (r0 = 2) first
-        let program = diamond(2, 1);
+        // (check_cond_jmp_op pushes the fall-through): with a PRECISE
+        // r7 difference (the tail's verdict marks it, see the test
+        // above) both join arrivals are analyzed, and the coverage map
+        // records the taken path's arrival (r7 = 2) first
+        let mut program = diamond(1, 1);
+        program.push(BpfInsn::MovReg { dst: 0, src: 7 });
+        program.push(BpfInsn::JgtImm {
+            dst: 7,
+            imm: 100,
+            offset: 1,
+        });
+        program.push(BpfInsn::Exit);
+        program.push(BpfInsn::Exit);
+        program[21] = BpfInsn::Jmp { offset: 4 };
+        program[24] = BpfInsn::Jmp { offset: 1 };
         let (count, states) =
             verify_mini_with_states(&program, &[], &VerifierLimits::default()).unwrap();
         assert_eq!(count, 2);
-        let join = states.get(&25).expect("join pc recorded");
+        let join = states.get(&26).expect("join pc recorded");
         assert_eq!(join.len(), 2);
         assert_eq!(
-            join[0].regs[0],
+            join[0].regs[7],
             RegState::Scalar(ScalarBounds::constant(2)),
-            "the taken path (r0 = 2) is analyzed first"
+            "the taken path (r7 = 2) is analyzed first"
         );
-        assert_eq!(join[1].regs[0], RegState::Scalar(ScalarBounds::constant(1)));
+        assert_eq!(join[1].regs[7], RegState::Scalar(ScalarBounds::constant(1)));
+    }
+
+    #[test]
+    fn verify_mini_branch_verdict_precision_prevents_false_accept() {
+        // the soundness anchor of the imprecise scalar shortcut (#98):
+        // the two paths' r7 values straddle the verdict boundary of the
+        // shared tail's branch, so the verdicts (and the explored
+        // continuations) differ. The taken path's verdict at pc 27
+        // backtracks and marks r7 precise in the stored join
+        // checkpoint; the fall path's arrival (r7 = 50) must NOT be
+        // pruned against it — its continuation contains an
+        // uninitialized stack read that the kernel rejects:
+        // 0-5: r1..r6 = 1
+        // 6: jeq r10, r10, +3 → taken 10, fall 7
+        // 7: r0 = 0 ; 8: r7 = 50 ; 9: jmp +6 → 16
+        // 10: r0 = 0 ; 11: r7 = 150 ; 12: r9 = 1 ; 13: r8 = 1
+        // 14: jmp +1 → 16 ; 15: r6 = 6
+        // 16: r0 = r7 ; 17: jgt r7, 100, +1 → taken 19, fall 18
+        // 18: r2 = [r10-8]  ← uninit on the fall's verdict direction
+        // 19: exit
+        let program = vec![
+            BpfInsn::MovImm { dst: 1, imm: 1 },
+            BpfInsn::MovImm { dst: 2, imm: 1 },
+            BpfInsn::MovImm { dst: 3, imm: 1 },
+            BpfInsn::MovImm { dst: 4, imm: 1 },
+            BpfInsn::MovImm { dst: 5, imm: 1 },
+            BpfInsn::MovImm { dst: 6, imm: 1 },
+            BpfInsn::Jeq {
+                dst: 10,
+                src: 10,
+                offset: 3,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 7, imm: 50 },
+            BpfInsn::Jmp { offset: 7 },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 7, imm: 150 },
+            BpfInsn::MovImm { dst: 9, imm: 1 },
+            BpfInsn::MovImm { dst: 8, imm: 1 },
+            BpfInsn::MovImm { dst: 6, imm: 6 },
+            BpfInsn::MovImm { dst: 5, imm: 5 },
+            BpfInsn::Jmp { offset: 0 },
+            BpfInsn::MovReg { dst: 0, src: 7 },
+            BpfInsn::JgtImm {
+                dst: 7,
+                imm: 100,
+                offset: 1,
+            },
+            BpfInsn::LdMem {
+                dst: 2,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let err = verify_mini(&program, &heads).unwrap_err();
+        assert!(
+            err.message.contains("uninitialized"),
+            "the fall path's uninit read must be found: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn verify_mini_bounded_loop_checkpoint_count() {
+        // the bounded counter loop: the jlt's static verdict marks r1
+        // precise (the kernel: 204 processed insns, total_states 6 for
+        // the 100-iteration loop), so the iterations do not collapse
+        // via the imprecise shortcut — but the in-progress store
+        // throttle keeps the CHECKPOINT count small, like the kernel's
+        // total_states
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 2, imm: 100 },
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::AddImm { dst: 1, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 1,
+                src: 2,
+                offset: -2,
+            },
+            BpfInsn::Exit,
+        ];
+        let count = verify_mini(&program, &[3]).unwrap();
+        // the kernel stores 6 states for this loop; ours stays in the
+        // same ballpark (a handful of checkpoints, not one per
+        // iteration)
+        assert!(count <= 8, "checkpoint count {count} too large");
+    }
+
+    #[test]
+    fn verify_mini_scalar_plus_pointer_precision_regression() {
+        // #98 review blocker 1: `scalar += pointer` derives the
+        // pointer offset from the scalar, so the scalar must be marked
+        // precise — otherwise the imprecise shortcut prunes a path
+        // whose pointer offset leaves the frame:
+        // 0: call 7 ; 1: r4 = 42 ; 2: [r10-8] = r4 ; 3: r5 = r0
+        // 4: r6 = 15 ; 5: jgt r5, r6, +2 (unknown) → taken 8 (r0=0),
+        //    fall 6 (r0=200)
+        // 6: r0 = 200 ; 7: jmp +2 → 10
+        // 8: r0 = 0 ; 9: jmp +1 → 11
+        // 10: r3 = 3
+        // 11: r0 += r10        (scalar += pointer — the join)
+        // 12: r2 = [r0-8]      (r10-8 for r0=0; r10+192 for r0=200 → REJECT)
+        // 13: r0 = r2 ; 14: exit
+        let program = vec![
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::MovImm { dst: 4, imm: 42 },
+            BpfInsn::StMem {
+                src: 4,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::MovReg { dst: 5, src: 0 },
+            BpfInsn::MovImm { dst: 6, imm: 15 },
+            BpfInsn::Jgt {
+                dst: 5,
+                src: 6,
+                offset: 2,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 200 },
+            BpfInsn::Jmp { offset: 2 },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Jmp { offset: 1 },
+            BpfInsn::MovImm { dst: 3, imm: 3 },
+            BpfInsn::AddReg { dst: 0, src: 10 },
+            BpfInsn::LdMem {
+                dst: 2,
+                base: 0,
+                offset: -8,
+            },
+            BpfInsn::MovReg { dst: 0, src: 2 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let err = verify_mini(&program, &heads).unwrap_err();
+        assert!(
+            err.message.contains("exceeds"),
+            "the r0=200 path's out-of-frame access must be found: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn verify_mini_store_pc_site_marks_new_checkpoint() {
+        // #98 review blocker 2: a value-dependent site at a pc that
+        // ALSO stores a checkpoint must mark the NEW checkpoint (the
+        // kernel links `cur->parent = new` before processing the
+        // instruction) — otherwise the sibling path with a different
+        // verdict direction is pruned and its unsafe continuation is
+        // never checked:
+        // 0: call 7 ; 1: r5 = r0 ; 2: r6 = 15 ; 3: r1 = 1 ; 4: r2 = 1
+        // 5: r3 = 1 ; 6: r4 = 1
+        // 7: jgt r5, r6, +3 (unknown) → taken 11 (A, r0=0), fall 8 (B, r0=200)
+        // 8: r0 = 200 ; 9: r9 = 1 ; 10: jmp +3 → 14
+        // 11: r0 = 0 ; 12: r9 = 1 ; 13: jmp +1 → 15
+        // 14: r8 = 1
+        // 15: jlt r0, r1, +2  (prune point AND verdict: A taken → 18;
+        //                      B: 200<1 false → 16)
+        // 16: r2 = [r10-8]     (uninit — B only → REJECT)
+        // 17: r0 = r9 ; 18: exit
+        let program = vec![
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::MovReg { dst: 5, src: 0 },
+            BpfInsn::MovImm { dst: 6, imm: 15 },
+            BpfInsn::MovImm { dst: 1, imm: 1 },
+            BpfInsn::MovImm { dst: 2, imm: 1 },
+            BpfInsn::MovImm { dst: 3, imm: 1 },
+            BpfInsn::MovImm { dst: 4, imm: 1 },
+            BpfInsn::Jgt {
+                dst: 5,
+                src: 6,
+                offset: 3,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 200 },
+            BpfInsn::MovImm { dst: 9, imm: 1 },
+            BpfInsn::Jmp { offset: 3 },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::MovImm { dst: 9, imm: 1 },
+            BpfInsn::Jmp { offset: 1 },
+            BpfInsn::MovImm { dst: 8, imm: 1 },
+            BpfInsn::Jlt {
+                dst: 0,
+                src: 1,
+                offset: 2,
+            },
+            BpfInsn::LdMem {
+                dst: 2,
+                base: 10,
+                offset: -8,
+            },
+            BpfInsn::MovReg { dst: 0, src: 9 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let err = verify_mini(&program, &heads).unwrap_err();
+        assert!(
+            err.message.contains("uninitialized"),
+            "the B path's uninit read must be found: {}",
+            err.message
+        );
     }
 
     #[test]

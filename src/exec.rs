@@ -763,7 +763,7 @@ fn check_map_buffer(
 /// stay within the 512-byte frame and be 8-byte aligned; the covered
 /// slot range (inclusive) is returned. Mirrors the kernel's
 /// `check_stack_access_within_bounds` + alignment requirement.
-fn stack_access_range(
+pub(crate) fn stack_access_range(
     pc: u32,
     base: u8,
     state: &VerifierState,
@@ -1046,6 +1046,7 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax),
+                precise: false,
             }
             .synced()
         }
@@ -1065,6 +1066,7 @@ fn apply_alu(op: AluOp, width: AluWidth, d: ScalarBounds, s: ScalarBounds) -> Sc
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: alu_tnum(op, d.tnum, s.tnum, s.smin, s.smax).subreg(),
+                precise: false,
             }
             .synced()
         }
@@ -1557,6 +1559,7 @@ pub(crate) fn refine_eq(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         // equality narrows the tnum to the common values (kernel
         // tnum_intersect in regs_refine_cond_op)
         tnum: dst.tnum.intersect(src.tnum),
+        precise: false,
     }
     .synced();
     // the fall-through (dst != src) excludes the other operand's values
@@ -1614,6 +1617,7 @@ fn exclude_bounds(a: ScalarBounds, b: ScalarBounds) -> ScalarBounds {
         // inequality cannot narrow the tnum: the complement of a tnum
         // is not representable — keep the sound over-approximation
         tnum: a.tnum,
+        precise: false,
     }
 }
 
@@ -1633,6 +1637,7 @@ pub(crate) fn refine_ne(dst: ScalarBounds, src: ScalarBounds) -> RefinedBranches
         u32_min: 0,
         u32_max: u32::MAX,
         tnum: dst.tnum.intersect(src.tnum),
+        precise: false,
     }
     .synced();
     (
@@ -2409,6 +2414,7 @@ mod tests {
             u32_min: u32::MAX - 9,
             u32_max: u32::MAX,
             tnum: Tnum::unknown(),
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2821,6 +2827,7 @@ mod tests {
                 value: 0b001,
                 mask: 0b010,
             },
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::AndImm { dst: 1, imm: 1 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2847,6 +2854,7 @@ mod tests {
                 value: 0,
                 mask: 0b001,
             },
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::OrImm { dst: 1, imm: 0b100 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2876,6 +2884,7 @@ mod tests {
             u32_min: 1,
             u32_max: 1,
             tnum: Tnum::constant(0x1_0000_0001),
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::Add32Imm { dst: 1, imm: 0 }).unwrap();
         let RegState::Scalar(b) = next.regs[1] else {
@@ -2901,6 +2910,7 @@ mod tests {
                 value: 0,
                 mask: 0b001,
             },
+            precise: false,
         });
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
         let nexts = successors(
@@ -2938,6 +2948,7 @@ mod tests {
                 value: 0,
                 mask: 0b001,
             },
+            precise: false,
         });
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
         let nexts = successors(
@@ -2982,6 +2993,7 @@ mod tests {
                 value: 0,
                 mask: 0b001,
             },
+            precise: false,
         });
         let state = step(
             0,
@@ -3031,6 +3043,7 @@ mod tests {
                 u32_min: 0xFFFF_FFF0,
                 u32_max: 0xFFFF_FFFF,
                 tnum: Tnum::unknown(),
+                precise: false,
             }
             .synced(),
         );
@@ -3052,6 +3065,7 @@ mod tests {
                 u32_min: 0,
                 u32_max: u32::MAX,
                 tnum: Tnum::unknown(),
+                precise: false,
             }
             .synced(),
         );
@@ -3348,6 +3362,7 @@ mod tests {
                 value: 0,
                 mask: 0b1000,
             },
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         assert_eq!(
@@ -3397,6 +3412,7 @@ mod tests {
             u32_min: 0,
             u32_max: 1000,
             tnum: Tnum::unknown(),
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         let RegState::PtrToStack {
@@ -3449,6 +3465,7 @@ mod tests {
                 value: 0,
                 mask: 0b101,
             },
+            precise: false,
         });
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
         let RegState::PtrToStack {
@@ -3483,6 +3500,7 @@ mod tests {
             u32_min: 1,
             u32_max: 1,
             tnum: Tnum::constant(1),
+            precise: false,
         });
         // exact result (r2 is a constant): accepted — access-time checks
         // cover exact offsets

@@ -89,6 +89,77 @@ fn map_value_within(old: &RegState, new: &RegState) -> bool {
     }
 }
 
+/// The kernel's `regs_exact()`: full structural register equality that
+/// deliberately EXCLUDES the scalar precision bit (kernel: memcmp up to
+/// `offsetof(struct bpf_reg_state, id)` — `precise` lives after it, and
+/// `states_maybe_looping`'s memcmp up to `frameno` excludes it too).
+/// The precise bit only drives the NOT_EXACT scalar shortcut; it never
+/// participates in equality.
+pub(crate) fn regs_exact(old: &RegState, new: &RegState) -> bool {
+    match (old, new) {
+        (RegState::Uninit, RegState::Uninit) => true,
+        (RegState::Scalar(a), RegState::Scalar(b)) => scalar_bounds_exact(a, b),
+        (
+            RegState::PtrToStack {
+                min_offset: a_min,
+                max_offset: a_max,
+                align_off: a_align,
+            },
+            RegState::PtrToStack {
+                min_offset: b_min,
+                max_offset: b_max,
+                align_off: b_align,
+            },
+        ) => a_min == b_min && a_max == b_max && a_align == b_align,
+        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (
+            RegState::PtrToMap {
+                key_size: a_key,
+                value_size: a_val,
+            },
+            RegState::PtrToMap {
+                key_size: b_key,
+                value_size: b_val,
+            },
+        ) => a_key == b_key && a_val == b_val,
+        (
+            RegState::PtrToMapValue {
+                min_offset: a_min,
+                max_offset: a_max,
+                align_off: a_align,
+                value_size: a_size,
+            },
+            RegState::PtrToMapValue {
+                min_offset: b_min,
+                max_offset: b_max,
+                align_off: b_align,
+                value_size: b_size,
+            },
+        ) => a_min == b_min && a_max == b_max && a_align == b_align && a_size == b_size,
+        (
+            RegState::PtrToMapValueOrNull { value_size: a_size },
+            RegState::PtrToMapValueOrNull { value_size: b_size },
+        ) => a_size == b_size,
+        _ => false,
+    }
+}
+
+/// Scalar equality excluding the precision bit.
+pub(crate) fn scalar_bounds_exact(
+    a: &crate::state::ScalarBounds,
+    b: &crate::state::ScalarBounds,
+) -> bool {
+    a.smin == b.smin
+        && a.smax == b.smax
+        && a.umin == b.umin
+        && a.umax == b.umax
+        && a.s32_min == b.s32_min
+        && a.s32_max == b.s32_max
+        && a.u32_min == b.u32_min
+        && a.u32_max == b.u32_max
+        && a.tnum == b.tnum
+}
+
 /// The kernel's `regsafe()`: whether the explored register `old` being
 /// safe implies the current register `new` is safe.
 ///
@@ -98,7 +169,7 @@ fn map_value_within(old: &RegState, new: &RegState) -> bool {
 /// on the old state may have affected other registers with the same id.
 pub(crate) fn regsafe(old: &RegState, new: &RegState, exact: ExactLevel) -> bool {
     if exact == ExactLevel::Exact {
-        return old == new;
+        return regs_exact(old, new);
     }
     if *old == RegState::Uninit {
         // the explored state never used this register (or it was dead
@@ -106,7 +177,22 @@ pub(crate) fn regsafe(old: &RegState, new: &RegState, exact: ExactLevel) -> bool
         return true;
     }
     match (old, new) {
-        (RegState::Scalar(old_b), RegState::Scalar(new_b)) => scalar_range_within(old_b, new_b),
+        (RegState::Scalar(old_b), RegState::Scalar(new_b)) => {
+            // the kernel's scalar precision shortcut (states.c): an
+            // *imprecise* explored scalar matches any current scalar
+            // at NOT_EXACT — the range knowledge does not affect any
+            // safety decision, so the current value cannot matter.
+            // Soundness rests on precision backtracking (#98) marking
+            // every value-dependent register precise in the stored
+            // states; until then every scalar stays imprecise and the
+            // ranges are skipped, exactly like the kernel's
+            // `if (!rold->precise && exact == NOT_EXACT) return true;`
+            if !old_b.precise && exact == ExactLevel::NotExact {
+                true
+            } else {
+                scalar_range_within(old_b, new_b)
+            }
+        }
         // two stack pointers are equal only if they point to the same
         // offset (kernel PTR_TO_STACK: `regs_exact` — fp-8 in one
         // frame is not fp-8 in another)
@@ -151,19 +237,19 @@ pub(crate) fn stacksafe(old: &StackState, new: &StackState, exact: ExactLevel) -
                 // the explored state never used this slot — ignore it
             }
             StackSlot::Initialized => {
-                // old MISC: safe with another MISC slot or a
+                // old MISC: safe with another MISC slot, a
                 // zero-initialized slot ("if old state was safe with
                 // misc data in the stack it will be safe with
                 // zero-initialized stack. The opposite is not true" —
-                // kernel stacksafe); never safe with an uninitialized
-                // slot. The kernel additionally matches a current
-                // scalar spill here (its MISC slot is compared through
-                // the imprecise unbound_reg fake register at NOT_EXACT);
-                // ours stays stricter until the precise bit lands
-                // (#98), which only makes pruning more conservative
+                // kernel stacksafe), and — with the precise bit landed
+                // (#98) — any current SCALAR spill: the kernel compares
+                // the old MISC slot through the imprecise unbound_reg
+                // fake register (states.c scalar_reg_for_stack), which
+                // the NOT_EXACT imprecise shortcut matches against any
+                // scalar. A current pointer spill still never matches.
                 match &new.slots[i] {
                     StackSlot::Initialized => {}
-                    StackSlot::Spilled(RegState::Scalar(b)) if b.is_zero() => {}
+                    StackSlot::Spilled(RegState::Scalar(_)) => {}
                     _ => return false,
                 }
             }
@@ -191,7 +277,7 @@ fn slot_types_equal_exact(old: &StackSlot, new: &StackSlot) -> bool {
     match (old, new) {
         (StackSlot::Uninit, StackSlot::Uninit) => true,
         (StackSlot::Initialized, StackSlot::Initialized) => true,
-        (StackSlot::Spilled(a), StackSlot::Spilled(b)) => regsafe(a, b, ExactLevel::Exact),
+        (StackSlot::Spilled(a), StackSlot::Spilled(b)) => regs_exact(a, b),
         _ => false,
     }
 }
@@ -243,7 +329,13 @@ pub(crate) fn clean_state(state: &mut VerifierState, live_regs: u16, live_stack:
 /// frame pointer) must be exactly equal — the prefilter of the
 /// infinite-loop detection before the full EXACT comparison.
 pub(crate) fn states_maybe_looping(old: &VerifierState, new: &VerifierState) -> bool {
-    old.regs == new.regs
+    // the kernel's memcmp up to `frameno` — every field except the
+    // precision bit (which lives after frameno and only drives the
+    // NOT_EXACT scalar shortcut)
+    old.regs
+        .iter()
+        .zip(&new.regs)
+        .all(|(a, b)| regs_exact(a, b))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
@@ -263,14 +355,49 @@ mod tests {
 
     // ── regsafe: scalars ──────────────────────────────────────────────
 
+    /// The containment checks below use PRECISE explored scalars — the
+    /// imprecise shortcut is tested separately (#98).
+    fn precise(b: ScalarBounds) -> ScalarBounds {
+        ScalarBounds { precise: true, ..b }
+    }
+
+    #[test]
+    fn regsafe_imprecise_scalar_matches_anything() {
+        // the kernel's scalar precision shortcut: an imprecise explored
+        // scalar matches ANY current scalar at NOT_EXACT (states.c:
+        // "if (!rold->precise && exact == NOT_EXACT) return true") —
+        // even a wider range or a different type... no, types must
+        // still match; only the RANGE is skipped
+        let old = scalar_state(1, ScalarBounds::from_signed(0, 100));
+        let wide = scalar_state(1, ScalarBounds::from_signed(-50, 200));
+        assert!(regsafe(&old.regs[1], &wide.regs[1], ExactLevel::NotExact));
+        let other = scalar_state(1, ScalarBounds::constant(7));
+        assert!(regsafe(&old.regs[1], &other.regs[1], ExactLevel::NotExact));
+        // ... but a PRECISE explored scalar enforces the ranges
+        let mut precise_old = scalar_state(1, precise(ScalarBounds::from_signed(0, 100)));
+        precise_old.regs[1] = RegState::Scalar(precise(ScalarBounds::from_signed(0, 100)));
+        assert!(!regsafe(
+            &precise_old.regs[1],
+            &wide.regs[1],
+            ExactLevel::NotExact
+        ));
+    }
+
     #[test]
     fn regsafe_scalar_containment() {
         // the explored range must contain the current one (old ⊇ new)
-        let old = scalar_state(1, ScalarBounds::from_signed(0, 100));
+        let old = scalar_state(1, precise(ScalarBounds::from_signed(0, 100)));
         let new = scalar_state(1, ScalarBounds::from_signed(10, 20));
         assert!(regsafe(&old.regs[1], &new.regs[1], ExactLevel::NotExact));
-        // the other direction never holds
-        assert!(!regsafe(&new.regs[1], &old.regs[1], ExactLevel::NotExact));
+        // the other direction never holds (the explored side must be
+        // precise for the direction to be observable — an imprecise
+        // explored scalar matches anything, #98)
+        let narrow = scalar_state(1, precise(ScalarBounds::from_signed(10, 20)));
+        assert!(!regsafe(
+            &narrow.regs[1],
+            &old.regs[1],
+            ExactLevel::NotExact
+        ));
         // wider current ranges are not covered
         let wide = scalar_state(1, ScalarBounds::from_signed(-50, 200));
         assert!(!regsafe(&old.regs[1], &wide.regs[1], ExactLevel::NotExact));
@@ -288,6 +415,9 @@ mod tests {
             &partial.regs[1],
             ExactLevel::NotExact
         ));
+        // ... and the shortcut stays off for precise old scalars: a
+        // WIDER current range is still not covered
+        let _ = wide;
     }
 
     #[test]
@@ -303,9 +433,10 @@ mod tests {
             u32_min: 0,
             u32_max: 3,
             tnum: Tnum { value, mask },
+            precise: false,
         };
-        let wide = scalar_state(1, tnum_bounds(0, 0b011));
-        let narrow = scalar_state(1, tnum_bounds(0b001, 0));
+        let wide = scalar_state(1, precise(tnum_bounds(0, 0b011)));
+        let narrow = scalar_state(1, precise(tnum_bounds(0b001, 0)));
         assert!(regsafe(
             &wide.regs[1],
             &narrow.regs[1],
@@ -465,9 +596,10 @@ mod tests {
 
     #[test]
     fn stacksafe_spill_comparison() {
+        // the old spilled scalar is PRECISE (#98) — ranges are enforced
         let mut old = VerifierState::initial();
         old.stack.slots[0] =
-            StackSlot::Spilled(RegState::Scalar(ScalarBounds::from_signed(0, 100)));
+            StackSlot::Spilled(RegState::Scalar(precise(ScalarBounds::from_signed(0, 100))));
         let mut new = VerifierState::initial();
         new.stack.slots[0] =
             StackSlot::Spilled(RegState::Scalar(ScalarBounds::from_signed(10, 20)));
@@ -493,10 +625,15 @@ mod tests {
         assert!(stacksafe(&old.stack, &zero.stack, ExactLevel::NotExact));
         // the reverse never holds
         assert!(!stacksafe(&zero.stack, &old.stack, ExactLevel::NotExact));
-        // a non-zero spill is not covered by a MISC slot
-        let mut nonzero = VerifierState::initial();
-        nonzero.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
-        assert!(!stacksafe(&old.stack, &nonzero.stack, ExactLevel::NotExact));
+        // any scalar spill is covered by a MISC slot at NOT_EXACT (the
+        // kernel's imprecise unbound_reg fake, #98) — but a pointer
+        // spill still is not
+        let mut scalar = VerifierState::initial();
+        scalar.stack.slots[0] = StackSlot::Spilled(RegState::Scalar(ScalarBounds::constant(1)));
+        assert!(stacksafe(&old.stack, &scalar.stack, ExactLevel::NotExact));
+        let mut ptr = VerifierState::initial();
+        ptr.stack.slots[0] = StackSlot::Spilled(RegState::PtrToCtx);
+        assert!(!stacksafe(&old.stack, &ptr.stack, ExactLevel::NotExact));
     }
 
     #[test]
@@ -525,15 +662,20 @@ mod tests {
         // next write) → the states are equal
         let mut old = VerifierState::initial();
         old.regs[0] = RegState::Scalar(ScalarBounds::constant(1));
-        old.regs[1] = RegState::Scalar(ScalarBounds::constant(42));
+        // r1 is PRECISE (a value-dependent use marked it, #98) — its
+        // range is enforced even at NOT_EXACT; r0 is imprecise, so the
+        // r0 difference alone never blocks equality
+        old.regs[1] = RegState::Scalar(precise(ScalarBounds::constant(42)));
         let mut new = VerifierState::initial();
         new.regs[0] = RegState::Scalar(ScalarBounds::constant(2));
         new.regs[1] = RegState::Scalar(ScalarBounds::constant(42));
         // r1 live, r0 dead
         assert!(states_equal(&old, &new, ExactLevel::NotExact, 1 << 1));
-        // with r0 live the states differ
+        // with r0 live AND PRECISE the states differ
+        let mut precise_old = old;
+        precise_old.regs[0] = RegState::Scalar(precise(ScalarBounds::constant(1)));
         assert!(!states_equal(
-            &old,
+            &precise_old,
             &new,
             ExactLevel::NotExact,
             (1 << 0) | (1 << 1)
