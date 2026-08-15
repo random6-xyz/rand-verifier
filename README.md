@@ -30,8 +30,8 @@ Programs use the kernel `struct bpf_insn` encoding (8 bytes/instruction). Build:
 ## Current state
 
 - **Campaigns**: 24 kernel-backed runs (22 mutation + 2 generation), 340K+ programs, verified inside a qemu bpf-next guest.
-- **Corpus**: 40 accept / 38 reject fixtures in `tests/programs/` (see `tests/programs/README.md`), 493 tests green in CI.
-- **Model**: mini covers scalar ranges (signed/unsigned + tnum), ALU32/64, stack spill/fill (8-byte slots), map/ctx/stack pointers with access-time bounds, helper calls, bounded loops. State pruning is kernel-style (liveness masks, prune points, parent/checkpoint states, `regsafe()`/`stacksafe()`/`states_equal()`). Not yet covered: BPF-to-BPF calls, precision tracking, reference tracking, BTF/kfunc — see the roadmap below.
+- **Corpus**: 47 accept / 43 reject fixtures in `tests/programs/` (see `tests/programs/README.md`), 511 tests green in CI, with a drift-monitoring baseline against bpf-next 7.2.0-rc6 (`tools/drift-baseline/`, CI records and compares every push).
+- **Model**: mini covers scalar ranges (signed/unsigned + tnum), ALU32/64, stack spill/fill (8-byte slots), map/ctx/stack pointers with access-time bounds, helper calls, bounded loops, BPF-to-BBP calls with multiple verifier frames, kernel-style state pruning (liveness masks, prune points, parent/checkpoint states, `regsafe()`/`stacksafe()`/`states_equal()`), scalar precision tracking with backtracking, and register ids with linked-refinement and nullable-alias refinement. Not yet covered: byte-level stack accesses (1/2/4-byte), BTF/kfunc/ref tracking — see the roadmap below.
 
 ## Kernel findings
 
@@ -43,11 +43,11 @@ Programs use the kernel `struct bpf_insn` encoding (8 bytes/instruction). Build:
 
 Deepen the abstract state model toward the kernel verifier's. Priority order, and after every step the differential fuzzer runs to compare verdicts and state counts (false reject / false accept / state-count drift):
 
-1. **State pruning** — parent states, register/stack liveness, `regsafe()` / `states_equal()` structure, dead-state pruning.
-2. **Precision tracking** — `precise` bit, instruction dependency tracking, precision backtracking.
-3. **Register/pointer realism** — `id` / `parent_id` / provenance, fixed/variable offsets, nullable pointer aliasing, `tnum` + `cnum32/cnum64`.
-4. **Stack / call frames** — byte-level stack state, spill/fill metadata, BPF-to-BPF calls, multiple verifier frames.
-5. **Modern verifier features** — BTF pointers, kfunc, ref acquire/release, dynptr / kptr / iterator.
+1. **State pruning** — parent states, register/stack liveness, `regsafe()` / `states_equal()` structure, dead-state pruning. ✅
+2. **Precision tracking** — `precise` bit, instruction dependency tracking, precision backtracking. ✅
+3. **Register/pointer realism** — `id` / `parent_id` / provenance, fixed/variable offsets, nullable pointer aliasing, `tnum` + `cnum32/cnum64`. ✅ (ids, linked refinement, nullable aliasing; `parent_id`/cnum pending)
+4. **Stack / call frames** — byte-level stack state, spill/fill metadata, BPF-to-BPF calls, multiple verifier frames. ⚠️ (calls + frames done; byte-level stack accesses pending)
+5. **Modern verifier features** — BTF pointers, kfunc, ref acquire/release, dynptr / kptr / iterator. ⚠️ (kfunc decode + documented BTF gap)
 
 Beyond finding bugs, this model doubles as a **drift-monitoring oracle**: re-verify the corpus and fuzz pool against every bpf-next rc in qemu, and report verdict / state-count / processed-insn regressions to maintainers early.
 
