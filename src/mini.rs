@@ -215,6 +215,23 @@ fn verify_mini_core(
             ));
         }
         if seen.iter().any(|old| subsumes(old, &item.state)) {
+            // The kernel explores every distinct state (its pruning is
+            // equality-based), so a state mini would subsume can still
+            // be a no-progress loop: the kernel processes it and the
+            // next arrival repeats. Look one step ahead — a successor
+            // at a loop pc that equals the current state is a
+            // fixed-point loop (campaign finding mseed-999983-144).
+            if loop_pcs.contains(&item.pc) {
+                let nexts = successors(item.pc, &program[item.pc as usize], &item.state)?;
+                for (next_pc, next_state) in nexts {
+                    if loop_pcs.contains(&next_pc) && next_state == item.state {
+                        return Err(VerificationFailure::new(
+                            next_pc,
+                            format!("infinite loop detected at insn {}", next_pc),
+                        ));
+                    }
+                }
+            }
             continue;
         }
         seen.push(item.state);
@@ -1008,5 +1025,68 @@ mod tests {
         assert!(subsumes(&map, &map));
         assert!(!subsumes(&map, &ctx));
         assert!(!subsumes(&ctx, &map));
+    }
+}
+
+#[cfg(test)]
+mod loop_fixed_point_tests {
+    use super::*;
+    use crate::insn::BpfInsn;
+
+    /// A subsumed state at a loop pc whose successor loops back onto
+    /// itself is a no-progress (infinite) loop. Regression: the
+    /// subsumption pruning used to hide it — the kernel rejects such
+    /// programs with "infinite loop detected" (campaign finding
+    /// mseed-999983-144: r0 = prandom(); if r0 >= 0x7fffffff goto -2).
+    #[test]
+    fn subsumed_fixed_point_loop_detected() {
+        let program = vec![
+            BpfInsn::Call { imm: 7 }, // r0 = prandom() — unknown scalar
+            BpfInsn::MovImm { dst: 3, imm: 42 },
+            BpfInsn::JgeImm {
+                dst: 0,
+                imm: 2147483647,
+                offset: -2, // r0 >= 0x7fffffff → loop; r0 never changes
+            },
+            BpfInsn::Jle {
+                dst: 0,
+                src: 3,
+                offset: 1,
+            },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 4, imm: 42 },
+            BpfInsn::Jeq {
+                dst: 0,
+                src: 4,
+                offset: 1,
+            },
+            BpfInsn::Exit,
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let loop_heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let err = verify_mini(&program, &loop_heads).unwrap_err();
+        assert!(err.message.contains("infinite loop"), "{}", err.message);
+    }
+
+    /// A bounded narrowing loop must still converge through subsumption
+    /// (no false infinite-loop detection).
+    #[test]
+    fn bounded_narrowing_loop_still_accepted() {
+        // r2 = 3; loop: r2 -= 1; if r2 > 0 goto -2; r0 = 0; exit
+        let program = vec![
+            BpfInsn::MovImm { dst: 2, imm: 3 },
+            BpfInsn::SubImm { dst: 2, imm: 1 },
+            BpfInsn::JgtImm {
+                dst: 2,
+                imm: 0,
+                offset: -2,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let loop_heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        assert!(verify_mini(&program, &loop_heads).is_ok());
     }
 }

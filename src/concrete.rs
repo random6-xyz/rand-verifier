@@ -833,12 +833,16 @@ pub(crate) struct ConcreteOutcome {
 /// The result of a concrete exploration: every distinct visited state
 /// (in visit order, for the coverage checker #52) plus the exit
 /// outcomes. `inconclusive` means an exploration budget was hit — the
-/// run proves nothing (non-terminating loop candidate).
+/// run proves nothing (non-terminating loop candidate). `no_exit`
+/// means the exploration finished without reaching any exit and
+/// without a budget hit — every path is a deduplicated (non-
+/// converging) loop, i.e. the program never terminates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConcreteRun {
     pub(crate) visited: Vec<(u32, ConcreteState)>,
     pub(crate) outcomes: Vec<ConcreteOutcome>,
     pub(crate) inconclusive: bool,
+    pub(crate) no_exit: bool,
 }
 
 /// Explore a program with the default limits (no maps). `loop_heads`
@@ -897,6 +901,7 @@ pub(crate) fn run_concrete_with_maps(
                 visited: visited_order,
                 outcomes,
                 inconclusive: true,
+                no_exit: false,
             });
         }
 
@@ -918,6 +923,7 @@ pub(crate) fn run_concrete_with_maps(
                     visited: visited_order,
                     outcomes,
                     inconclusive: true,
+                    no_exit: false,
                 });
             }
         }
@@ -927,6 +933,7 @@ pub(crate) fn run_concrete_with_maps(
                 visited: visited_order,
                 outcomes,
                 inconclusive: true,
+                no_exit: false,
             });
         }
 
@@ -950,10 +957,15 @@ pub(crate) fn run_concrete_with_maps(
             worklist.push((next_pc, next_state));
         }
     }
+    // The worklist is empty: every path either exited or converged into
+    // a deduplicated loop. With no exit outcome the program never
+    // terminates (the kernel rejects such programs as infinite loops).
+    let no_exit = outcomes.is_empty();
     Ok(ConcreteRun {
         visited: visited_order,
         outcomes,
         inconclusive: false,
+        no_exit,
     })
 }
 
@@ -1451,6 +1463,12 @@ pub(crate) struct ConcreteReport {
     /// programs terminate within the concrete budget (mirrors the
     /// abstract loop budget).
     pub(crate) inconclusive: bool,
+    /// The concrete exploration finished without reaching any exit:
+    /// every path converges into a deduplicated loop, so the program
+    /// never terminates. On accepted programs this is a model bug
+    /// (mini missed the loop); on rejected programs it confirms the
+    /// rejection.
+    pub(crate) no_exit: bool,
     /// The concrete interpreter failed although the abstract verifier
     /// accepted the program — a model discrepancy.
     pub(crate) unexpected_failure: Option<ConcreteFailure>,
@@ -2987,5 +3005,63 @@ mod tests {
         let report = render_coverage_report(&precision, &program);
         assert!(report.contains("ABSTRACT MISSED PC"));
         assert!(!report.contains("NOT COVERED"));
+    }
+}
+
+#[cfg(test)]
+mod no_exit_tests {
+    use super::*;
+    use crate::insn::BpfInsn;
+
+    /// A deduplicated self-loop never reaches an exit: the run must be
+    /// flagged `no_exit` (never terminates) instead of a SAFE outcome.
+    /// Regression: the concrete cross-check used to report such
+    /// programs as "executes concretely — precision candidate" while
+    /// the kernel rejects them as infinite loops.
+    #[test]
+    fn self_loop_run_is_no_exit() {
+        // r0 = 0; r0 = prandom(); if r0 >= r0 goto -2  (always taken)
+        // the fall-through (r0 = 1; exit) is unreachable in concrete
+        // execution because r0 >= r0 is always true.
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::Jge {
+                dst: 0,
+                src: 0,
+                offset: -2,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let loop_heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let run = run_concrete(&program, &loop_heads).unwrap();
+        assert!(run.no_exit, "run must be flagged non-terminating");
+        assert!(run.outcomes.is_empty());
+        assert!(!run.inconclusive);
+    }
+
+    /// A terminating program with a real (bounded) loop reaches an exit
+    /// and is not flagged.
+    #[test]
+    fn bounded_loop_reaches_exit() {
+        // r2 = 3; loop: r2 -= 1; if r2 > 0 goto -2; r0 = 0; exit
+        let program = vec![
+            BpfInsn::MovImm { dst: 2, imm: 3 },
+            BpfInsn::SubImm { dst: 2, imm: 1 },
+            BpfInsn::JgtImm {
+                dst: 2,
+                imm: 0,
+                offset: -2,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let loop_heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        let run = run_concrete(&program, &loop_heads).unwrap();
+        assert!(!run.no_exit, "bounded loop must reach exit");
+        assert!(!run.outcomes.is_empty());
     }
 }

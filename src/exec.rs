@@ -1932,6 +1932,23 @@ pub(crate) fn cond_branch(
     op: CondOp,
     state: &VerifierState,
 ) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    // Same-register scalar comparison: `rX op rX` is statically decided
+    // regardless of the value — a register always equals itself (kernel
+    // is_scalar_branch_taken's `reg1 == reg2` shortcut: EQ/LE/GE/SLE/SGE
+    // are always taken, NE/LT/GT/SLT/SGT never). Without this, mini
+    // explores the dead branch of e.g. `if r0 <= r0` and can reject a
+    // program on an unreachable path the kernel never visits.
+    if src == dst && matches!(read_reg(pc, state, dst)?, RegState::Scalar(_)) {
+        let taken = matches!(
+            op,
+            CondOp::Eq | CondOp::Ule | CondOp::Uge | CondOp::Sle | CondOp::Sge
+        );
+        return Ok(vec![if taken {
+            (branch_target(pc, offset), *state)
+        } else {
+            (pc + 1, *state)
+        }]);
+    }
     let src_state = read_reg(pc, state, src)?;
     cond_branch_impl(pc, dst, Some(src), src_state, offset, op, state)
 }
@@ -5197,5 +5214,88 @@ mod tests {
             );
         }
         assert_eq!(next.regs[10], ptr_stack(0));
+    }
+}
+
+#[cfg(test)]
+mod self_compare_tests {
+    use super::*;
+    use crate::mini::verify_mini;
+
+    /// Same-register scalar comparisons are statically decided (kernel
+    /// is_scalar_branch_taken `reg1 == reg2`): EQ/LE/GE/SLE/SGE always
+    /// taken, NE/LT/GT/SLT/SGT never. Regression: `if r0 <= r0` used to
+    /// fork both branches, so an unreachable fall-through with an
+    /// uninitialized read rejected a program the kernel accepts
+    /// (campaign finding mseed-31415-2580).
+    #[test]
+    fn self_compare_scalar_always_taken_for_le() {
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Call { imm: 7 }, // r0 = scalar (unknown value)
+            BpfInsn::Jle {
+                dst: 0,
+                src: 0,
+                offset: 3, // r0 <= r0: always taken → exit
+            },
+            BpfInsn::Jlt {
+                dst: 2,
+                src: 4,
+                offset: 2,
+            }, // dead: uninit r2/r4
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::AndImm { dst: 9, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        assert!(verify_mini(&program, &[]).is_ok());
+    }
+
+    /// The dual: `r0 != r0` is never taken — only the fall-through is
+    /// explored, so an uninitialized read on the taken path is not
+    /// reported.
+    #[test]
+    fn self_compare_scalar_never_taken_for_ne() {
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Jne {
+                dst: 0,
+                src: 0,
+                offset: 2, // r0 != r0: never taken
+            },
+            BpfInsn::MovImm { dst: 0, imm: 2 },
+            BpfInsn::Exit,
+            BpfInsn::Jlt {
+                dst: 2,
+                src: 4,
+                offset: 0,
+            }, // dead
+            BpfInsn::Exit,
+        ];
+        assert!(verify_mini(&program, &[]).is_ok());
+    }
+
+    /// A scalar self-comparison loop is a genuine infinite loop: with
+    /// the fall-through pruned, mini must still reject it (back-edge
+    /// with an identical state), like the kernel's infinite-loop
+    /// detection.
+    #[test]
+    fn self_compare_loop_still_detected() {
+        let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Call { imm: 7 },
+            BpfInsn::Jge {
+                dst: 0,
+                src: 0,
+                offset: -2, // r0 >= r0: always taken → infinite loop
+            },
+            BpfInsn::MovImm { dst: 0, imm: 1 },
+            BpfInsn::Exit,
+        ];
+        // loop heads come from the structural pass in the real pipeline
+        let subprogs = crate::cfg::add_subprog(&program).unwrap();
+        let loop_heads = crate::cfg::check_cfg(&program, &subprogs).unwrap();
+        assert!(!loop_heads.is_empty());
+        let err = verify_mini(&program, &loop_heads).unwrap_err();
+        assert!(err.message.contains("infinite loop"), "{}", err.message);
     }
 }
