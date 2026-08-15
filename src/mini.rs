@@ -250,7 +250,7 @@ fn backtrack_insn(
         // are dead — a requirement still pending on them cannot be
         // resolved here (kernel: verifier_bug; we fall back
         // conservatively)
-        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } => {
+        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
             bt.regs &= !(1u16 << 0);
             if bt.regs & 0b111110 != 0 {
                 return BacktrackOutcome::Fallback;

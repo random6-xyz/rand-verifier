@@ -81,7 +81,7 @@ pub(crate) fn step(
         }
         // BPF-to-BPF call: save the current frame and enter the
         // subprogram with R1..R5 as arguments (#100)
-        BpfInsn::CallSub { .. } => {
+        BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
             let mut next = *state;
             next.call_subprog(pc + 1)
                 .map_err(|msg| VerificationFailure::new(pc, msg.to_string()))?;

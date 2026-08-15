@@ -213,7 +213,7 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         // registers R1..R5 and clobber all caller-saved registers
         // R0..R5 (kernel BPF_CALL: `def = ALL_CALLER_SAVED_REGS`,
         // `use = r1..r5`)
-        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } => {
+        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
             ud.use_regs = reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);
             ud.def_regs =
                 reg_bit(0) | reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);

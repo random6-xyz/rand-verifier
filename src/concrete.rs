@@ -216,6 +216,8 @@ pub(crate) enum ConcreteFailure {
     InvalidShiftAmount { pc: u32, amount: u64 },
     /// An unknown helper id (mirrors the abstract "unknown helper").
     UnknownHelper { pc: u32, imm: i32 },
+    /// A kfunc call (no BTF support, #101).
+    UnsupportedKfunc { pc: u32 },
     /// A helper argument that does not match the prototype (mirrors
     /// `check_helper_args`, #28).
     HelperArgMismatch { pc: u32, arg: u8 },
@@ -273,6 +275,9 @@ impl std::fmt::Display for ConcreteFailure {
                 write!(f, "at insn {}: invalid shift amount {}", pc, amount)
             }
             Self::UnknownHelper { pc, imm } => write!(f, "at insn {}: unknown helper {}", pc, imm),
+            Self::UnsupportedKfunc { pc } => {
+                write!(f, "at insn {}: unknown kfunc (no BTF support, #101)", pc)
+            }
             Self::HelperArgMismatch { pc, arg } => {
                 write!(
                     f,
@@ -708,7 +713,8 @@ pub(crate) fn concrete_step(
         | BpfInsn::JsltImm { .. }
         | BpfInsn::JsleImm { .. }
         | BpfInsn::Call { .. }
-        | BpfInsn::CallSub { .. } => {
+        | BpfInsn::CallSub { .. }
+        | BpfInsn::CallKfunc { .. } => {
             unreachable!(
                 "exit, control flow and calls are expanded by the explorer (#51), not concrete_step()"
             )
@@ -1090,8 +1096,9 @@ fn concrete_successors(
         BpfInsn::CallSub { offset } => {
             let mut callee = *state;
             callee.call_subprog(pc + 1)?;
-            Ok(vec![(branch_target(pc, *offset as i16), callee)])
+            Ok(vec![((pc as i32 + 1 + *offset) as u32, callee)])
         }
+        BpfInsn::CallKfunc { .. } => Err(ConcreteFailure::UnsupportedKfunc { pc }),
         BpfInsn::Jmp { offset } => Ok(vec![(branch_target(pc, *offset), *state)]),
         BpfInsn::Jeq { dst, src, offset } => {
             concrete_cond(pc, *dst, *src, *offset, CondOp::Eq, state)
