@@ -1,263 +1,23 @@
 {
-  "nullalias": {
+  "non_converging_loop": {
     "mini": {
-      "verdict": "REJECT(invalid access to map value r7+0, value_size=0 (base offsets 0..0))",
+      "verdict": "REJECT(back-edge exceeds max loops (256) — the loop does not converge)",
       "states": 0
     },
     "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 13,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "computed_offset_out_of_frame": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 1
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 14,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "range_checked_access": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "map_lookup_uninit_key": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "pointer_out_of_frame": {
-    "mini": {
-      "verdict": "REJECT(r0 is uninitialized at exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(PointerArith)",
+      "verdict": "REJECT(Complexity)",
       "insns": null,
       "total_states": null,
       "peak_states": null
     }
   },
-  "tnum_precise_branch": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "map_value_misaligned": {
-    "mini": {
-      "verdict": "REJECT(stack access at r0+0 is not 8-byte aligned)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(ExitR0)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "bounded_loop": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 5
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 204,
-      "total_states": 6,
-      "peak_states": 6
-    }
-  },
-  "alu32_zero_extend": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "pointer_reg_arith": {
-    "mini": {
-      "verdict": "REJECT(r0 is not a scalar value at exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 3,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "pointer_arithmetic": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 4,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "scalar_add_reg": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "invalid_helper_argument": {
-    "mini": {
-      "verdict": "REJECT(helper arg 1: r1 must be a map pointer (load a map fd with ldimm64 first))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(HelperArgs)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "ctx_arith": {
-    "mini": {
-      "verdict": "REJECT(r0 is uninitialized at exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "stack_wrong_direction": {
-    "mini": {
-      "verdict": "REJECT(stack access at r10+8 points away from the frame (valid: r10-512..r10-8))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(StackBounds)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "uninit_alu": {
+  "immediate_compare_uninit": {
     "mini": {
       "verdict": "REJECT(register r2 is uninitialized)",
       "states": 0
     },
     "kernel": {
       "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "pointer_spill_fill": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 4,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "jeq_fall_exclusion": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 8,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "map_value_out_of_bounds": {
-    "mini": {
-      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 8..8))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(ExitR0)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "initialized_on_one_path_only": {
-    "mini": {
-      "verdict": "REJECT(r0 is uninitialized at exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "stack_two_slots": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "map_lookup_null_deref": {
-    "mini": {
-      "verdict": "REJECT(load through a non-stack pointer r0 is not supported)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(ExitR0)",
       "insns": null,
       "total_states": null,
       "peak_states": null
@@ -275,7 +35,247 @@
       "peak_states": 1
     }
   },
-  "overflow_full_range": {
+  "map_value_access": {
+    "mini": {
+      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 0..0))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 13,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "computed_ptr_misaligned_access": {
+    "mini": {
+      "verdict": "REJECT(stack pointer r6 alignment is not provable (computed offsets must be 8-byte aligned))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(StackAlign)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "map_lookup_null_check": {
+    "mini": {
+      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 0..0))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 11,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "signed_compare": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "nullalias": {
+    "mini": {
+      "verdict": "REJECT(invalid access to map value r7+0, value_size=0 (base offsets 0..0))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 13,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "stack_two_slots": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "partial_w_unaligned": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "loop_no_exit": {
+    "mini": {
+      "verdict": "REJECT(subprogram [0..1) does not end with exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Loop)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "stack_wrong_direction": {
+    "mini": {
+      "verdict": "REJECT(stack access at r10+8 points away from the frame (valid: r10-512..r10-8))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(StackBounds)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "uninit_read": {
+    "mini": {
+      "verdict": "REJECT(register r2 is uninitialized)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "alu32_pointer_arith": {
+    "mini": {
+      "verdict": "REJECT(arithmetic on context pointer r1 is not allowed)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(PointerArith)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "dynptr_roundtrip": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 29,
+      "total_states": 2,
+      "peak_states": 2
+    }
+  },
+  "dynptr_oob_read_ok": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 30,
+      "total_states": 2,
+      "peak_states": 2
+    }
+  },
+  "ldimm64_bad_pseudo": {
+    "mini": {
+      "verdict": "REJECT(empty program)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Other)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "stack_write_before_read": {
+    "mini": {
+      "verdict": "REJECT(stack slot at offset -8 is uninitialized (write before read))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 2,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "complexity_limit": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 10
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 100,
+      "total_states": 11,
+      "peak_states": 11
+    }
+  },
+  "alu32_roundtrip": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "uninit_register_on_path": {
+    "mini": {
+      "verdict": "REJECT(register r2 is uninitialized)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "scalar_propagation": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "uninit_store": {
+    "mini": {
+      "verdict": "REJECT(register r0 is uninitialized)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "two_branches": {
     "mini": {
       "verdict": "ACCEPT",
       "states": 0
@@ -287,33 +287,69 @@
       "peak_states": 0
     }
   },
-  "invalid_jump": {
+  "uninit_alu": {
     "mini": {
-      "verdict": "REJECT(jump target 101 crosses subprogram boundary [0, 2))",
+      "verdict": "REJECT(register r2 is uninitialized)",
       "states": 0
     },
     "kernel": {
-      "verdict": "REJECT(CfgJump)",
+      "verdict": "REJECT(UninitRead)",
       "insns": null,
       "total_states": null,
       "peak_states": null
     }
   },
-  "subcall": {
+  "minimal_exit": {
     "mini": {
       "verdict": "ACCEPT",
       "states": 0
     },
     "kernel": {
       "verdict": "ACCEPT",
-      "insns": 7,
+      "insns": 2,
       "total_states": 0,
       "peak_states": 0
     }
   },
-  "invalid_pointer_arithmetic": {
+  "pointer_reg_arith": {
     "mini": {
-      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "verdict": "REJECT(r0 is not a scalar value at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "alu_shift": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "narrow_read_uninit": {
+    "mini": {
+      "verdict": "REJECT(stack slot at offset -8 is uninitialized (write before read))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 2,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "partial_write_corrupt_pointer": {
+    "mini": {
+      "verdict": "REJECT(attempt to corrupt spilled pointer on stack at r10-4 (spilled PTR_CTX at slot 0))",
       "states": 0
     },
     "kernel": {
@@ -335,6 +371,246 @@
       "peak_states": 0
     }
   },
+  "ldimm64_const": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "stack_misaligned": {
+    "mini": {
+      "verdict": "REJECT(stack access at r10-4 is not 8-byte aligned)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(StackAlign)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "alu32_uninit": {
+    "mini": {
+      "verdict": "REJECT(register r2 is uninitialized)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "invalid_jump": {
+    "mini": {
+      "verdict": "REJECT(jump target 101 crosses subprogram boundary [0, 2))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(CfgJump)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "computed_offset_out_of_frame": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 1
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 14,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "ctx_arith": {
+    "mini": {
+      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "narrow_fill_pointer": {
+    "mini": {
+      "verdict": "REJECT(invalid size of register fill at r10-8: spilled PTR_CTX)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Other)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "initialized_on_all_paths": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "jeq_fall_exclusion": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 8,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "unsigned_then_signed_refine": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 7,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "no_exit": {
+    "mini": {
+      "verdict": "REJECT(subprogram [0..1) does not end with exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(CfgJump)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "pointer_arithmetic": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "computed_ptr_indirect_read_uninit": {
+    "mini": {
+      "verdict": "REJECT(stack access at r6+0 with base offsets -512..-264 reads uninitialized stack)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 14,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "map_value_misaligned": {
+    "mini": {
+      "verdict": "REJECT(stack access at r0+0 is not 8-byte aligned)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(ExitR0)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "immediate_compare": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "st_imm_w": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "kfunc_obj_drop_bad_arg": {
+    "mini": {
+      "verdict": "REJECT(helper arg 1: r1 has type SCALAR(s:0..0,u:0x0..0x0,t:0x0/0x0), expected PtrToBtf)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Other)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "overflow_full_range": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "tnum_precise_branch": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "ldxb_sign_extend": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
   "map_update_basic": {
     "mini": {
       "verdict": "ACCEPT",
@@ -347,7 +623,475 @@
       "peak_states": 0
     }
   },
+  "scalar_constants": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 2,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "jne_branch": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "scalar_add_reg": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "map_update_bad_value_arg": {
+    "mini": {
+      "verdict": "REJECT(helper arg 4: r3 must be a stack pointer holding the map value buffer)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(HelperArgs)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "ringbuf_leak": {
+    "mini": {
+      "verdict": "REJECT(Unreleased reference id=1)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Ref)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "range_checked_access": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "unsigned_compare": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "computed_ptr_access": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 1
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 15,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "alu_sub": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "invalid_pointer_arithmetic": {
+    "mini": {
+      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "st_imm_zero": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "alu_and_or_xor": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "kfunc_unknown_id": {
+    "mini": {
+      "verdict": "REJECT(unknown kfunc (no BTF): btf_id 12345)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Other)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "computed_offset_access": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 1
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 14,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
   "ctx_arith_bounded": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "map_lookup_uninit_key": {
+    "mini": {
+      "verdict": "REJECT(stack slot at offset -8 is uninitialized (write before read))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 6,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "stack_out_of_frame": {
+    "mini": {
+      "verdict": "REJECT(stack access at r10-520 with base offsets 0..0 exceeds the 512 byte frame)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(StackBounds)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "initialized_on_one_path_only": {
+    "mini": {
+      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "alu32_zero_extend": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 5,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "computed_ptr_indirect_read_spill": {
+    "mini": {
+      "verdict": "REJECT(invalid indirect read from stack at r6+0: spilled register in the covered range)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 15,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "sub_on_pointer": {
+    "mini": {
+      "verdict": "REJECT(arithmetic on stack pointer r10 is not allowed (only ADD supports stack pointer arithmetic))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(PointerArith)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "overflowed_range_out_of_frame": {
+    "mini": {
+      "verdict": "REJECT(math between stack pointer and register with unbounded min value is not allowed)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(PointerArith)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "unreachable": {
+    "mini": {
+      "verdict": "REJECT(unreachable instruction)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Unreachable)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "pointer_spill_fill": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "map_lookup_null_deref": {
+    "mini": {
+      "verdict": "REJECT(load through a non-stack pointer r0 is not supported)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(ExitR0)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "map_value_out_of_bounds": {
+    "mini": {
+      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 8..8))",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(ExitR0)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "pointer_out_of_frame": {
+    "mini": {
+      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(PointerArith)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "ldimm64_map_fd": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 3,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "partial_w_misaligned": {
+    "mini": {
+      "verdict": "REJECT(stack access at r10-3 is not 4-byte aligned)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(StackAlign)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "jsgt_must_be_signed": {
+    "mini": {
+      "verdict": "REJECT(r0 is uninitialized at exit)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(UninitRead)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "dynptr_uninit": {
+    "mini": {
+      "verdict": "REJECT(Expected an initialized dynptr as arg #4)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Ref)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "ringbuf_reserve_submit": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 11,
+      "total_states": 1,
+      "peak_states": 1
+    }
+  },
+  "partial_spill_high_bytes": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 4,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "loop_unreachable_exit": {
+    "mini": {
+      "verdict": "REJECT(unreachable instruction)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Unreachable)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "subprog_call": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 7,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "invalid_shift": {
+    "mini": {
+      "verdict": "REJECT(invalid shift amount 64)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(Other)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "bounded_loop": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 5
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 204,
+      "total_states": 6,
+      "peak_states": 6
+    }
+  },
+  "ringbuf_submit_nullable": {
+    "mini": {
+      "verdict": "REJECT(helper arg 1: r1 has type PTR_TO_MEM_OR_NULL(ref:1, parent:0), expected PtrToMem)",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "REJECT(HelperArgs)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
+    }
+  },
+  "helper_return_used": {
+    "mini": {
+      "verdict": "ACCEPT",
+      "states": 0
+    },
+    "kernel": {
+      "verdict": "ACCEPT",
+      "insns": 2,
+      "total_states": 0,
+      "peak_states": 0
+    }
+  },
+  "pointer_spill": {
     "mini": {
       "verdict": "ACCEPT",
       "states": 0
@@ -371,45 +1115,9 @@
       "peak_states": 1
     }
   },
-  "signed_compare": {
+  "invalid_helper_argument": {
     "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "ldimm64_bad_pseudo": {
-    "mini": {
-      "verdict": "REJECT(empty program)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Other)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "complexity_limit": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 10
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 100,
-      "total_states": 11,
-      "peak_states": 11
-    }
-  },
-  "map_update_bad_value_arg": {
-    "mini": {
-      "verdict": "REJECT(helper arg 4: r3 must be a stack pointer holding the map value buffer)",
+      "verdict": "REJECT(helper arg 1: r1 must be a map pointer (load a map fd with ldimm64 first))",
       "states": 0
     },
     "kernel": {
@@ -417,90 +1125,6 @@
       "insns": null,
       "total_states": null,
       "peak_states": null
-    }
-  },
-  "alu32_uninit": {
-    "mini": {
-      "verdict": "REJECT(register r2 is uninitialized)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "helper_return_used": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 2,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "scalar_propagation": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 4,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "no_exit": {
-    "mini": {
-      "verdict": "REJECT(subprogram [0..1) does not end with exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(CfgJump)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "computed_ptr_access": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 1
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 15,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "map_value_access": {
-    "mini": {
-      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 0..0))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 13,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "unsigned_compare": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
     }
   },
   "stack_roundtrip": {
@@ -515,43 +1139,19 @@
       "peak_states": 0
     }
   },
-  "initialized_on_all_paths": {
+  "infinite_loop_identical": {
     "mini": {
-      "verdict": "ACCEPT",
+      "verdict": "REJECT(infinite loop detected at insn 3)",
       "states": 0
     },
     "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
+      "verdict": "REJECT(Loop)",
+      "insns": null,
+      "total_states": null,
+      "peak_states": null
     }
   },
-  "pointer_spill": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 3,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "unsigned_then_signed_refine": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 7,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "immediate_compare": {
+  "partial_w_roundtrip": {
     "mini": {
       "verdict": "ACCEPT",
       "states": 0
@@ -559,150 +1159,6 @@
     "kernel": {
       "verdict": "ACCEPT",
       "insns": 4,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "ldimm64_const": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 3,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "computed_ptr_indirect_read_spill": {
-    "mini": {
-      "verdict": "REJECT(invalid indirect read from stack at r6+0: spilled PTR_CTX at offset -8)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 15,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "invalid_shift": {
-    "mini": {
-      "verdict": "REJECT(invalid shift amount 64)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Other)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "loop_unreachable_exit": {
-    "mini": {
-      "verdict": "REJECT(unreachable instruction)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Unreachable)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "computed_ptr_indirect_read_uninit": {
-    "mini": {
-      "verdict": "REJECT(stack slot at offset -264 is uninitialized (write before read))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 14,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "stack_misaligned": {
-    "mini": {
-      "verdict": "REJECT(stack access at r10-4 is not 8-byte aligned)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(StackAlign)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "overflowed_range_out_of_frame": {
-    "mini": {
-      "verdict": "REJECT(math between stack pointer and register with unbounded min value is not allowed)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(PointerArith)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "alu32_roundtrip": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "map_lookup_null_check": {
-    "mini": {
-      "verdict": "REJECT(invalid access to map value r0+0, value_size=0 (base offsets 0..0))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 11,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "sub_on_pointer": {
-    "mini": {
-      "verdict": "REJECT(arithmetic on stack pointer r10 is not allowed (only ADD supports stack pointer arithmetic))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(PointerArith)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "alu32_pointer_arith": {
-    "mini": {
-      "verdict": "REJECT(arithmetic on context pointer r1 is not allowed)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(PointerArith)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "scalar_constants": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 2,
       "total_states": 0,
       "peak_states": 0
     }
@@ -717,246 +1173,6 @@
       "insns": null,
       "total_states": null,
       "peak_states": null
-    }
-  },
-  "jsgt_must_be_signed": {
-    "mini": {
-      "verdict": "REJECT(r0 is uninitialized at exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "loop_no_exit": {
-    "mini": {
-      "verdict": "REJECT(subprogram [0..1) does not end with exit)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Loop)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "uninit_read": {
-    "mini": {
-      "verdict": "REJECT(register r2 is uninitialized)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "uninit_register_on_path": {
-    "mini": {
-      "verdict": "REJECT(register r2 is uninitialized)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "computed_offset_access": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 1
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 14,
-      "total_states": 1,
-      "peak_states": 1
-    }
-  },
-  "alu_shift": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "immediate_compare_uninit": {
-    "mini": {
-      "verdict": "REJECT(register r2 is uninitialized)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "alu_sub": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 4,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "computed_ptr_misaligned_access": {
-    "mini": {
-      "verdict": "REJECT(stack pointer r6 alignment is not provable (computed offsets must be 8-byte aligned))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(StackAlign)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "infinite_loop_identical": {
-    "mini": {
-      "verdict": "REJECT(infinite loop detected at insn 3)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Loop)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "minimal_exit": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 2,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "non_converging_loop": {
-    "mini": {
-      "verdict": "REJECT(back-edge exceeds max loops (256) — the loop does not converge)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Complexity)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "unreachable": {
-    "mini": {
-      "verdict": "REJECT(unreachable instruction)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(Unreachable)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "uninit_store": {
-    "mini": {
-      "verdict": "REJECT(register r0 is uninitialized)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(UninitRead)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "jne_branch": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 5,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "stack_out_of_frame": {
-    "mini": {
-      "verdict": "REJECT(stack access at r10-520 exceeds the 512 byte frame)",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "REJECT(StackBounds)",
-      "insns": null,
-      "total_states": null,
-      "peak_states": null
-    }
-  },
-  "ldimm64_map_fd": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 3,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "two_branches": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "alu_and_or_xor": {
-    "mini": {
-      "verdict": "ACCEPT",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 6,
-      "total_states": 0,
-      "peak_states": 0
-    }
-  },
-  "stack_write_before_read": {
-    "mini": {
-      "verdict": "REJECT(stack slot at offset -8 is uninitialized (write before read))",
-      "states": 0
-    },
-    "kernel": {
-      "verdict": "ACCEPT",
-      "insns": 2,
-      "total_states": 0,
-      "peak_states": 0
     }
   }
 }
