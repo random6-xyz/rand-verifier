@@ -45,12 +45,6 @@ pub(crate) enum SpecValue {
     },
     /// The nullable acquire result.
     PtrToMemOrNull { size: u32, id: u32 },
-    /// A BTF-typed kernel object pointer (kfunc family — the spec
-    /// rejects kfunc calls for the socket-filter type anyway).
-    PtrToBtfId { btf_id: u32 },
-    /// A NULL-refined nullable pointer: any use is a violation
-    /// (kernel's PTR_TO_PACKET-style null deref guard).
-    PtrNull,
 }
 
 /// A scalar interval — the wrapping-aware u64 interval.
@@ -91,8 +85,6 @@ impl SpecValue {
                 | SpecValue::PtrToMapValueOrNull { .. }
                 | SpecValue::PtrToMem { .. }
                 | SpecValue::PtrToMemOrNull { .. }
-                | SpecValue::PtrToBtfId { .. }
-                | SpecValue::PtrNull
         )
     }
 }

@@ -13,13 +13,14 @@
 //! [`verify_spec`] returns [`SpecVerdict`]; the verdict report and the
 //! divergence audit against mini live in docs/spec-oracle-design.md.
 //!
-//! `dead_code` is allowed until issue #113 wires the spec into the
-//! fuzz oracle as the fourth axis (the corpus tests are the only
-//! consumers today).
-
-#![allow(dead_code)]
+//! Since issue #113 the fuzz oracle (src/fuzz/oracle.rs) consumes
+//! `verify_spec` as the fourth verdict axis; remaining item-level
+//! `#[allow(dead_code)]` carries a reason where an item is only used
+//! by tests or a later issue.
 
 pub(crate) mod helper;
 pub(crate) mod runner;
 pub(crate) mod state;
 pub(crate) mod value;
+
+pub use runner::{SpecFailure, SpecVerdict, verify_spec};

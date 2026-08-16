@@ -33,9 +33,9 @@ use super::value::{
 /// A safety violation — the spec's rejection reason (displayed in the
 /// verdict report).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpecFailure {
-    pub(crate) pc: u32,
-    pub(crate) message: String,
+pub struct SpecFailure {
+    pub pc: u32,
+    pub message: String,
 }
 
 impl SpecFailure {
@@ -49,7 +49,7 @@ impl SpecFailure {
 
 /// The spec verdict on one program.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SpecVerdict {
+pub enum SpecVerdict {
     /// Every explored path satisfied the safety invariants (bounded
     /// evidence, like the concrete side — not a proof).
     Accept,
@@ -80,7 +80,7 @@ impl Default for SpecLimits {
 const BPF_MAX_VAR_OFF: i64 = 1 << 29;
 
 /// Verify one program with the safety spec.
-pub(crate) fn verify_spec(program: &[BpfInsn], maps: &HashMap<u32, MapInfo>) -> SpecVerdict {
+pub fn verify_spec(program: &[BpfInsn], maps: &HashMap<u32, MapInfo>) -> SpecVerdict {
     verify_spec_limited(program, maps, &SpecLimits::default())
 }
 
@@ -1003,7 +1003,11 @@ impl<'a> SpecRunner<'a> {
 
     fn helper_call(&mut self, state: &mut SpecState, pc: u32, id: i32) -> Result<(), SpecVerdict> {
         let Some(proto) = spec_helper(id) else {
-            return Err(self.failure(pc, format!("unknown helper {id}")));
+            // a helper the spec does not model: the program is outside
+            // the spec's surface — a non-finding, not a safety
+            // violation (the oracle treats Inconclusive as "classic
+            // three-axis rules only", #113)
+            return Err(SpecVerdict::Inconclusive);
         };
         for (i, arg) in proto.args.iter().enumerate() {
             let reg = (i + 1) as u8;
@@ -1155,7 +1159,6 @@ impl<'a> SpecRunner<'a> {
                     false
                 }
             }
-            SpecArg::PtrToBtf => matches!(actual, SpecValue::PtrToBtfId { .. }),
         };
         if ok {
             Ok(())
@@ -1295,7 +1298,6 @@ impl<'a> SpecRunner<'a> {
                 pc,
                 "invalid mem access of a map value pointer (NULL not yet refined)",
             )),
-            SpecValue::PtrNull => Err(self.failure(pc, "NULL pointer dereference")),
             _ => Err(self.failure(pc, "invalid mem access (non-pointer base)")),
         }
     }
@@ -1407,7 +1409,6 @@ impl<'a> SpecRunner<'a> {
                 pc,
                 "invalid mem access of a map value pointer (NULL not yet refined)",
             )),
-            SpecValue::PtrNull => Err(self.failure(pc, "NULL pointer dereference")),
             SpecValue::Uninit => Err(self.failure(pc, "invalid mem access (uninitialized base)")),
             _ => Err(self.failure(pc, "invalid mem access (non-pointer base)")),
         }
@@ -1966,6 +1967,7 @@ enum Op {
     Lsh,
     Rsh,
     Arsh,
+    #[allow(dead_code)] // exercised by issue #115 (SMT translation)
     Mul,
 }
 
@@ -2269,9 +2271,9 @@ mod tests {
     }
 
     #[test]
-    fn spec_helper_unknown_rejects() {
-        // call 999; exit
+    fn spec_helper_unknown_is_inconclusive() {
+        // call 999; exit — an unmodeled helper is a non-finding
         let insns = [insn_bytes(0x85, 0, 0, 0, 999), insn_bytes(0x95, 0, 0, 0, 0)];
-        assert!(reject_contains(&insns, "unknown helper"));
+        assert_eq!(run(&insns), SpecVerdict::Inconclusive);
     }
 }

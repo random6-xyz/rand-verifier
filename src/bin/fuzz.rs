@@ -918,6 +918,10 @@ fn save_finding(dir: &Path, env: &BpfVerifierEnv, result: &ProgramResult) -> any
         fs::write(dir.join("kernel.log"), format!("{msg}\n"))?;
     }
 
+    let spec = rand_verifier::fuzz::oracle::spec_side(&rand_verifier::spec::verify_spec(
+        env.program_insns(),
+        env.maps(),
+    ));
     fs::write(
         dir.join("meta.json"),
         meta_json(
@@ -926,6 +930,7 @@ fn save_finding(dir: &Path, env: &BpfVerifierEnv, result: &ProgramResult) -> any
             &result.finding,
             &result.mini,
             &result.kernel,
+            &spec,
         ),
     )?;
     Ok(())
@@ -938,13 +943,22 @@ fn meta_json(
     finding: &Finding,
     mini: &SideVerdict,
     kernel: &SideVerdict,
+    spec: &rand_verifier::fuzz::oracle::SpecSide,
 ) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"label\": \"{}\",\n", json_escape(label)));
     s.push_str(&format!("  \"name\": \"{}\",\n", json_escape(name)));
     s.push_str(&format!("  \"finding\": \"{}\",\n", finding.name()));
     s.push_str(&format!("  \"mini\": \"{}\",\n", side_json(mini)));
-    s.push_str(&format!("  \"kernel\": \"{}\"\n", side_json(kernel)));
+    s.push_str(&format!("  \"kernel\": \"{}\",\n", side_json(kernel)));
+    s.push_str(&format!(
+        "  \"spec\": \"{}\"\n",
+        match spec {
+            rand_verifier::fuzz::oracle::SpecSide::Accept => "ACCEPT",
+            rand_verifier::fuzz::oracle::SpecSide::Reject => "REJECT",
+            rand_verifier::fuzz::oracle::SpecSide::Inconclusive => "INCONCLUSIVE",
+        }
+    ));
     s.push_str("}\n");
     s
 }

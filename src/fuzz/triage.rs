@@ -111,9 +111,15 @@ fn category_of(side: &SideVerdict) -> Option<ReasonCategory> {
 fn priority_of(finding: &Finding) -> u8 {
     match finding {
         // a model bug is the most urgent: rand-verifier is unsound
-        Finding::RvSoundnessBug => 3,
+        Finding::RvSoundnessBug => 4,
+        // the kernel accepts a program the spec independently judges
+        // unsafe — the spec-backed soundness candidate (#113)
+        Finding::KernelUnsoundCandidate => 3,
         // the kernel accepts a concretely unsafe program
         Finding::SoundnessCandidate => 2,
+        // the spec judged the program safe while the kernel rejected
+        // it — the spec-backed precision candidate (#113)
+        Finding::KernelOverstrictCandidate => 2,
         // the kernel rejects a concretely safe program — the v0.7 target
         Finding::PrecisionCandidate => 1,
         Finding::RvPrecisionGap => 0,
@@ -304,8 +310,8 @@ mod tests {
         assert_eq!(group(mk()), group(reversed));
     }
 
-    /// Groups surface in analysis priority order: model bug > soundness
-    /// > precision > rand-verifier gap.
+    /// Groups surface in analysis priority order: model bug / spec
+    /// soundness > soundness / spec overstrict > precision > gap.
     #[test]
     fn triage_priority_order() {
         let u = ReasonCategory::UninitRead;
@@ -318,6 +324,24 @@ mod tests {
                 Some(7),
                 Some(9),
                 None,
+            ),
+            cand(
+                "ku",
+                Finding::KernelUnsoundCandidate,
+                Some(u),
+                None,
+                Some(7),
+                None,
+                None,
+            ),
+            cand(
+                "ko",
+                Finding::KernelOverstrictCandidate,
+                Some(u),
+                None,
+                Some(7),
+                None,
+                Some(3),
             ),
             cand(
                 "s",
@@ -348,18 +372,25 @@ mod tests {
             ),
         ]);
         let order: Vec<Finding> = groups.iter().map(|g| g.key.finding).collect();
+        // soundness-class groups tie on priority (2) and sort by key:
+        // the enum order puts KernelOverstrictCandidate before
+        // SoundnessCandidate — deterministic, documented here
         assert_eq!(
             order,
             vec![
                 Finding::RvSoundnessBug,
+                Finding::KernelUnsoundCandidate,
+                Finding::KernelOverstrictCandidate,
                 Finding::SoundnessCandidate,
                 Finding::PrecisionCandidate,
                 Finding::RvPrecisionGap
             ]
         );
-        assert_eq!(groups[0].priority, 3);
-        assert_eq!(groups[1].priority, 2);
-        assert_eq!(groups[2].priority, 1);
-        assert_eq!(groups[3].priority, 0);
+        assert_eq!(groups[0].priority, 4);
+        assert_eq!(groups[1].priority, 3);
+        assert_eq!(groups[2].priority, 2);
+        assert_eq!(groups[3].priority, 2);
+        assert_eq!(groups[4].priority, 1);
+        assert_eq!(groups[5].priority, 0);
     }
 }

@@ -29,8 +29,6 @@ pub(crate) enum SpecArg {
     /// A stack pointer to a 16-byte dynptr slot that the helper is
     /// about to initialize (dynptr_from_mem's arg4).
     PtrToDynptrW,
-    /// A BTF-typed object pointer (kfunc family).
-    PtrToBtf,
 }
 
 /// The R0 result of a helper call.
@@ -53,10 +51,6 @@ pub(crate) enum SpecRet {
 pub(crate) struct SpecHelper {
     pub(crate) args: &'static [SpecArg],
     pub(crate) ret: SpecRet,
-    /// The helper writes `init_bytes` of the stack buffer in R1
-    /// (dynptr_read writes the dst buffer; dynptr_from_mem writes the
-    /// dynptr slot).
-    pub(crate) stack_write: u32,
 }
 
 /// The spec's helper table: id → contract.
@@ -67,7 +61,6 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
         1 => Some(&SpecHelper {
             args: &[SpecArg::PtrToMap, SpecArg::PtrToStackInit { size: 0 }],
             ret: SpecRet::MapValueOrNull,
-            stack_write: 0,
         }),
         // map_update_elem(map, key, value, flags)
         2 => Some(&SpecHelper {
@@ -78,7 +71,6 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
                 SpecArg::Scalar,
             ],
             ret: SpecRet::Zero,
-            stack_write: 0,
         }),
         // ktime_get_ns / get_smp_processor_id / get_numa_node_id /
         // ktime_get_boot_ns / ktime_get_coarse_ns / ktime_get_tai_ns:
@@ -86,7 +78,6 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
         5 | 8 | 10 | 125 | 160 | 208 => Some(&SpecHelper {
             args: &[],
             ret: SpecRet::UnknownScalar,
-            stack_write: 0,
         }),
         // get_prandom_u32: an unknown u32 (zero-extended) — the kernel
         // returns a 32-bit value, so a narrower range lets signed
@@ -94,21 +85,18 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
         7 => Some(&SpecHelper {
             args: &[],
             ret: SpecRet::UnknownU32,
-            stack_write: 0,
         }),
         // ringbuf_reserve(ringbuf_map, size, flags) → nullable
         // referenced mem
         131 => Some(&SpecHelper {
             args: &[SpecArg::PtrToMap, SpecArg::Scalar, SpecArg::Scalar],
             ret: SpecRet::MemOrNull,
-            stack_write: 0,
         }),
         // ringbuf_submit / ringbuf_discard(mem, flags): releases the
         // reference
         132 | 133 => Some(&SpecHelper {
             args: &[SpecArg::PtrToMem, SpecArg::Scalar],
             ret: SpecRet::Zero,
-            stack_write: 0,
         }),
         // dynptr_from_mem(data, size, flags, ptr): initializes the
         // 16-byte dynptr at the stack pointer in arg4 (the slot
@@ -121,7 +109,6 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
                 SpecArg::PtrToDynptrW,
             ],
             ret: SpecRet::Zero,
-            stack_write: 16,
         }),
         // dynptr_read(dst, len, src_dynptr, offset, flags): the dst
         // buffer's `len` bytes are written by the helper (SP1/SP2:
@@ -135,7 +122,6 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
                 SpecArg::Scalar,
             ],
             ret: SpecRet::Zero,
-            stack_write: 8,
         }),
         // dynptr_write(dst_dynptr, offset, src, len, flags)
         202 => Some(&SpecHelper {
@@ -147,21 +133,19 @@ pub(crate) fn spec_helper(id: i32) -> Option<&'static SpecHelper> {
                 SpecArg::Scalar,
             ],
             ret: SpecRet::Zero,
-            stack_write: 0,
         }),
         // dynptr_data(ptr, offset, len) → nullable referenced slice of
         // the dynptr
         203 => Some(&SpecHelper {
             args: &[SpecArg::PtrToDynptr, SpecArg::Scalar, SpecArg::Scalar],
             ret: SpecRet::MemOrNull,
-            stack_write: 0,
         }),
         _ => None,
     }
 }
 
-/// Whether the spec knows this helper id (otherwise the call is
-/// "unknown helper").
+#[cfg(test)]
+/// Whether the spec knows this helper id — test helper.
 pub(crate) fn spec_known_helper(id: i32) -> bool {
     spec_helper(id).is_some()
 }
@@ -183,6 +167,7 @@ const fn spec_stack_base_check(off: i64) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 /// Does the dynptr at stack offset `off` cover a valid 16-byte slot?
 pub(crate) fn dynptr_ok(off: i64) -> bool {
     spec_stack_base_check(off).is_some()

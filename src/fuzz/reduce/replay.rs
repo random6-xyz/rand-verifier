@@ -89,6 +89,9 @@ pub struct FindingSpec {
     pub mini: SideVerdict,
     /// The recorded kernel side.
     pub kernel: SideVerdict,
+    /// The recorded spec side (#113): the independent safety spec's
+    /// verdict, preserved through reduction.
+    pub spec: crate::fuzz::oracle::SpecSide,
 }
 
 /// The three verdict sides of one program, re-derived from the
@@ -102,6 +105,9 @@ pub struct Sides {
     pub mini_reason: Option<String>,
     pub concrete: ConcreteSide,
     pub kernel: SideVerdict,
+    /// The spec side (#113): the independent safety spec's verdict on
+    /// the program.
+    pub spec: crate::fuzz::oracle::SpecSide,
 }
 
 /// The replay baseline: the recorded spec validated against the
@@ -146,6 +152,7 @@ impl Invariant {
                     kernel: &sides.kernel,
                     kernel_reason: None,
                     strict,
+                    spec: sides.spec,
                 });
                 if candidate != *finding {
                     return false;
@@ -168,7 +175,12 @@ impl Invariant {
 pub fn is_kernel_dependent(label: &str) -> bool {
     matches!(
         label,
-        "precision-candidate" | "soundness-candidate" | "rv-precision-gap" | "whitelisted"
+        "precision-candidate"
+            | "soundness-candidate"
+            | "rv-precision-gap"
+            | "kernel-unsound-candidate"
+            | "kernel-overstrict-candidate"
+            | "whitelisted"
     )
 }
 
@@ -195,6 +207,7 @@ pub fn load_finding(dir: &Path) -> Result<(FindingSpec, Vec<u8>), ReduceError> {
             .ok_or_else(|| ReduceError::InvalidFinding("meta.json: missing \"kernel\"".into()))?,
     )
     .ok_or_else(|| ReduceError::InvalidFinding("meta.json: unparsable \"kernel\"".into()))?;
+    let spec = parse_spec_side(meta_value(&text, "spec").as_deref());
 
     let finding = if is_kernel_dependent(&label) || label == "rv-soundness-bug" {
         Some(parse_finding(&label).ok_or_else(|| {
@@ -221,6 +234,7 @@ pub fn load_finding(dir: &Path) -> Result<(FindingSpec, Vec<u8>), ReduceError> {
             finding,
             mini,
             kernel,
+            spec,
         },
         bytes,
     ))
@@ -266,11 +280,14 @@ pub fn evaluate_bytes(bytes: &[u8], kernel: bool, _strict: bool) -> Result<Sides
     } else {
         SideVerdict::Skipped
     };
+    let spec =
+        crate::fuzz::oracle::spec_side(&crate::spec::verify_spec(env.program_insns(), &env.maps));
     Ok(Sides {
         mini,
         mini_reason,
         concrete,
         kernel,
+        spec,
     })
 }
 
@@ -316,6 +333,7 @@ pub fn replay_check(spec: &FindingSpec, sides: &Sides, strict: bool) -> Result<(
             kernel: &sides.kernel,
             kernel_reason: None,
             strict,
+            spec: sides.spec,
         });
         if actual != finding {
             return Err(ReduceError::ReplayMismatch {
@@ -392,6 +410,14 @@ fn meta_value(text: &str, key: &str) -> Option<String> {
 
 /// Parse the compact side encoding of meta.json: `ACCEPT`, `SKIPPED`,
 /// or `REJECT(CategoryName)`.
+fn parse_spec_side(s: Option<&str>) -> crate::fuzz::oracle::SpecSide {
+    match s {
+        Some("ACCEPT") => crate::fuzz::oracle::SpecSide::Accept,
+        Some("REJECT") => crate::fuzz::oracle::SpecSide::Reject,
+        _ => crate::fuzz::oracle::SpecSide::Inconclusive,
+    }
+}
+
 fn parse_side(s: &str) -> Option<SideVerdict> {
     match s {
         "ACCEPT" => Some(SideVerdict::Accept),
@@ -426,6 +452,8 @@ fn parse_category(s: &str) -> Option<ReasonCategory> {
 fn parse_finding(label: &str) -> Option<Finding> {
     [
         Finding::PrecisionCandidate,
+        Finding::KernelUnsoundCandidate,
+        Finding::KernelOverstrictCandidate,
         Finding::SoundnessCandidate,
         Finding::RvPrecisionGap,
         Finding::RvSoundnessBug,
@@ -501,6 +529,7 @@ mod tests {
             mini_reason: None,
             concrete,
             kernel,
+            spec: crate::fuzz::oracle::SpecSide::Inconclusive,
         }
     }
 
@@ -520,6 +549,63 @@ mod tests {
             Some("REJECT(UninitRead)".into())
         );
         assert_eq!(meta_value(FLIP_META, "missing"), None);
+    }
+
+    #[test]
+    fn parse_spec_side_strings() {
+        use crate::fuzz::oracle::SpecSide;
+        assert_eq!(parse_spec_side(Some("ACCEPT")), SpecSide::Accept);
+        assert_eq!(parse_spec_side(Some("REJECT")), SpecSide::Reject);
+        assert_eq!(
+            parse_spec_side(Some("INCONCLUSIVE")),
+            SpecSide::Inconclusive
+        );
+        // old finding dirs (no "spec" key) default to Inconclusive —
+        // the classic three-axis semantics
+        assert_eq!(parse_spec_side(None), SpecSide::Inconclusive);
+        assert_eq!(parse_spec_side(Some("bogus")), SpecSide::Inconclusive);
+    }
+
+    /// The spec-backed classes reduce with the spec verdict preserved:
+    /// a kernel-unsound candidate whose spec verdict flips to Accept
+    /// during reduction must not silently change class.
+    #[test]
+    fn invariant_preserves_spec_verdict() {
+        use crate::fuzz::oracle::{Finding, SpecSide};
+        use crate::klog::ReasonCategory;
+        let u = ReasonCategory::UninitRead;
+        let spec = FindingSpec {
+            name: "seed-1".into(),
+            label: "kernel-unsound-candidate".into(),
+            finding: Some(Finding::KernelUnsoundCandidate),
+            mini: SideVerdict::Reject { category: u },
+            kernel: SideVerdict::Accept,
+            spec: SpecSide::Reject,
+        };
+        let invariant = Invariant::Classification {
+            finding: Finding::KernelUnsoundCandidate,
+            kernel_category: None,
+        };
+        // the original sides preserve the class
+        let sides = Sides {
+            mini: SideVerdict::Reject { category: u },
+            mini_reason: None,
+            concrete: ConcreteSide::Safe,
+            kernel: SideVerdict::Accept,
+            spec: SpecSide::Reject,
+        };
+        assert!(invariant.preserves(&spec.name, &sides, false));
+        // a reduction that flips the spec verdict to Accept changes the
+        // classification (kernel-unsound needs spec REJECT) — the
+        // invariant must reject the candidate
+        let flipped = Sides {
+            spec: SpecSide::Accept,
+            ..sides.clone()
+        };
+        assert!(!invariant.preserves(&spec.name, &flipped, false));
+        // the kernel column is mandatory for these classes
+        assert!(is_kernel_dependent("kernel-unsound-candidate"));
+        assert!(is_kernel_dependent("kernel-overstrict-candidate"));
     }
 
     #[test]
@@ -560,6 +646,8 @@ mod tests {
         assert!(is_kernel_dependent("precision-candidate"));
         assert!(is_kernel_dependent("soundness-candidate"));
         assert!(is_kernel_dependent("rv-precision-gap"));
+        assert!(is_kernel_dependent("kernel-unsound-candidate"));
+        assert!(is_kernel_dependent("kernel-overstrict-candidate"));
         assert!(is_kernel_dependent("whitelisted"));
         assert!(!is_kernel_dependent("rv-soundness-bug"));
         assert!(!is_kernel_dependent("verdict-flip"));

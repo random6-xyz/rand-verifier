@@ -125,8 +125,15 @@ fn campaign_invariants() {
             if concrete == ConcreteSide::Safe {
                 let name = path.file_stem().unwrap().to_string_lossy().into_owned();
                 let f = classify_env(&env, &name, &mini, None, &kernel_accept, None, false);
+                // with the spec axis (#113) a fixture the spec also
+                // rejects is a kernel-unsound candidate under the
+                // hypothetical kernel-accept — the spec independently
+                // flags the program, so mini's rejection is no longer
+                // just a model gap
                 assert!(
-                    f == Finding::RvPrecisionGap || f == Finding::Whitelisted,
+                    f == Finding::RvPrecisionGap
+                        || f == Finding::Whitelisted
+                        || f == Finding::KernelUnsoundCandidate,
                     "{name}: {f:?}"
                 );
                 gap_fixtures += 1;

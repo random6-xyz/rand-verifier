@@ -42,22 +42,13 @@ pub(crate) struct SpecStack {
 }
 
 impl SpecStack {
+    #[cfg(test)]
     /// The absolute byte index of a stack-relative offset `off`
     /// (`R10 = SPEC_STACK_SIZE`).
     pub(crate) fn byte_index(off: i64) -> Option<usize> {
         let idx = SPEC_STACK_SIZE as i64 + off;
         if idx >= 0 && (idx as usize) < SPEC_STACK_SIZE {
             Some(idx as usize)
-        } else {
-            None
-        }
-    }
-
-    /// The slot index covering byte offset `off` (relative to R10).
-    pub(crate) fn slot_of(off: i64) -> Option<usize> {
-        let idx = SPEC_STACK_SIZE as i64 + off;
-        if idx >= 0 && (idx as usize) < SPEC_STACK_SIZE {
-            Some(idx as usize / 8)
         } else {
             None
         }
@@ -166,6 +157,7 @@ impl SpecState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_ref(&self, id: u32) -> bool {
         self.refs[..self.refs_cnt as usize].contains(&id)
     }
