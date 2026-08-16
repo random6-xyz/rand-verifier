@@ -460,11 +460,18 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
                         // 7 - j (little-endian: the LSB at the lowest
                         // address)
                         StackByte::Zero => (value.bits() >> ((7 - j) * 8)) & 0xff == 0,
-                        // a spilled register covers the concrete value
-                        StackByte::Spill => matches!(
-                            abstract_state.stack.spilled[slot],
-                            Some(reg) if abstract_covers(reg, *value)
-                        ),
+                        // a spilled register covers the concrete
+                        // value: constants byte-exactly (the abstract
+                        // frame byte j is the concrete slot-value byte
+                        // 7 - j), ranges cover anything
+                        StackByte::Spill => match abstract_state.stack.spilled[slot] {
+                            Some(RegState::Scalar(b)) if b.is_constant() => {
+                                ((value.bits() >> ((7 - j) * 8)) & 0xff)
+                                    == (((b.smin as u64) >> ((7 - j) * 8)) & 0xff)
+                            }
+                            Some(reg) => abstract_covers(reg, *value),
+                            None => false,
+                        },
                         // never-written bytes are fabricated as zero by
                         // the concrete merge; they are never read (the
                         // abstract rejects every access touching them)
@@ -2066,6 +2073,7 @@ mod tests {
             RegState::PtrToMap {
                 key_size: 4,
                 value_size: 8,
+                map_type: 0,
             },
             RegState::PtrToMapValue {
                 min_offset: 0,
@@ -2108,6 +2116,7 @@ mod tests {
             RegState::PtrToMap {
                 key_size: 4,
                 value_size: 8,
+                map_type: 0,
             },
             ConcreteValue::MapPtr(region)
         ));
@@ -2269,6 +2278,7 @@ mod tests {
                 fd: 1,
                 key_size: 4,
                 value_size: 8,
+                map_type: 0,
             },
             BpfInsn::LdImm64Second { imm_hi: 0 },
             BpfInsn::MovReg { dst: 2, src: 10 },
@@ -2321,6 +2331,7 @@ mod tests {
                 fd: 1,
                 key_size: 4,
                 value_size: 8,
+                map_type: 0,
             },
             BpfInsn::LdImm64Second { imm_hi: 0 },
             BpfInsn::MovReg { dst: 2, src: 10 },

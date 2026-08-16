@@ -135,6 +135,7 @@ pub(crate) fn step(
             dst,
             key_size,
             value_size,
+            map_type,
             ..
         } => {
             check_reg(pc, *dst)?;
@@ -142,6 +143,7 @@ pub(crate) fn step(
             next.regs[*dst as usize] = RegState::PtrToMap {
                 key_size: *key_size,
                 value_size: *value_size,
+                map_type: *map_type,
             };
             Ok(next)
         }
@@ -256,6 +258,14 @@ pub(crate) fn step(
             } else {
                 check_helper_args(pc, helper, state)?;
             }
+            // ringbuf_reserve requires a RINGBUF map (kernel
+            // check_map_func_compatibility)
+            if *imm == 131 && !matches!(state.regs[1], RegState::PtrToMap { map_type: 1, .. }) {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "arg#0: ringbuf_reserve requires a RINGBUF map",
+                ));
+            }
             let mut next = *state;
             // acquire helpers: push a fresh reference and return the
             // nullable pointer (kernel acquire_reference_state +
@@ -267,10 +277,24 @@ pub(crate) fn step(
                         format!("too many references held (max {})", crate::state::MAX_REFS),
                     ));
                 }
-                let id = next.refs_cnt as u32 + 1;
+                // the kernel allocates every id from one global counter
+                // (env->id_gen), so the pc-derived ids of the mini can
+                // never collide with the reference ids — the refs live
+                // in a disjoint high space (#101 review fix)
+                let id = crate::state::REF_ID_BASE + next.refs_cnt as u32 + 1;
                 next.refs[next.refs_cnt as usize] = id;
                 next.refs_cnt += 1;
-                next.regs[0] = RegState::PtrToMemOrNull { id, parent_id: 0 };
+                // the buffer size comes from the reserve's size
+                // argument (kernel process_const_alloc_mem_size)
+                let size = match state.regs[2] {
+                    RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as u32,
+                    _ => 0,
+                };
+                next.regs[0] = RegState::PtrToMemOrNull {
+                    id,
+                    parent_id: 0,
+                    size,
+                };
             } else if matches!(*imm, 197 | 201 | 202 | 203) {
                 // dynptr helpers: validate the dynptr slots, apply the
                 // side effects (buffer init / dynptr creation / slice
@@ -326,17 +350,25 @@ pub(crate) fn step(
                         } | RegState::PtrToMemOrNull {
                             id: rid,
                             parent_id: pid,
+                            ..
                         } if *rid == id || *pid == id
                     ) {
                         *reg = RegState::Scalar(ScalarBounds::unknown());
                     }
                 }
                 for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
-                    if let Some(RegState::PtrToMem {
-                        id: rid,
-                        parent_id: pid,
-                        ..
-                    }) = spilled
+                    if let Some(
+                        RegState::PtrToMem {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        }
+                        | RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        },
+                    ) = spilled
                         && (*rid == id || *pid == id)
                         && next.stack.bytes[slot * 8..slot * 8 + 8]
                             .iter()
@@ -698,6 +730,16 @@ fn mem_access_check(
 ) -> Result<(), VerificationFailure> {
     let min_off = min_offset as i64 + offset as i64;
     let max_off = max_offset as i64 + offset as i64 + size;
+    // the access must be aligned to its size (kernel check_ptr_alignment)
+    if min_off.rem_euclid(size) != 0 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "misaligned access to referenced memory at r{}{:+} (access size {})",
+                base, offset, size
+            ),
+        ));
+    }
     if min_off < 0 || max_off > max_offset as i64 + 8 {
         return Err(VerificationFailure::new(
             pc,
@@ -826,29 +868,27 @@ fn dynptr_helper_call(
         201 => {
             // read(dst, len, src, offset, flags): the kernel does not
             // statically bound the offset/len (the helper returns
-            // -EINVAL at runtime); the dst buffer becomes initialized
+            // -EINVAL at runtime); the [dst, dst + len) buffer becomes
+            // initialized (kernel ARG_PTR_TO_UNINIT_MEM)
             let _ = dynptr_slot_of(pc, state, 3, 3)?;
-            if let RegState::PtrToStack {
-                min_offset,
-                max_offset,
-                ..
-            } = state.regs[1]
-            {
-                init_stack_buffer(next, min_offset, max_offset);
+            let len = match state.regs[2] {
+                RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as i32,
+                _ => 8,
+            };
+            if let RegState::PtrToStack { min_offset, .. } = state.regs[1] {
+                init_stack_buffer(next, min_offset, len);
             }
         }
         // write(dst, offset, src, len, flags): the dst dynptr must be
-        // live; the src buffer must be readable (validated by the
-        // prototype's PtrToStack + the buffer check below)
+        // live; the [src, src + len) buffer must be readable
         202 => {
             let _ = dynptr_slot_of(pc, state, 1, 1)?;
-            if let RegState::PtrToStack {
-                min_offset,
-                max_offset,
-                ..
-            } = state.regs[3]
-            {
-                check_stack_range_initialized(pc, next, min_offset, max_offset)?;
+            let len = match state.regs[4] {
+                RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as i32,
+                _ => 8,
+            };
+            if let RegState::PtrToStack { min_offset, .. } = state.regs[3] {
+                check_stack_range_initialized(pc, next, min_offset, min_offset + len)?;
             }
         }
         // data(ptr, offset, len): a nullable slice of the dynptr; the
@@ -858,9 +898,16 @@ fn dynptr_helper_call(
             let (_, ds) = dynptr_slot_of(pc, state, 1, 1)?;
             // the kernel: the slice gets the dynptr's id as parent_id
             // (the slice dies with the dynptr, #99)
+            // the slice's size is the requested len (kernel
+            // ARG_CONST_ALLOC_SIZE_OR_ZERO)
+            let size = match state.regs[3] {
+                RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as u32,
+                _ => 0,
+            };
             next.regs[0] = RegState::PtrToMemOrNull {
                 id: ds.id,
                 parent_id: ds.id,
+                size,
             };
         }
         _ => unreachable!(),
@@ -870,10 +917,10 @@ fn dynptr_helper_call(
 
 /// Mark the buffer bytes of an exact stack pointer as initialized
 /// (kernel check_stack_range_initialized with the clobber semantics).
-fn init_stack_buffer(next: &mut VerifierState, min_offset: i32, _max_offset: i32) {
-    // the exact 8-byte buffer [min_offset, min_offset + 8): the frame
-    // bytes [b(min_offset + 7), b(min_offset)]
-    let lo = stack_byte_index(min_offset as i64 + 7);
+fn init_stack_buffer(next: &mut VerifierState, min_offset: i32, len: i32) {
+    // the buffer [min_offset, min_offset + len): the frame bytes
+    // [b(min_offset + len - 1), b(min_offset)]
+    let lo = stack_byte_index(min_offset as i64 + len as i64 - 1);
     let hi = stack_byte_index(min_offset as i64);
     for i in lo..=hi {
         next.stack.bytes[i] = StackByte::Misc;
@@ -941,7 +988,7 @@ fn kfunc_call(
                 format!("too many references held (max {})", crate::state::MAX_REFS),
             ));
         }
-        let id = next.refs_cnt as u32 + 1;
+        let id = crate::state::REF_ID_BASE + next.refs_cnt as u32 + 1;
         next.refs[next.refs_cnt as usize] = id;
         next.refs_cnt += 1;
         // the return's btf id comes from the argument (the kernel
@@ -1085,6 +1132,7 @@ fn check_map_helper_args(
     let RegState::PtrToMap {
         key_size,
         value_size,
+        ..
     } = state.regs[1]
     else {
         return Err(VerificationFailure::new(
@@ -1551,14 +1599,43 @@ fn stack_write(
                 }
             }
             if let Some(did) = destroyed {
+                // every slice derived from the dynptr dies with it
+                // (kernel release_reference's id + parent_id cascade)
                 for reg in next.regs.iter_mut() {
-                    if let RegState::PtrToMemOrNull {
-                        id: rid,
-                        parent_id: pid,
-                    } = reg
-                        && (*rid == did || *pid == did)
-                    {
+                    if matches!(
+                        reg,
+                        RegState::PtrToMem {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        } | RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        } if *rid == did || *pid == did
+                    ) {
                         *reg = RegState::Scalar(ScalarBounds::unknown());
+                    }
+                }
+                for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
+                    if let Some(
+                        RegState::PtrToMem {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        }
+                        | RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        },
+                    ) = spilled
+                        && (*rid == did || *pid == did)
+                        && next.stack.bytes[slot * 8..slot * 8 + 8]
+                            .iter()
+                            .all(|x| *x == StackByte::Spill)
+                    {
+                        *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
                     }
                 }
             }
@@ -1630,19 +1707,31 @@ fn stack_write(
             }
             // partial or variable-offset write: the kernel's else
             // branch — the covered bytes become MISC (or ZERO for zero
-            // values). The spilled register is kept — reads of the
-            // untouched bytes still see it (the kernel never clears
-            // spilled_ptr).
+            // values), and the covered slots are scrubbed (kernel
+            // scrub_special_slot: the spilled register is destroyed and
+            // the slot's remaining SPILL bytes become MISC)
             let zero = match value {
                 Some(RegState::Scalar(b)) => b.is_constant() && b.smin == 0,
                 _ => false,
             };
+            for slot in lo / 8..=hi / 8 {
+                next.stack.spilled[slot] = None;
+                next.stack.dynptr[slot] = None;
+            }
             for i in lo..=hi {
                 next.stack.bytes[i] = if zero {
                     StackByte::Zero
                 } else {
                     StackByte::Misc
                 };
+            }
+            // the uncovered bytes of the covered slots are scrubbed too
+            for slot in lo / 8..=hi / 8 {
+                for i in slot * 8..slot * 8 + 8 {
+                    if next.stack.bytes[i] == StackByte::Spill {
+                        next.stack.bytes[i] = StackByte::Misc;
+                    }
+                }
             }
             Ok(next)
         }
@@ -3238,8 +3327,12 @@ fn cond_branch_impl(
                     for reg in null_state.regs.iter_mut() {
                         if matches!(
                             reg,
-                            RegState::PtrToMem { id: rid, .. } | RegState::PtrToMemOrNull { id: rid, parent_id: 0 }
-                                if *rid == id
+                            RegState::PtrToMem { id: rid, .. }
+                        | RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id: 0,
+                            ..
+                        } if *rid == id
                         ) {
                             *reg = RegState::Scalar(ScalarBounds::constant(0));
                         }
@@ -3250,6 +3343,7 @@ fn cond_branch_impl(
                             | RegState::PtrToMemOrNull {
                                 id: rid,
                                 parent_id: 0,
+                                ..
                             },
                         ) = spilled
                             && *rid == id
@@ -3263,12 +3357,19 @@ fn cond_branch_impl(
                     // the valid side: every alias becomes a non-null
                     // referenced buffer (the ref survives)
                     for reg in valid.regs.iter_mut() {
-                        if let RegState::PtrToMemOrNull { id: rid, parent_id } = reg
+                        if let RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id,
+                            size,
+                        } = reg
                             && *rid == id
                         {
+                            // the buffer's byte range: [0, size) — the
+                            // kernel's mem_size
+                            let max_off = size.saturating_sub(8) as i32;
                             *reg = RegState::PtrToMem {
                                 min_offset: 0,
-                                max_offset: 0,
+                                max_offset: max_off,
                                 align_off: 0,
                                 id,
                                 parent_id: *parent_id,
@@ -3276,15 +3377,20 @@ fn cond_branch_impl(
                         }
                     }
                     for (slot, spilled) in valid.stack.spilled.iter_mut().enumerate() {
-                        if let Some(RegState::PtrToMemOrNull { id: rid, parent_id }) = spilled
+                        if let Some(RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id,
+                            size,
+                        }) = spilled
                             && *rid == id
                             && valid.stack.bytes[slot * 8..slot * 8 + 8]
                                 .iter()
                                 .all(|x| *x == StackByte::Spill)
                         {
+                            let max_off = size.saturating_sub(8) as i32;
                             *spilled = Some(RegState::PtrToMem {
                                 min_offset: 0,
-                                max_offset: 0,
+                                max_offset: max_off,
                                 align_off: 0,
                                 id,
                                 parent_id: *parent_id,
@@ -6403,6 +6509,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
         spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
@@ -6434,6 +6541,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
         state.regs[3] = ptr_stack(-16);
@@ -6451,6 +6559,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
         spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
@@ -6465,6 +6574,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
@@ -6483,6 +6593,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = RegState::PtrToMapValue {
             min_offset: 0,
@@ -6642,6 +6753,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("uninitialized"), "{}", err.message);
@@ -6654,6 +6766,7 @@ mod tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
+            map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
         spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
@@ -6785,6 +6898,7 @@ mod ref_tracking_tests {
         state.regs[1] = RegState::PtrToMap {
             key_size: 0,
             value_size: 0,
+            map_type: 1,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
@@ -6794,19 +6908,20 @@ mod ref_tracking_tests {
             ref other => panic!("expected PtrToMemOrNull, got {:?}", other),
         };
         assert_eq!(next.refs_cnt, 1);
-        assert_eq!(next.refs[0], 1);
+        assert_eq!(next.refs[0], crate::state::REF_ID_BASE + 1);
         (next, id)
     }
 
     #[test]
     fn reserve_acquires_reference() {
         let (state, id) = reserve_state();
-        assert_eq!(id, 1);
+        assert_eq!(id, crate::state::REF_ID_BASE + 1);
         assert_eq!(
             state.regs[0],
             RegState::PtrToMemOrNull {
-                id: 1,
-                parent_id: 0
+                id: crate::state::REF_ID_BASE + 1,
+                parent_id: 0,
+                size: 8
             }
         );
     }
@@ -6929,7 +7044,7 @@ mod ref_tracking_tests {
 mod dynptr_kfunc_tests {
     use super::*;
     use crate::insn::BpfInsn;
-    use crate::state::{DynptrState, RegState, ScalarBounds, StackByte, VerifierState};
+    use crate::state::{DynptrState, RegState, ScalarBounds, VerifierState};
 
     fn ptr_stack(off: i32) -> RegState {
         RegState::PtrToStack {
@@ -6997,13 +7112,14 @@ mod dynptr_kfunc_tests {
         s.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
         s.regs[5] = RegState::Scalar(ScalarBounds::constant(0));
         let next = step(0, &s, &BpfInsn::Call { imm: 201 }).unwrap();
-        // the dst buffer at r10-56 is now initialized (the frame bytes
-        // 55..=48 — the access [r10-56, r10-48))
+        // the dst buffer [r10-56, r10-52) (len 4) is now initialized
+        // (the frame bytes 52..=55)
         assert!(
-            next.stack.bytes[48..56]
+            next.stack.bytes[52..56]
                 .iter()
                 .all(|b| *b == StackByte::Misc)
         );
+        assert_eq!(next.stack.bytes[48], StackByte::Invalid);
     }
 
     #[test]
@@ -7019,7 +7135,8 @@ mod dynptr_kfunc_tests {
             next.regs[0],
             RegState::PtrToMemOrNull {
                 id: 1,
-                parent_id: 1
+                parent_id: 1,
+                ..
             }
         ));
     }
@@ -7053,7 +7170,7 @@ mod dynptr_kfunc_tests {
             RegState::PtrToBtfId { ref_obj_id, .. } => ref_obj_id,
             ref other => panic!("expected PtrToBtfId, got {:?}", other),
         };
-        assert_eq!(id, 1);
+        assert_eq!(id, crate::state::REF_ID_BASE + 1);
         // the release with the referenced object
         let mut s = acquired;
         s.regs[1] = s.regs[0];
@@ -7118,5 +7235,180 @@ mod parent_id_tests {
         assert_eq!(after.regs[0], RegState::Scalar(ScalarBounds::unknown()));
         // the dynptr slot is gone
         assert_ne!(after.stack.bytes[24], crate::state::StackByte::Dynptr);
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+    use crate::insn::BpfInsn;
+    use crate::state::{DynptrState, RegState, ScalarBounds, VerifierState};
+
+    fn ringbuf_map() -> RegState {
+        RegState::PtrToMap {
+            key_size: 0,
+            value_size: 0,
+            map_type: 1,
+        }
+    }
+
+    fn ptr_stack(off: i32) -> RegState {
+        RegState::PtrToStack {
+            min_offset: off,
+            max_offset: off,
+            align_off: off.rem_euclid(8) as u8,
+        }
+    }
+
+    #[test]
+    fn spilled_nullable_reference_invalidated_by_release() {
+        // reserve → spill the nullable copy → NULL check → submit →
+        // reload the spilled copy: the reloaded register must be
+        // invalidated (review blocker 2)
+        let mut state = VerifierState::initial();
+        state.regs[1] = ringbuf_map();
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        let state = step(0, &state, &BpfInsn::Call { imm: 131 }).unwrap();
+        // spill the nullable pointer at r10-8
+        let mut s = state;
+        s.regs[2] = s.regs[0];
+        let spilled = step(
+            0,
+            &s,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -8,
+                size: crate::insn::MemSize::DW,
+            },
+        )
+        .unwrap();
+        // the NULL check on the register refines it; the spilled copy
+        // survives (the bytes still Spill + the spilled OrNull)
+        let valid = cond_branch_impl(
+            0,
+            0,
+            None,
+            RegState::Scalar(ScalarBounds::constant(0)),
+            1,
+            CondOp::Eq,
+            &spilled,
+        )
+        .unwrap()[1]
+            .1;
+        // submit the refined register
+        let mut s = valid;
+        s.regs[1] = s.regs[0];
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        let released = step(0, &s, &BpfInsn::Call { imm: 132 }).unwrap();
+        // the spilled copy was invalidated by the release cascade
+        assert!(matches!(
+            released.stack.spilled[0],
+            Some(RegState::Scalar(_))
+        ));
+        // a reload yields the unknown scalar, not a pointer
+        let reloaded = step(
+            0,
+            &released,
+            &BpfInsn::LdMem {
+                dst: 3,
+                base: 10,
+                offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(reloaded.regs[3], RegState::Scalar(_)));
+    }
+
+    #[test]
+    fn dynptr_slice_register_dies_with_dynptr() {
+        // from_mem → dynptr_data → NULL check (the slice becomes a
+        // non-null PtrToMem) → store over the dynptr slot: the refined
+        // slice must be invalidated (review blocker 3)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[4] = ptr_stack(-32);
+        state.regs[6] = state.regs[4];
+        let state = step(0, &state, &BpfInsn::Call { imm: 197 }).unwrap();
+        let mut s = state;
+        s.regs[1] = s.regs[6];
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[3] = RegState::Scalar(ScalarBounds::constant(4));
+        let sliced = step(0, &s, &BpfInsn::Call { imm: 203 }).unwrap();
+        // NULL check: the slice becomes the non-null PtrToMem
+        let valid = cond_branch_impl(
+            0,
+            0,
+            None,
+            RegState::Scalar(ScalarBounds::constant(0)),
+            1,
+            CondOp::Eq,
+            &sliced,
+        )
+        .unwrap()[1]
+            .1;
+        assert!(matches!(valid.regs[0], RegState::PtrToMem { .. }));
+        // an 8-byte store over the dynptr slot at r10-32 destroys it
+        let mut s2 = valid;
+        s2.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        let after = step(
+            0,
+            &s2,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -32,
+                size: crate::insn::MemSize::DW,
+            },
+        )
+        .unwrap();
+        assert_eq!(after.regs[0], RegState::Scalar(ScalarBounds::unknown()));
+    }
+
+    #[test]
+    fn dynptr_id_never_collides_with_ref_ids() {
+        // the dynptr ids are pc-derived (small); the reference ids live
+        // in the REF_ID_BASE space — a dynptr created right after a
+        // reserve never aliases the reference (review blocker 1)
+        let mut state = VerifierState::initial();
+        state.regs[1] = ringbuf_map();
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        let state = step(0, &state, &BpfInsn::Call { imm: 131 }).unwrap();
+        let ref_id = match state.regs[0] {
+            RegState::PtrToMemOrNull { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert!(ref_id >= crate::state::REF_ID_BASE);
+        // a dynptr created at pc 1 gets the id 2 — never the ref id
+        let mut s = state;
+        s.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        s.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[4] = ptr_stack(-32);
+        s.regs[6] = s.regs[4];
+        let after = step(1, &s, &BpfInsn::Call { imm: 197 }).unwrap();
+        assert!(matches!(
+            after.stack.dynptr[3],
+            Some(DynptrState { id: 2, .. })
+        ));
+        assert_ne!(after.stack.dynptr[3].unwrap().id, ref_id);
     }
 }

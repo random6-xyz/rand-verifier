@@ -180,6 +180,7 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
             return_type: RegState::PtrToMemOrNull {
                 id: 0,
                 parent_id: 0,
+                size: 0,
             },
         }),
         // BPF_FUNC_dynptr_from_mem (197): from_mem(data, size, flags,
@@ -228,6 +229,7 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
             return_type: RegState::PtrToMemOrNull {
                 id: 0,
                 parent_id: 0,
+                size: 0,
             },
         }),
         // BPF_FUNC_ringbuf_submit / BPF_FUNC_ringbuf_discard:

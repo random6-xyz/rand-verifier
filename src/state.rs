@@ -252,6 +252,9 @@ pub(crate) enum RegState {
     PtrToMap {
         key_size: u32,
         value_size: u32,
+        /// The kernel map type (0 = ARRAY, 1 = RINGBUF, #101): the
+        /// ringbuf helpers require a RINGBUF map.
+        map_type: u8,
     },
     /// A pointer into a map value (non-null) — an offset interval
     /// within the value; bounds are validated at access time against
@@ -293,10 +296,12 @@ pub(crate) enum RegState {
     },
     /// The nullable acquire result (kernel PTR_TO_MEM_OR_NULL): a
     /// NULL check both refines the pointer and releases the reference
-    /// on the null side (kernel mark_ptr_or_null_regs).
+    /// on the null side (kernel mark_ptr_or_null_regs). `size` is the
+    /// buffer size (kernel meta.msize) for the access bounds.
     PtrToMemOrNull {
         id: u32,
         parent_id: u32,
+        size: u32,
     },
     /// A BTF-typed kernel object pointer (kernel PTR_TO_BTF_ID, #101):
     /// the kfunc family (bpf_obj_drop / bpf_kptr_xchg /
@@ -320,6 +325,13 @@ pub(crate) struct DynptrState {
 /// Maximum simultaneously held references (kernel: bounded by the
 /// registers and stack slots).
 pub(crate) const MAX_REFS: usize = 8;
+
+/// The base of the reference id space: the kernel allocates every id
+/// (pointer ids, dynptr ids, reference ids) from one global counter,
+/// so the mini's pc-derived ids (small) must never collide with the
+/// reference ids — they live in a disjoint high space (#101 review
+/// fix).
+pub(crate) const REF_ID_BASE: u32 = 0x1000_0000;
 
 impl std::fmt::Display for RegState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -345,6 +357,7 @@ impl std::fmt::Display for RegState {
             RegState::PtrToMap {
                 key_size,
                 value_size,
+                ..
             } => write!(f, "PTR_MAP(k:{},v:{})", key_size, value_size),
             RegState::PtrToMapValue {
                 min_offset,
@@ -376,8 +389,16 @@ impl std::fmt::Display for RegState {
                 "PTR_TO_MEM(off:{}..{}, ref:{}, parent:{})",
                 min_offset, max_offset, id, parent_id
             ),
-            RegState::PtrToMemOrNull { id, parent_id } => {
-                write!(f, "PTR_TO_MEM_OR_NULL(ref:{}, parent:{})", id, parent_id)
+            RegState::PtrToMemOrNull {
+                id,
+                parent_id,
+                size,
+            } => {
+                write!(
+                    f,
+                    "PTR_TO_MEM_OR_NULL(ref:{}, parent:{}, size:{})",
+                    id, parent_id, size
+                )
             }
             RegState::PtrToBtfId { btf_id, ref_obj_id } => {
                 write!(f, "PTR_TO_BTF_ID(btf:{}, ref:{})", btf_id, ref_obj_id)
@@ -712,6 +733,7 @@ mod tests {
             RegState::PtrToMap {
                 key_size: 4,
                 value_size: 8,
+                map_type: 0,
             }
             .to_string(),
             "PTR_MAP(k:4,v:8)"

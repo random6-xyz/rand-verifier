@@ -147,10 +147,12 @@ pub(crate) fn regs_exact(old: &RegState, new: &RegState) -> bool {
             RegState::PtrToMap {
                 key_size: a_key,
                 value_size: a_val,
+                ..
             },
             RegState::PtrToMap {
                 key_size: b_key,
                 value_size: b_val,
+                ..
             },
         ) => a_key == b_key && a_val == b_val,
         (
@@ -285,25 +287,50 @@ pub(crate) fn regsafe(
                 min_offset: old_min,
                 max_offset: old_max,
                 id: old_id,
+                parent_id: old_parent,
                 ..
             },
             RegState::PtrToMem {
                 min_offset: new_min,
                 max_offset: new_max,
                 id: new_id,
+                parent_id: new_parent,
                 ..
             },
-        ) => old_min <= new_min && old_max >= new_max && check_ids(idmap, *old_id, *new_id),
+        ) => {
+            old_min <= new_min
+                && old_max >= new_max
+                && check_ids(idmap, *old_id, *new_id)
+                && check_ids(idmap, *old_parent, *new_parent)
+        }
         (
             RegState::PtrToMemOrNull {
                 id: old_id,
                 parent_id: old_parent,
+                size: old_size,
             },
             RegState::PtrToMemOrNull {
                 id: new_id,
                 parent_id: new_parent,
+                size: new_size,
             },
-        ) => check_ids(idmap, *old_id, *new_id) && check_ids(idmap, *old_parent, *new_parent),
+        ) => {
+            old_size == new_size
+                && check_ids(idmap, *old_id, *new_id)
+                && check_ids(idmap, *old_parent, *new_parent)
+        }
+        // BTF object pointers: same object type, the reference
+        // identity related (kernel PTR_TO_BTF_ID, #101)
+        (
+            RegState::PtrToBtfId {
+                btf_id: old_btf,
+                ref_obj_id: old_ref,
+            },
+            RegState::PtrToBtfId {
+                btf_id: new_btf,
+                ref_obj_id: new_ref,
+            },
+        ) => old_btf == new_btf && check_ids(idmap, *old_ref, *new_ref),
         // different types are never comparable
         _ => false,
     }
@@ -328,10 +355,12 @@ fn check_reg_ids(idmap: &mut IdMap, old: &RegState, new: &RegState) -> bool {
             RegState::PtrToMemOrNull {
                 id: a,
                 parent_id: ap,
+                ..
             },
             RegState::PtrToMemOrNull {
                 id: b,
                 parent_id: bp,
+                ..
             },
         ) => check_ids(idmap, *a, *b) && check_ids(idmap, *ap, *bp),
         (
