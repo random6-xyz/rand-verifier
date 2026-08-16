@@ -58,18 +58,44 @@ impl Tnum {
         }
     }
 
-    /// Subtraction, following the kernel's tnum_sub() (the same carry
-    /// folding as `add`, with the borrow handled by wrapping).
+    /// Subtraction, following the kernel's tnum_sub() (kernel/bpf/
+    /// tnum.c): the difference spans `[dv - b.mask, dv + a.mask]` and
+    /// the mask covers the bits that vary across that span plus both
+    /// input masks. (The add-symmetric carry-folding form was unsound:
+    /// `a = {0}, b = {0,1}` yields `0 - 1 = -1` outside the result —
+    /// found by the SMT soundness harness, issue #116.)
     pub(crate) fn sub(self, other: Tnum) -> Self {
-        let sm = self.mask.wrapping_add(other.mask);
-        let sv = self.value.wrapping_sub(other.value);
-        let sigma = sm.wrapping_add(sv);
-        let chi = sigma ^ sv;
+        let dv = self.value.wrapping_sub(other.value);
+        let alpha = dv.wrapping_add(self.mask);
+        let beta = dv.wrapping_sub(other.mask);
+        let chi = alpha ^ beta;
         let mu = chi | self.mask | other.mask;
         Self {
-            value: sv & !mu,
+            value: dv & !mu,
             mask: mu,
         }
+    }
+
+    /// Multiplication, following the kernel's tnum_mul()
+    /// (kernel/bpf/tnum.c, upstreamed 2025-01 as "Provably sound,
+    /// faster, and more precise algorithm for tnum_mul"): long
+    /// multiplication over the bits of `a`; when the LSB of `a` is
+    /// uncertain the accumulator takes the union of both partial
+    /// products (LSB 0 and LSB 1).
+    pub(crate) fn mul(self, other: Tnum) -> Self {
+        let mut acc = Tnum::constant(0);
+        let mut a = self;
+        let mut b = other;
+        while a.value != 0 || a.mask != 0 {
+            if a.value & 1 != 0 {
+                acc = acc.add(b);
+            } else if a.mask & 1 != 0 {
+                acc = acc.union(acc.add(b));
+            }
+            a = a.rshift(1);
+            b = b.lshift(1);
+        }
+        acc
     }
 
     /// Bitwise XOR: a bit is known 1 if the operands differ there and
@@ -162,6 +188,21 @@ impl Tnum {
         Self {
             value: known_one,
             mask: !(known_one | known_zero),
+        }
+    }
+
+    /// The union of two abstractions (kernel tnum_union,
+    /// kernel/bpf/tnum.c): the smallest tnum containing both member
+    /// sets — a bit is known only when both agree on it with the same
+    /// value. (`value | value; mask | mask` is NOT the union: it
+    /// drops members — e.g. `union({0}, {1})` would return `{1}` —
+    /// found by the SMT soundness harness, issue #116.)
+    pub(crate) fn union(self, other: Tnum) -> Self {
+        let v = self.value & other.value;
+        let mu = (self.value ^ other.value) | self.mask | other.mask;
+        Self {
+            value: v & !mu,
+            mask: mu,
         }
     }
 

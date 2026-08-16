@@ -34,6 +34,7 @@ pub mod klog;
 pub mod krun;
 pub mod liveness;
 pub mod mini;
+pub mod smt;
 pub mod spec;
 pub mod state;
 pub mod state_eq;
