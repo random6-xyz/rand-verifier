@@ -48,8 +48,12 @@ const POOL_CAP: usize = 200;
 const QEMU_BATCH: usize = 100;
 
 /// The script the guest runs for one batch: verify every job file,
-/// write `out/<name>.out`, then signal completion with the
-/// `batch-done` marker.
+/// write `out/<name>.out`. Completion is detected by state, not by a
+/// marker file: the host polls until `job/` is empty and every
+/// expected result exists in `out/`. (A shared batch-done marker
+/// races badly over the 9p share: the guest's stale dentry cache can
+/// make its touch fail with ENOENT or hide the host's deletions,
+/// stalling the host for its full 60s/300s wait.)
 const QEMU_RUN_SCRIPT: &str = r###"#!/bin/sh
 STRICT=""
 [ -f /mnt/host/strict ] && STRICT="--strict"
@@ -59,7 +63,6 @@ for f in /mnt/host/job/*.bin; do
     /sbin/agent "$f" $STRICT > "/mnt/host/out/$b.out" 2>&1
     rm -f "$f"
 done
-touch /mnt/host/batch-done
 "###;
 
 /// Batch kernel-verdict queries to the qemu guest via the 9p share:
@@ -116,10 +119,17 @@ impl QemuBatch {
 
 impl Drop for QemuBatch {
     fn drop(&mut self) {
-        // disconnect the channel so the worker drains and exits
+        // disconnect the channel so the worker drains and exits: send the
+        // flush signal, then drop our sender so the worker's recv_timeout
+        // loop sees the disconnect and terminates (without dropping the
+        // sender first, join() hangs forever — the channel stays open).
         let _ = self
             .tx
             .send(("__flush__".into(), Vec::new(), std::sync::mpsc::channel().0));
+        drop(std::mem::replace(
+            &mut self.tx,
+            std::sync::mpsc::channel().0,
+        ));
         let _ = self.handle.take().map(|h| h.join());
     }
 }
@@ -154,13 +164,19 @@ fn qemu_worker(dir: PathBuf, strict: bool, rx: std::sync::mpsc::Receiver<QemuJob
 }
 
 /// Send one batch to the guest and deliver the parsed verdicts.
+///
+/// Completion protocol (markerless, race-free over the 9p share):
+/// the host waits until `job/` is empty (the guest consumed the
+/// previous batch), clears stale results, writes the new batch, and
+/// polls until every job has its `out/<name>.out` and `job/` is
+/// empty again. No batch-done marker exists, so host and guest never
+/// churn the same file.
 fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
     if pending.is_empty() {
         return;
     }
     let job = dir.join("job");
     let out = dir.join("out");
-    let done_marker = dir.join("batch-done");
     if fs::create_dir_all(&job).is_err() || fs::create_dir_all(&out).is_err() {
         fail_all(pending, "qemu: cannot create share dirs");
         return;
@@ -173,22 +189,19 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
         let _ = fs::remove_file(&strict_marker);
     }
 
-    // wait for the previous batch's completion marker
+    // wait until the guest consumed the previous batch (job/ empty),
+    // then clear stale results
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while done_marker.exists() {
+    while job_has_files(&job) {
         if std::time::Instant::now() > deadline {
-            eprintln!("qemu: previous batch never finished; clearing marker");
-            let _ = fs::remove_file(&done_marker);
+            eprintln!("qemu: previous batch never consumed; clearing job dir");
+            clear_dir(&job);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // clear stale results
-    if let Ok(entries) = fs::read_dir(&out) {
-        for e in entries.flatten() {
-            let _ = fs::remove_file(e.path());
-        }
-    }
+    clear_dir(&out);
+
     // write the batch + the run script
     let mut ok = true;
     for (name, bytes, _) in pending.iter() {
@@ -204,17 +217,21 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
         fail_all(pending, "qemu: cannot write batch");
         return;
     }
-    // poll until the guest signals completion
+    // poll until every job has its result and the guest consumed the
+    // whole batch: the job file disappears only after the agent
+    // finished writing its out file, so both conditions together mean
+    // the result is complete
     let want = pending.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    while !done_marker.exists() {
+    while pending.iter().any(|(name, _, _)| {
+        job.join(format!("{name}.bin")).exists() || !out.join(format!("{name}.out")).is_file()
+    }) {
         if std::time::Instant::now() > deadline {
             eprintln!("qemu: timeout waiting for {want} results; marking rest skipped");
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let _ = fs::remove_file(&done_marker);
     // parse the results and reply
     for (name, _, resp) in pending.drain(..) {
         let p = out.join(format!("{name}.out"));
@@ -243,6 +260,20 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
                 eprintln!("qemu: parse failure for {name}: {first_line:?}");
                 let _ = resp.send(Err("qemu: parse/read failure".into()));
             }
+        }
+    }
+}
+
+fn job_has_files(job: &Path) -> bool {
+    fs::read_dir(job)
+        .map(|it| it.flatten().next().is_some())
+        .unwrap_or(false)
+}
+
+fn clear_dir(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let _ = fs::remove_file(e.path());
         }
     }
 }
@@ -623,7 +654,16 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &
             };
             let mut env = BpfVerifierEnv::new();
             env.setup_prog_bytes(&bytes)?;
-            let verdict = match env.verify()? {
+            let verdict =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
+                    Ok(Ok(v)) => v,
+                    // a model crash on a seed is recorded via the campaign
+                    // stream itself; here the seed is skipped so the
+                    // campaign can start (the mutated copies will re-trigger
+                    // the path through run_program's catcher)
+                    _ => continue,
+                };
+            let verdict = match verdict {
                 Verdict::Safe => "ACCEPT",
                 Verdict::Unsafe(_) => "REJECT",
             };
@@ -671,7 +711,11 @@ struct Outcome {
 }
 
 /// One program through the whole pipeline: verify (mini + concrete),
-/// optional kernel load, oracle classification.
+/// optional kernel load, oracle classification. A panic inside the
+/// mini/concrete side is caught and recorded as an `rv-panic` finding:
+/// a model crash is a real bug, but it must not kill a whole
+/// multi-hour campaign (the kernel verdict for the same program is
+/// still asked and stored).
 fn run_program(
     args: &Args,
     name: &str,
@@ -683,18 +727,35 @@ fn run_program(
     // rand-verifier side (mini + concrete)
     let mut env = BpfVerifierEnv::new();
     env.setup_prog_bytes(&bytes)?;
-    let (mini, mini_reason, mini_insn) = match env.verify()? {
-        Verdict::Safe => (SideVerdict::Accept, None, None),
-        Verdict::Unsafe(failure) => {
-            let category = categorize_mini_reason(&failure);
-            let insn = failure.insn_idx();
-            (
-                SideVerdict::Reject { category },
-                Some(failure.message),
-                Some(insn),
-            )
-        }
-    };
+    let (mini, mini_reason, mini_insn, panic_msg) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
+            Ok(Ok(Verdict::Safe)) => (SideVerdict::Accept, None, None, None),
+            Ok(Ok(Verdict::Unsafe(failure))) => {
+                let category = categorize_mini_reason(&failure);
+                let insn = failure.insn_idx();
+                (
+                    SideVerdict::Reject { category },
+                    Some(failure.message),
+                    Some(insn),
+                    None,
+                )
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>")
+                    .to_string();
+                (
+                    SideVerdict::Skipped,
+                    Some(format!("mini panicked: {msg}")),
+                    None,
+                    Some(msg),
+                )
+            }
+        };
 
     // kernel side: qemu guest agent (preferred) or host kernel
     let (kernel, kernel_message, kernel_insn) = if let Some(qemu) = qemu {
@@ -705,15 +766,19 @@ fn run_program(
         (SideVerdict::Skipped, None, None)
     };
 
-    let finding = classify_env(
-        &env,
-        name,
-        &mini,
-        mini_reason.as_deref(),
-        &kernel,
-        kernel_message.as_deref(),
-        args.strict,
-    );
+    let finding = if panic_msg.is_some() {
+        Finding::RvPanic
+    } else {
+        classify_env(
+            &env,
+            name,
+            &mini,
+            mini_reason.as_deref(),
+            &kernel,
+            kernel_message.as_deref(),
+            args.strict,
+        )
+    };
     Ok(Outcome {
         name: name.to_string(),
         bytes,

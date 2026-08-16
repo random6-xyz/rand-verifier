@@ -58,6 +58,11 @@ pub enum Finding {
     /// mini ACCEPT + concrete UNSAFE — a rand-verifier model bug. Must
     /// surface loudly (report channel), never silently.
     RvSoundnessBug,
+    /// The rand-verifier side (mini) panicked while verifying the
+    /// program — a model crash, recorded as a finding instead of
+    /// killing the whole campaign (the kernel verdict is still
+    /// consulted).
+    RvPanic,
     /// All sides agree — discard.
     Agree,
     /// A known design difference (diff whitelist, same-reason reject,
@@ -76,6 +81,7 @@ impl Finding {
             Finding::SoundnessCandidate => "soundness-candidate",
             Finding::RvPrecisionGap => "rv-precision-gap",
             Finding::RvSoundnessBug => "rv-soundness-bug",
+            Finding::RvPanic => "rv-panic",
             Finding::Agree => "agree",
             Finding::Whitelisted => "whitelisted",
             Finding::Inconclusive => "inconclusive",
@@ -91,6 +97,7 @@ impl Finding {
                 | Finding::SoundnessCandidate
                 | Finding::RvPrecisionGap
                 | Finding::RvSoundnessBug
+                | Finding::RvPanic
         )
     }
 }
