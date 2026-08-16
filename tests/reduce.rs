@@ -75,7 +75,7 @@ fn cli_success_reduces_fixture_exit_0() {
         .unwrap();
     assert!(json.contains("\"final_insns\""), "{json}");
     // the reduced program still exhibits the flip (mini REJECT)
-    let sides = evaluate_bytes(&bytes, false, false).unwrap();
+    let sides = evaluate_bytes(&bytes, false, false, None).unwrap();
     assert_eq!(sides.mini.name(), "REJECT");
     assert!(
         bytes.len() < 64,
@@ -123,6 +123,7 @@ fn fixture_verdict_flip_reduces_and_preserves() {
             budget: 0,
             kernel: false,
             strict: false,
+            qemu_dir: None,
         },
     )
     .unwrap();

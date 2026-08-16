@@ -37,6 +37,7 @@ struct Args {
     kernel: bool,
     budget: usize,
     tolerate_findings: bool,
+    qemu_dir: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -56,6 +57,7 @@ fn parse_args() -> Args {
         kernel: false,
         budget: 0,
         tolerate_findings: false,
+        qemu_dir: None,
     };
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -71,6 +73,7 @@ fn parse_args() -> Args {
             "--budget" => args.budget = value().parse().unwrap_or_else(|_| usage()),
             "--kernel" => args.kernel = true,
             "--strict" => args.strict = true,
+            "--qemu-dir" => args.qemu_dir = Some(value().into()),
             "--tolerate-findings" => args.tolerate_findings = true,
             "--help" | "-h" => usage(),
             other if other.starts_with('-') => {
@@ -133,8 +136,9 @@ fn main() -> anyhow::Result<()> {
     if args.strict && !args.kernel {
         eprintln!("note: --strict only affects the kernel side; ignored without --kernel");
     }
-    if args.kernel && args.strict {
+    if args.kernel && args.strict && args.qemu_dir.is_none() {
         // unprivileged-equivalent kernel rules, like diff/fuzz --strict
+        // (qemu guests handle strict via the share marker)
         if let Err(msg) = drop_privileged_caps() {
             eprintln!("{msg}");
             process::exit(2);
@@ -146,6 +150,7 @@ fn main() -> anyhow::Result<()> {
         budget: args.budget,
         kernel: args.kernel,
         strict: args.strict,
+        qemu_dir: args.qemu_dir,
     };
 
     let mut failed = 0usize;

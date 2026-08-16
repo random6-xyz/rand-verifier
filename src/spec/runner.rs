@@ -1091,6 +1091,20 @@ impl<'a> SpecRunner<'a> {
         for r in 1..=5 {
             state.set_reg(r, SpecValue::Uninit);
         }
+        // a helper call unprotects spilled pointer slots: the kernel
+        // re-types the spilled register to a scalar (bpf-next
+        // empirical — partial writes and narrow fills over a spill
+        // are accepted after any helper call). The spec mirrors that:
+        // the spilled pointer becomes an unknown scalar spill, so
+        // later partial writes no longer trip the corruption rule.
+        for slot in state.cur.stack.spill.iter_mut() {
+            if matches!(slot, Some(Spill::Ptr(_))) {
+                *slot = Some(Spill::Scalar {
+                    lo: 0,
+                    hi: u64::MAX,
+                });
+            }
+        }
         Ok(())
     }
 

@@ -231,25 +231,15 @@ pub fn classify(input: &OracleInput) -> Finding {
             SideVerdict::Skipped => Finding::Skipped,
             SideVerdict::Accept => match mini {
                 SideVerdict::Reject { .. } => {
+                    // (the spec-Reject variant of this pair was
+                    // already returned by the top branch above)
                     if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                         Finding::Whitelisted
-                    } else if matches!(spec, SpecSide::Reject) {
-                        // mini and the spec independently reject what
-                        // the kernel accepts — a kernel soundness
-                        // candidate (#113), not a mini over-rejection
-                        Finding::KernelUnsoundCandidate
                     } else {
                         Finding::RvPrecisionGap
                     }
                 }
-                // the spec rejects what everyone else accepts
-                _ => {
-                    if matches!(spec, SpecSide::Reject) {
-                        Finding::KernelUnsoundCandidate
-                    } else {
-                        Finding::Agree
-                    }
-                }
+                _ => Finding::Agree,
             },
             SideVerdict::Reject { category } => {
                 // both sides reject — the kernel is not rejecting a

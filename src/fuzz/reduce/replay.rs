@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::diff::{SideVerdict, categorize_mini_reason, kernel_side};
 use crate::env::BpfVerifierEnv;
@@ -92,6 +93,9 @@ pub struct FindingSpec {
     /// The recorded spec side (#113): the independent safety spec's
     /// verdict, preserved through reduction.
     pub spec: crate::fuzz::oracle::SpecSide,
+    /// Whether meta.json carried a "spec" field — old finding dirs
+    /// (pre-#113) default to Inconclusive and are NOT re-checked.
+    pub spec_recorded: bool,
 }
 
 /// The three verdict sides of one program, re-derived from the
@@ -207,7 +211,9 @@ pub fn load_finding(dir: &Path) -> Result<(FindingSpec, Vec<u8>), ReduceError> {
             .ok_or_else(|| ReduceError::InvalidFinding("meta.json: missing \"kernel\"".into()))?,
     )
     .ok_or_else(|| ReduceError::InvalidFinding("meta.json: unparsable \"kernel\"".into()))?;
-    let spec = parse_spec_side(meta_value(&text, "spec").as_deref());
+    let spec_raw = meta_value(&text, "spec");
+    let spec = parse_spec_side(spec_raw.as_deref());
+    let spec_recorded = spec_raw.is_some();
 
     let finding = if is_kernel_dependent(&label) || label == "rv-soundness-bug" {
         Some(parse_finding(&label).ok_or_else(|| {
@@ -235,6 +241,7 @@ pub fn load_finding(dir: &Path) -> Result<(FindingSpec, Vec<u8>), ReduceError> {
             mini,
             kernel,
             spec,
+            spec_recorded,
         },
         bytes,
     ))
@@ -245,7 +252,20 @@ pub fn load_finding(dir: &Path) -> Result<(FindingSpec, Vec<u8>), ReduceError> {
 /// was requested but the host cannot produce a verdict (EPERM, no log
 /// line), the program cannot be classified — an error, never a silent
 /// `Skipped` (the reducer must not reduce blind).
-pub fn evaluate_bytes(bytes: &[u8], kernel: bool, _strict: bool) -> Result<Sides, ReduceError> {
+/// Unique job names for qemu queries: the guest writes one out file
+/// per name, so every evaluation gets a fresh name.
+static QEMU_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn qemu_name() -> String {
+    format!("rv-{}", QEMU_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn evaluate_bytes(
+    bytes: &[u8],
+    kernel: bool,
+    _strict: bool,
+    qemu: Option<&mut crate::fuzz::qemu::QemuBatch>,
+) -> Result<Sides, ReduceError> {
     let mut env = BpfVerifierEnv::new();
     env.setup_prog_bytes(bytes)
         .map_err(|e| ReduceError::Pipeline(e.to_string()))?;
@@ -267,15 +287,24 @@ pub fn evaluate_bytes(bytes: &[u8], kernel: bool, _strict: bool) -> Result<Sides
         .map(concrete_side)
         .unwrap_or(ConcreteSide::Inconclusive);
     let kernel = if kernel {
-        let outcome = load_with_kernel(bytes);
-        match kernel_side(&outcome) {
-            SideVerdict::Skipped => {
-                return Err(ReduceError::KernelRequired(format!(
-                    "kernel load produced no verdict ({})",
-                    kernel_skip_reason(&outcome)
-                )));
+        match qemu {
+            Some(q) => {
+                q.ask(&qemu_name(), bytes)
+                    .map_err(|e| ReduceError::KernelRequired(format!("qemu verdict failed: {e}")))?
+                    .0
             }
-            side => side,
+            None => {
+                let outcome = load_with_kernel(bytes);
+                match kernel_side(&outcome) {
+                    SideVerdict::Skipped => {
+                        return Err(ReduceError::KernelRequired(format!(
+                            "kernel load produced no verdict ({})",
+                            kernel_skip_reason(&outcome)
+                        )));
+                    }
+                    side => side,
+                }
+            }
         }
     } else {
         SideVerdict::Skipped
@@ -318,6 +347,16 @@ pub fn replay_check(spec: &FindingSpec, sides: &Sides, strict: bool) -> Result<(
         return Err(ReduceError::ReplayMismatch {
             expected: side_str(&spec.mini),
             actual: side_str(&sides.mini),
+        });
+    }
+    // the spec verdict (#113) is re-derived too — a recorded spec
+    // side that no longer reproduces is stale (changed verifier /
+    // changed spec surface). Old finding dirs without the field are
+    // not re-checked.
+    if spec.spec_recorded && sides.spec != spec.spec {
+        return Err(ReduceError::ReplayMismatch {
+            expected: format!("spec {:?}", spec.spec),
+            actual: format!("spec {:?}", sides.spec),
         });
     }
     // verdict-flip: the mini verdict IS the flip direction — equality
@@ -375,9 +414,14 @@ pub fn invariant_for(spec: &FindingSpec) -> Result<Invariant, ReduceError> {
 /// Load a finding directory and validate it against the pipeline: the
 /// baseline every reduction starts from. `kernel` must be true for
 /// kernel-dependent findings (enforced here).
-pub fn load_and_replay(dir: &Path, kernel: bool, strict: bool) -> Result<Baseline, ReduceError> {
+pub fn load_and_replay(
+    dir: &Path,
+    kernel: bool,
+    strict: bool,
+    qemu: Option<&mut crate::fuzz::qemu::QemuBatch>,
+) -> Result<Baseline, ReduceError> {
     let (spec, bytes) = load_finding(dir)?;
-    let sides = evaluate_bytes(&bytes, kernel, strict)?;
+    let sides = evaluate_bytes(&bytes, kernel, strict, qemu)?;
     replay_check(&spec, &sides, strict)?;
     let invariant = invariant_for(&spec)?;
     Ok(Baseline {
@@ -581,6 +625,7 @@ mod tests {
             mini: SideVerdict::Reject { category: u },
             kernel: SideVerdict::Accept,
             spec: SpecSide::Reject,
+            spec_recorded: true,
         };
         let invariant = Invariant::Classification {
             finding: Finding::KernelUnsoundCandidate,
@@ -842,7 +887,7 @@ mod tests {
             insn_bytes(0x95, 0, 0, 0, 0), // exit
         ];
         let (dir, _guard) = temp_finding(FLIP_META, &insns);
-        let baseline = load_and_replay(&dir, false, false).unwrap();
+        let baseline = load_and_replay(&dir, false, false, None).unwrap();
         assert_eq!(baseline.spec.label, "verdict-flip");
         assert_eq!(baseline.spec.finding, None);
         assert_eq!(baseline.sides.mini.name(), "REJECT");
@@ -875,7 +920,7 @@ mod tests {
             insn_bytes(0x95, 0, 0, 0, 0), // exit
         ];
         let (dir, _guard) = temp_finding(meta, &insns);
-        let err = load_and_replay(&dir, false, false).unwrap_err();
+        let err = load_and_replay(&dir, false, false, None).unwrap_err();
         assert!(matches!(err, ReduceError::KernelRequired(_)), "{err:?}");
     }
 
@@ -897,7 +942,7 @@ mod tests {
             insn_bytes(0x95, 0, 0, 0, 0),
         ];
         let (dir, _guard) = temp_finding(meta, &insns);
-        let err = load_and_replay(&dir, false, false).unwrap_err();
+        let err = load_and_replay(&dir, false, false, None).unwrap_err();
         assert!(
             matches!(
                 err,
