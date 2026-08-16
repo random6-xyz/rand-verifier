@@ -448,6 +448,7 @@ fn alu_imm(
             min_offset,
             max_offset,
             align_off,
+            frameno,
         } => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(VerificationFailure::new(
@@ -470,6 +471,7 @@ fn alu_imm(
                 min_offset: new_min,
                 max_offset: new_max,
                 align_off: (align_off as i32 + imm.rem_euclid(8)).rem_euclid(8) as u8,
+                frameno,
             };
             Ok(next)
         }
@@ -572,6 +574,7 @@ fn alu_reg(
         min_offset,
         max_offset,
         align_off,
+        frameno,
     } = dst_state
     {
         if op != AluOp::Add || width != AluWidth::W64 {
@@ -584,7 +587,9 @@ fn alu_reg(
             ));
         }
         let s = read_scalar(pc, state, src)?;
-        return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, s, state);
+        return add_scalar_to_stack_ptr(
+            pc, dst, min_offset, max_offset, align_off, frameno, s, state,
+        );
     }
     // context pointer arithmetic (register form): the kernel allows
     // ctx ADD/SUB with a sane scalar (adjust_ptr_min_max_vals,
@@ -655,10 +660,13 @@ fn alu_reg(
             min_offset,
             max_offset,
             align_off,
+            frameno,
         } = read_reg(pc, state, src)?
         {
             check_sane_addend(pc, "stack", d)?;
-            return add_scalar_to_stack_ptr(pc, dst, min_offset, max_offset, align_off, d, state);
+            return add_scalar_to_stack_ptr(
+                pc, dst, min_offset, max_offset, align_off, frameno, d, state,
+            );
         }
         if let RegState::PtrToMapValue { .. } = read_reg(pc, state, src)? {
             return add_scalar_to_map_value_ptr(pc, dst, read_reg(pc, state, src)?, d, state);
@@ -768,6 +776,7 @@ fn dynptr_slot_of(
         min_offset,
         max_offset,
         align_off,
+        ..
     } = state.regs[reg as usize]
     else {
         return Err(VerificationFailure::new(
@@ -1168,6 +1177,7 @@ fn check_map_buffer(
         min_offset,
         max_offset,
         align_off,
+        ..
     } = state.regs[reg as usize]
     else {
         if matches!(state.regs[reg as usize], RegState::Uninit) {
@@ -1331,6 +1341,7 @@ fn stack_read(
             min_offset,
             max_offset,
             align_off,
+            frameno,
         } => {
             let size = size.bytes() as i64;
             let off64 = offset as i64;
@@ -1364,26 +1375,20 @@ fn stack_read(
                 ));
             }
             let (lo, hi) = stack_byte_range(min_off, max_off);
+            // the accessed frame's stack: a caller-frame pointer
+            // received by a subprogram reads the caller's stack (the
+            // kernel's `state->frame[reg->frameno]`, #100)
+            let stack = frame_stack(state, frameno);
             if min_offset == max_offset {
                 // a fixed access: single position
-                fixed_stack_read(
-                    pc,
-                    base,
-                    offset,
-                    &state.stack,
-                    lo,
-                    hi,
-                    min_off,
-                    size,
-                    sign_extend,
-                )
+                fixed_stack_read(pc, base, offset, stack, lo, hi, min_off, size, sign_extend)
             } else {
                 // variable-offset read: every covered byte must be
                 // MISC/ZERO (SPILL is rejected — the kernel's "invalid
                 // variable-offset read from stack")
                 let mut unknown = false;
                 for i in lo..=hi {
-                    match state.stack.bytes[i] {
+                    match stack.bytes[i] {
                         StackByte::Invalid | StackByte::Dynptr => {
                             return Err(VerificationFailure::new(
                                 pc,
@@ -1398,7 +1403,7 @@ fn stack_read(
                             // scalar spills are readable bytes (kernel
                             // check_stack_range_initialized); pointers
                             // are not ("invalid indirect read")
-                            match state.stack.spilled[i / 8] {
+                            match stack.spilled[i / 8] {
                                 Some(RegState::Scalar(_)) => unknown = true,
                                 _ => {
                                     return Err(VerificationFailure::new(
@@ -1477,18 +1482,21 @@ fn fixed_stack_read(
         if size == 8 {
             return Ok(spilled);
         }
-        // narrow fill: scalars only, at the slot's LSB (the
-        // kernel: "invalid size of register fill" otherwise)
+        // narrow fill: the kernel rejects a narrow fill of a NON-scalar
+        // spill outright (check_stack_read_fixed_off: "invalid size of
+        // register fill"); scalar narrow fills additionally need the
+        // slot-LSB alignment (bpf_stack_narrow_access_ok — a misaligned
+        // scalar narrow read falls through to the byte walk below).
+        let RegState::Scalar(b) = spilled else {
+            return Err(VerificationFailure::new(
+                pc,
+                format!(
+                    "invalid size of register fill at r{}{:+}: spilled {}",
+                    base, offset, spilled
+                ),
+            ));
+        };
         if min_off.rem_euclid(8) == 0 {
-            let RegState::Scalar(b) = spilled else {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "invalid size of register fill at r{}{:+}: spilled {}",
-                        base, offset, spilled
-                    ),
-                ));
-            };
             return Ok(RegState::Scalar(coerce_scalar(
                 b,
                 size as usize,
@@ -1535,6 +1543,34 @@ fn fixed_stack_read(
 /// zero values); partial writes scrub the covered bytes to MISC (or
 /// ZERO for the immediate 0) and destroy spill metadata; a partial
 /// write of a pointer is rejected ("invalid size of register spill").
+/// The stack of the frame a stack pointer belongs to (kernel
+/// `state->frame[reg->frameno]`): the current frame's stack for
+/// `frameno == state.curframe`, otherwise the saved caller frame at
+/// that depth. A stack pointer received from a caller keeps the
+/// caller's frameno, so accesses through it hit the caller frame
+/// (mseed-202608161-5128/-12982).
+fn frame_stack(state: &VerifierState, frameno: u8) -> &StackState {
+    if frameno == state.curframe {
+        &state.stack
+    } else {
+        &state.saved[frameno as usize]
+            .as_ref()
+            .expect("a stack pointer always targets an active frame")
+            .stack
+    }
+}
+
+fn frame_stack_mut(state: &mut VerifierState, frameno: u8) -> &mut StackState {
+    if frameno == state.curframe {
+        &mut state.stack
+    } else {
+        &mut state.saved[frameno as usize]
+            .as_mut()
+            .expect("a stack pointer always targets an active frame")
+            .stack
+    }
+}
+
 fn stack_write(
     pc: u32,
     base: u8,
@@ -1550,6 +1586,7 @@ fn stack_write(
             min_offset,
             max_offset,
             align_off,
+            frameno,
         } => {
             let size = size.bytes() as i64;
             let off64 = offset as i64;
@@ -1585,17 +1622,20 @@ fn stack_write(
             // destroy_if_dynptr_stack_slot + the parent_id cascade,
             // #99)
             let mut destroyed = None;
-            for slot in lo / 8..=hi / 8 {
-                if next.stack.bytes[slot * 8] == StackByte::Dynptr {
-                    // the metadata is anchored at the lowest-address
-                    // slot of the pair
-                    if let Some(ds) = next.stack.dynptr[slot] {
-                        destroyed = Some(ds.id);
+            {
+                let stack = frame_stack_mut(&mut next, frameno);
+                for slot in lo / 8..=hi / 8 {
+                    if stack.bytes[slot * 8] == StackByte::Dynptr {
+                        // the metadata is anchored at the lowest-address
+                        // slot of the pair
+                        if let Some(ds) = stack.dynptr[slot] {
+                            destroyed = Some(ds.id);
+                        }
+                        for b in stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+                            *b = StackByte::Invalid;
+                        }
+                        stack.dynptr[slot] = None;
                     }
-                    for b in next.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
-                        *b = StackByte::Invalid;
-                    }
-                    next.stack.dynptr[slot] = None;
                 }
             }
             if let Some(did) = destroyed {
@@ -1617,7 +1657,8 @@ fn stack_write(
                         *reg = RegState::Scalar(ScalarBounds::unknown());
                     }
                 }
-                for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
+                let stack = frame_stack_mut(&mut next, frameno);
+                for (slot, spilled) in stack.spilled.iter_mut().enumerate() {
                     if let Some(
                         RegState::PtrToMem {
                             id: rid,
@@ -1631,7 +1672,7 @@ fn stack_write(
                         },
                     ) = spilled
                         && (*rid == did || *pid == did)
-                        && next.stack.bytes[slot * 8..slot * 8 + 8]
+                        && stack.bytes[slot * 8..slot * 8 + 8]
                             .iter()
                             .all(|x| *x == StackByte::Spill)
                     {
@@ -1653,17 +1694,20 @@ fn stack_write(
             } else {
                 // partial or variable-offset write: the kernel's "attempt
                 // to corrupt spilled pointer on stack" check first
-                for s in lo / 8..=hi / 8 {
-                    if let Some(v) = next.stack.spilled[s]
-                        && !matches!(v, RegState::Scalar(_))
-                    {
-                        return Err(VerificationFailure::new(
-                            pc,
-                            format!(
-                                "attempt to corrupt spilled pointer on stack at r{}{:+} (spilled {} at slot {})",
-                                base, offset, v, s
-                            ),
-                        ));
+                {
+                    let stack = frame_stack_mut(&mut next, frameno);
+                    for s in lo / 8..=hi / 8 {
+                        if let Some(v) = stack.spilled[s]
+                            && !matches!(v, RegState::Scalar(_))
+                        {
+                            return Err(VerificationFailure::new(
+                                pc,
+                                format!(
+                                    "attempt to corrupt spilled pointer on stack at r{}{:+} (spilled {} at slot {})",
+                                    base, offset, v, s
+                                ),
+                            ));
+                        }
                     }
                 }
                 match src {
@@ -1691,17 +1735,29 @@ fn stack_write(
                         ),
                     ));
                 }
+                // the kernel rejects spilling a stack pointer into a
+                // CALLER frame (check_stack_write_fixed_off: "cannot
+                // spill pointers to stack into stack frame of the
+                // caller") — the pointer would outlive the frame it
+                // describes (mseed-202608161-12590 etc.).
+                if matches!(value, Some(RegState::PtrToStack { .. })) && frameno != state.curframe {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        "cannot spill pointers to stack into stack frame of the caller",
+                    ));
+                }
                 let slot = hi / 8;
+                let stack = frame_stack_mut(&mut next, frameno);
                 for i in lo..=hi {
-                    next.stack.bytes[i] = StackByte::Spill;
+                    stack.bytes[i] = StackByte::Spill;
                 }
                 // the rest of the slot is initialized-but-unknown
                 // (kernel mark_stack_slot_misc)
                 for i in slot * 8..lo {
-                    next.stack.bytes[i] = StackByte::Misc;
+                    stack.bytes[i] = StackByte::Misc;
                 }
                 if let Some(v) = value {
-                    next.stack.spilled[slot] = Some(v);
+                    stack.spilled[slot] = Some(v);
                 }
                 return Ok(next);
             }
@@ -1714,12 +1770,13 @@ fn stack_write(
                 Some(RegState::Scalar(b)) => b.is_constant() && b.smin == 0,
                 _ => false,
             };
+            let stack = frame_stack_mut(&mut next, frameno);
             for slot in lo / 8..=hi / 8 {
-                next.stack.spilled[slot] = None;
-                next.stack.dynptr[slot] = None;
+                stack.spilled[slot] = None;
+                stack.dynptr[slot] = None;
             }
             for i in lo..=hi {
-                next.stack.bytes[i] = if zero {
+                stack.bytes[i] = if zero {
                     StackByte::Zero
                 } else {
                     StackByte::Misc
@@ -1728,8 +1785,8 @@ fn stack_write(
             // the uncovered bytes of the covered slots are scrubbed too
             for slot in lo / 8..=hi / 8 {
                 for i in slot * 8..slot * 8 + 8 {
-                    if next.stack.bytes[i] == StackByte::Spill {
-                        next.stack.bytes[i] = StackByte::Misc;
+                    if stack.bytes[i] == StackByte::Spill {
+                        stack.bytes[i] = StackByte::Misc;
                     }
                 }
             }
@@ -1779,6 +1836,7 @@ pub(crate) fn stack_access_range(
         min_offset,
         max_offset,
         align_off,
+        ..
     } = state.regs[base as usize]
     else {
         unreachable!("read_stack_ptr checked the base")
@@ -1913,12 +1971,14 @@ fn check_sane_result_offset(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_scalar_to_stack_ptr(
     pc: u32,
     dst: u8,
     min_offset: i32,
     max_offset: i32,
     align_off: u8,
+    frameno: u8,
     s: ScalarBounds,
     state: &VerifierState,
 ) -> Result<VerifierState, VerificationFailure> {
@@ -1943,6 +2003,7 @@ fn add_scalar_to_stack_ptr(
         min_offset: new_min,
         max_offset: new_max,
         align_off: new_align,
+        frameno,
     };
     Ok(next)
 }
@@ -4837,6 +4898,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds {
             smin: 0,
@@ -4862,6 +4924,7 @@ mod tests {
                 min_offset: -32,
                 max_offset: -24,
                 align_off: 0,
+                frameno: 0
             }
         );
         // the frame pointer itself is untouched
@@ -4877,6 +4940,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
         let next = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
@@ -4892,6 +4956,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds {
             smin: 0,
@@ -4912,6 +4977,7 @@ mod tests {
             min_offset,
             max_offset,
             align_off,
+            ..
         } = next.regs[1]
         else {
             panic!("expected stack pointer");
@@ -4944,6 +5010,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds {
             smin: 0,
@@ -4967,6 +5034,7 @@ mod tests {
             min_offset,
             max_offset,
             align_off,
+            ..
         } = next.regs[1]
         else {
             panic!("expected stack pointer");
@@ -4984,6 +5052,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds {
             smin: 1,
@@ -5031,6 +5100,7 @@ mod tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::unknown());
         let err = step(0, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap_err();
@@ -5050,6 +5120,7 @@ mod tests {
             min_offset,
             max_offset,
             align_off,
+            ..
         } = next.regs[1]
         else {
             panic!("expected stack pointer");
@@ -5134,6 +5205,7 @@ mod tests {
             min_offset: -32,
             max_offset: 216,
             align_off: 0,
+            frameno: 0,
         };
         let err = step(
             0,
@@ -5161,6 +5233,7 @@ mod tests {
             min_offset: -32,
             max_offset: 0,
             align_off: ALIGN_UNKNOWN,
+            frameno: 0,
         };
         let err = step(
             0,
@@ -5269,6 +5342,7 @@ mod tests {
             min_offset: -256,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(7));
         let next = step(
@@ -5309,6 +5383,7 @@ mod tests {
             min_offset: -256,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         let err = step(
             0,
@@ -5347,6 +5422,7 @@ mod tests {
             min_offset: -16,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         let err = step(
             1,
@@ -5396,6 +5472,7 @@ mod tests {
             min_offset: -16,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         let next = step(
             1,
@@ -7051,6 +7128,7 @@ mod dynptr_kfunc_tests {
             min_offset: off,
             max_offset: off,
             align_off: off.rem_euclid(8) as u8,
+            frameno: 0,
         }
     }
 
@@ -7207,6 +7285,7 @@ mod parent_id_tests {
             min_offset: -32,
             max_offset: -32,
             align_off: 0,
+            frameno: 0,
         };
         state.regs[6] = state.regs[4];
         let state = step(0, &state, &BpfInsn::Call { imm: 197 }).unwrap();
@@ -7257,6 +7336,7 @@ mod review_fix_tests {
             min_offset: off,
             max_offset: off,
             align_off: off.rem_euclid(8) as u8,
+            frameno: 0,
         }
     }
 

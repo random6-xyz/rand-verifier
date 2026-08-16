@@ -238,13 +238,21 @@ pub(crate) enum RegState {
     Scalar(ScalarBounds),
     /// A pointer into the stack frame, offset relative to R10. The
     /// offset may be a range (computed pointer arithmetic, #45); the
-    /// alignment tracks the known offset modulo 8.
+    /// alignment tracks the known offset modulo 8. `frameno` is the
+    /// absolute depth of the frame the pointer belongs to (0 = main
+    /// program; the kernel's `reg->frameno`): a subprogram that
+    /// receives the caller's stack pointer keeps the caller's depth,
+    /// so stack accesses through it hit the caller frame
+    /// (kernel: check_stack_access_within_bounds uses
+    /// `state->frame[reg->frameno]`; mseed-202608161-5128 etc.).
     PtrToStack {
         min_offset: i32,
         max_offset: i32,
         /// Known offset modulo 8 (0..=7); [`ALIGN_UNKNOWN`] when the low
         /// three bits of the offset are not determined.
         align_off: u8,
+        /// The absolute depth of the owning frame.
+        frameno: u8,
     },
     PtrToCtx,
     /// A fixed map pointer (kernel's CONST_PTR_TO_MAP) carrying the
@@ -417,6 +425,7 @@ pub(crate) fn initial_reg_state() -> [RegState; NUM_REGS] {
         min_offset: 0,
         max_offset: 0,
         align_off: 0,
+        frameno: 0,
     };
     regs
 }
@@ -572,6 +581,12 @@ impl VerifierState {
         self.curframe += 1;
         let mut callee = FrameState::new();
         callee.regs[1..=5].copy_from_slice(&args);
+        // R10 belongs to the callee's own frame: its frameno is the
+        // callee depth, so stack pointers derived from it target the
+        // callee stack (the kernel sets frameno on R10 init).
+        if let RegState::PtrToStack { frameno, .. } = &mut callee.regs[10] {
+            *frameno = self.curframe;
+        }
         self.regs = callee.regs;
         self.stack = callee.stack;
         self.ret_pc = return_pc;

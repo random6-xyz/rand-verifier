@@ -8,6 +8,7 @@ pub(crate) fn ptr_stack(offset: i32) -> crate::state::RegState {
         min_offset: offset,
         max_offset: offset,
         align_off: offset.rem_euclid(8) as u8,
+        frameno: 0,
     }
 }
 
