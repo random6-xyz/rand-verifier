@@ -166,6 +166,7 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | dynptr_uninit            | `dynptr_read` of an uninitialized dynptr slot                   | "Expected an initialized dynptr" (#101) |
 | kfunc_obj_drop_bad_arg   | `call kfunc bpf_obj_drop` with a scalar arg                      | kfunc arg validation (#101) |
 | kfunc_unknown_id         | `call kfunc 12345` (not a vmlinux function)                      | unknown kfunc (#101) |
+| kfunc_unknown_id         | `call kfunc 12345` (not a vmlinux function)                      | unknown kfunc (#101) |
 | ringbuf_leak              | `call 131; jeq r0, 0, +1; r0 = 0; exit`                      | unreleased reference at exit (#101) |
 | ringbuf_submit_nullable   | `call 131; r1 = r0; r2 = 0; call 132; exit`                     | release of the unrefined nullable pointer (#101) |
 
