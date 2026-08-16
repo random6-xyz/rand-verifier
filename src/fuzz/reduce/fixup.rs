@@ -211,7 +211,8 @@ mod tests {
             BpfInsn::StMem {
                 src: 1,
                 base: 10,
-                offset: -8
+                offset: -8,
+                size: crate::insn::MemSize::DW
             }
         ));
         assert!(matches!(
@@ -219,7 +220,9 @@ mod tests {
             BpfInsn::LdMem {
                 dst: 0,
                 base: 10,
-                offset: -8
+                offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false
             }
         ));
         assert!(matches!(decoded[3], BpfInsn::Call { imm: 1 }));

@@ -61,8 +61,63 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         BpfInsn::Arsh32Reg { dst, src } => (opcode::ARSH32_REG, *dst, *src, 0, 0),
         // stack accesses — DW only, any base register (#87; the
         // verifier requires a stack pointer at exec time)
-        BpfInsn::LdMem { dst, base, offset } => (opcode::LD_STACK, *dst, *base, *offset, 0),
-        BpfInsn::StMem { src, base, offset } => (opcode::ST_STACK, *base, *src, *offset, 0),
+        BpfInsn::LdMem {
+            dst,
+            base,
+            offset,
+            size,
+            sign_extend,
+        } => (
+            match (size, sign_extend) {
+                (crate::insn::MemSize::W, false) => 0x61,
+                (crate::insn::MemSize::H, false) => 0x69,
+                (crate::insn::MemSize::B, false) => 0x71,
+                (crate::insn::MemSize::DW, false) => 0x79,
+                // BPF_MEMSX (0x80) with the LDX class (0x01)
+                (crate::insn::MemSize::W, true) => 0x81,
+                (crate::insn::MemSize::H, true) => 0x89,
+                (crate::insn::MemSize::B, true) => 0x91,
+                (crate::insn::MemSize::DW, true) => unreachable!(),
+            },
+            *dst,
+            *base,
+            *offset,
+            0,
+        ),
+        BpfInsn::StMem {
+            src,
+            base,
+            offset,
+            size,
+        } => (
+            match size {
+                crate::insn::MemSize::W => 0x63,
+                crate::insn::MemSize::H => 0x6b,
+                crate::insn::MemSize::B => 0x73,
+                crate::insn::MemSize::DW => 0x7b,
+            },
+            *base,
+            *src,
+            *offset,
+            0,
+        ),
+        BpfInsn::StMemImm {
+            imm,
+            base,
+            offset,
+            size,
+        } => (
+            match size {
+                crate::insn::MemSize::W => 0x62,
+                crate::insn::MemSize::H => 0x6a,
+                crate::insn::MemSize::B => 0x72,
+                crate::insn::MemSize::DW => 0x7a,
+            },
+            *base,
+            0,
+            *offset,
+            *imm,
+        ),
         // ldimm64 (#89): each entry encodes one 8-byte slot — the
         // instruction pair [LdImm64/LdMap*, LdImm64Second] roundtrips
         // to the kernel's two-slot encoding
@@ -210,6 +265,8 @@ pub fn ld_stack(dst: u8, offset: i16) -> BpfInsn {
         dst,
         base: 10,
         offset,
+        size: crate::insn::MemSize::DW,
+        sign_extend: false,
     }
 }
 
@@ -219,6 +276,7 @@ pub fn st_stack(src: u8, offset: i16) -> BpfInsn {
         src,
         base: 10,
         offset,
+        size: crate::insn::MemSize::DW,
     }
 }
 
@@ -354,7 +412,7 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::JsltImm { .. }
         | BpfInsn::Jsle { .. }
         | BpfInsn::JsleImm { .. } => "cmp_signed",
-        BpfInsn::LdMem { .. } | BpfInsn::StMem { .. } => "stack",
+        BpfInsn::LdMem { .. } | BpfInsn::StMem { .. } | BpfInsn::StMemImm { .. } => "stack",
         BpfInsn::LdImm64 { .. }
         | BpfInsn::LdMapFd { .. }
         | BpfInsn::LdMapValue { .. }

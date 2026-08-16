@@ -70,6 +70,7 @@ struct BpfProgLoadAttr {
 fn bpf_map_create(info: &MapInfo) -> Result<i32, i32> {
     let map_type = match info.map_type {
         MapType::Array => BPF_MAP_TYPE_ARRAY,
+        MapType::Ringbuf => 27, // BPF_MAP_TYPE_RINGBUF
     };
     #[repr(C)]
     #[derive(Default)]

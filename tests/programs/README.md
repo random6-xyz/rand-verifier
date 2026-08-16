@@ -111,6 +111,12 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | ldimm64_const               | `r2 = 0x1234567890abcdef; r0 = r2; exit`                          | ldimm64 64-bit constant (#89) |
 | ldimm64_map_fd              | `r1 = map_fd(1); r0 = 0; exit`                                    | CONST_PTR_TO_MAP from a map fd (#89) |
 | map_lookup_null_check       | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +2; r4 = [r0]; r0 = 1; exit; exit` | map_lookup → NULL check → value load (#89) |
+| partial_w_roundtrip       | `r2 = 0x12345678; [r10-8] = w r2; r0 = (u32)[r10-8]; exit` | 4-byte spill/fill at the slot LSB (#100) |
+| partial_w_unaligned       | `r2 = 7; [r10-4] = w r2; r0 = (u32)[r10-4]; exit`          | 4-aligned non-8-aligned store/load (#100) |
+| st_imm_zero               | `[r10-8] = 0; r0 = [r10-8]; exit`                            | BPF_ST immediate spill (#100)            |
+| st_imm_w                  | `[r10-8] = u32 42; r0 = (u32)[r10-8]; exit`                  | BPF_ST 4-byte immediate spill (#100)     |
+| ldxb_sign_extend          | `r2 = 0x80; [r10-8] = r2; r0 = (s8)[r10-8]; exit`            | sign-extending load (BPF_MEMSX, #100)    |
+| partial_spill_high_bytes  | `r2 = 0x11223344; [r10-8] = r2; r0 = (u32)[r10-4]; exit`     | non-LSB narrow fill of a spill → unknown (#100) |
 | subprog_call                 | `r1 = 5; call sub @4; r0 = r0; exit; r0 = r1; r0 += 1; exit` | BPF-to-BPF call: arg passing + return value (#100) |
 | null_alias_refinement        | `r1 = map_fd(1); r2 = r10-8; r3 = 0; [r10-8] = r3; call 1; r7 = r0; if r0 == 0 goto +3; r4 = [r7]; r0 = r4; exit; r0 = 0; exit` | NULL check on one alias refines the copy (id, #99) |
 | map_value_access            | `r1 = map_fd(1); r2 = r10-8; [r10-8] = 0; call 1; if r0 == 0 goto +4; r4 = 42; [r0] = r4; r4 = [r0]; r0 = r4; exit; exit` | map value store/load roundtrip (#89) |
@@ -150,6 +156,20 @@ checked against the abstract verifier state (Phase 2). Execution model:
 | invalid_shift                 | `r2 = 1; r2 <<= 64; exit`                           | shift amount out of 0..64           |
 | alu32_pointer_arith           | `w1 += 1; exit`                                     | 32-bit arithmetic on context pointer |
 | jsgt_must_be_signed            | `r1 = -1; r2 = 0; jsgt r1, r2, +1; exit; r0 = 1; exit`          | signed compare must prune the taken path |
+| dynptr_roundtrip          | `map_lookup → null check → dynptr_from_mem(map value) → dynptr_read` | stack dynptr slots (#101) |
+| dynptr_oob_read_ok       | same + a read with `offset 32 > size 8` (runtime -EINVAL only) | the kernel has no static dynptr OOB check (#101) |
+| ringbuf_reserve_submit    | `r1 = fd; r2 = 8; r3 = 0; call 131; jeq r0, 0, +3; r1 = r0; r2 = 0; call 132; r0 = 0; exit` | acquire + NULL check + release (#101) |
+| partial_write_corrupt_pointer | `[r10-8] = r1; r2 = 1; [r10-4] = w r2; exit`          | partial write over a spilled pointer (#100) |
+| narrow_fill_pointer        | `[r10-8] = r1; r0 = (u32)[r10-8]; exit`                   | narrow fill of a spilled pointer (#100) |
+| partial_w_misaligned       | `r2 = 1; [r10-3] = w r2; exit`                            | 4-byte store at a 4-misaligned offset (#100) |
+| narrow_read_uninit         | `r0 = (u32)[r10-8]; exit`                                 | narrow read of uninitialized stack (#100) |
+| dynptr_uninit            | `dynptr_read` of an uninitialized dynptr slot                   | "Expected an initialized dynptr" (#101) |
+| kfunc_obj_drop_bad_arg   | `call kfunc bpf_obj_drop` with a scalar arg                      | kfunc arg validation (#101) |
+| kfunc_unknown_id         | `call kfunc 12345` (not a vmlinux function)                      | unknown kfunc (#101) |
+| kfunc_unknown_id         | `call kfunc 12345` (not a vmlinux function)                      | unknown kfunc (#101) |
+| ringbuf_leak              | `call 131; jeq r0, 0, +1; r0 = 0; exit`                      | unreleased reference at exit (#101) |
+| ringbuf_submit_nullable   | `call 131; r1 = r0; r2 = 0; call 132; exit`                     | release of the unrefined nullable pointer (#101) |
+
 | computed_ptr_out_of_frame_access | `r6 = r10; r6 += -8; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = [r6]; exit` | computed pointer out-of-frame *access* rejected (#87) |
 | computed_ptr_misaligned_access | `r6 = r10; r6 += -8; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 254; r6 += r2; r0 = [r6]; exit` | computed pointer access alignment not provable (#87) |
 | computed_ptr_indirect_read_uninit | `r6 = r10; r6 += -512; call 7; r2 = r0; r3 = 255; jslt r2, r3, +1; exit; r4 = 0; jsge r2, r4, +1; exit; r2 &= 248; r6 += r2; r0 = [r6]; exit` | variable-offset read over uninitialized slots (#87) |

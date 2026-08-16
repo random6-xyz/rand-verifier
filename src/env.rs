@@ -54,6 +54,9 @@ pub struct MapInfo {
 pub enum MapType {
     #[default]
     Array,
+    /// A per-CPU ring buffer (kernel BPF_MAP_TYPE_RINGBUF, #101): the
+    /// ringbuf reserve helpers take its pointer as R1.
+    Ringbuf,
 }
 
 impl MapInfo {
@@ -176,11 +179,16 @@ impl BpfVerifierEnv {
                         fd,
                         key_size,
                         value_size,
+                        map_type,
                         ..
                     } => match self.maps.get(fd) {
                         Some(info) => {
                             *key_size = info.key_size;
                             *value_size = info.value_size;
+                            *map_type = match info.map_type {
+                                MapType::Array => 0,
+                                MapType::Ringbuf => 1,
+                            };
                         }
                         None => {
                             decode_error = Some(VerificationFailure::new(
@@ -559,6 +567,16 @@ mod tests {
 
     /// Every program under tests/programs/reject/ must fail verification.
 
+    #[test]
+    fn dbg_st_imm_w() {
+        let mut env = BpfVerifierEnv::new();
+        env.setup_prog("tests/programs/accept/st_imm_w".to_string())
+            .unwrap();
+        match env.verify() {
+            Ok(v) => eprintln!("verdict {:?}", v),
+            Err(e) => eprintln!("verify error: {}", e),
+        }
+    }
     #[test]
     fn corpus_reject_all() {
         let dir = std::path::Path::new("tests/programs/reject");

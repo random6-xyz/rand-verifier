@@ -49,6 +49,11 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // "invalid indirect read from stack ... spilled ..." — the
         // kernel rejects variable-offset reads over spilled registers
         ReasonCategory::UninitRead
+    } else if msg.contains("invalid size of register fill")
+        || msg.contains("corrupt spilled pointer")
+    {
+        // the kernel's -EACCES fill/spill corruption family (#100)
+        ReasonCategory::UninitRead
     } else if msg.contains("stack access") || msg.contains("stack pointer") {
         // "stack access at r10 ... exceeds/points away",
         // "stack access at r6+0 with base offsets ...",
@@ -65,6 +70,19 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // mini's loop budget is its complexity mechanism — the kernel
         // rejects non-converging loops with "BPF program is too large"
         ReasonCategory::Complexity
+    } else if msg.contains("kfunc") {
+        // "unknown kfunc", "calling kernel function ... is not
+        // allowed" (kernel check_kfunc_call, #101)
+        ReasonCategory::Ref
+    } else if msg.contains("dynptr") {
+        // "Expected an initialized dynptr as arg #N", "dynptr read out
+        // of bounds" (kernel check_func_arg for ARG_PTR_TO_DYNPTR,
+        // #101)
+        ReasonCategory::Ref
+    } else if msg.contains("reference") || msg.contains("Unreleased") {
+        // "Unreleased reference id=N", "release of unacquired
+        // reference" (kernel check_reference_leak, #101)
+        ReasonCategory::Ref
     } else if msg.contains("infinite loop") {
         // kernel/bpf/states.c: "infinite loop detected at insn N"
         ReasonCategory::Loop
@@ -239,6 +257,10 @@ pub fn whitelisted(
                 "stack_write_before_read" => Some(
                     "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
                 ),
+                // the same family for the narrow-read fixture (#100)
+                "narrow_read_uninit" => Some(
+                    "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
+                ),
                 _ => None,
             }
         }
@@ -260,7 +282,9 @@ pub fn privileged_stack_leniency(mini: &SideVerdict, mini_reason: Option<&str>) 
         SideVerdict::Reject {
             category: ReasonCategory::UninitRead
         }
-    ) && mini_reason.is_some_and(|r| r.contains("stack slot") || r.contains("indirect read"))
+    ) && mini_reason.is_some_and(|r| {
+        r.contains("stack slot") || r.contains("indirect read") || r.contains("uninitialized stack")
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
