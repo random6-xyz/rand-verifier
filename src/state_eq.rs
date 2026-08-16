@@ -320,6 +320,10 @@ fn check_reg_ids(idmap: &mut IdMap, old: &RegState, new: &RegState) -> bool {
         (RegState::PtrToMemOrNull { id: a }, RegState::PtrToMemOrNull { id: b }) => {
             check_ids(idmap, *a, *b)
         }
+        (
+            RegState::PtrToBtfId { ref_obj_id: a, .. },
+            RegState::PtrToBtfId { ref_obj_id: b, .. },
+        ) => check_ids(idmap, *a, *b),
         _ => true,
     }
 }
@@ -387,6 +391,9 @@ pub(crate) fn stacksafe(
             // both slots are fully spills: the spilled registers must
             // be comparable (kernel: "check that stored pointers types
             // are the same as well")
+            if o == StackByte::Dynptr && old.dynptr[spi] != new.dynptr[spi] {
+                return false;
+            }
             if o == StackByte::Spill {
                 let Some(old_spilled) = old.spilled[spi].as_ref() else {
                     i += 1;
@@ -529,6 +536,7 @@ pub(crate) fn clean_state(state: &mut VerifierState, live_regs: u16, live_stack:
                 *b = crate::state::StackByte::Invalid;
             }
             state.stack.spilled[i] = None;
+            state.stack.dynptr[i] = None;
         }
     }
 }

@@ -423,7 +423,8 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
         | (RegState::PtrToMapValue { .. }, _)
         | (RegState::PtrToMapValueOrNull { .. }, _)
         | (RegState::PtrToMem { .. }, _)
-        | (RegState::PtrToMemOrNull { .. }, _) => false,
+        | (RegState::PtrToMemOrNull { .. }, _)
+        | (RegState::PtrToBtfId { .. }, _) => false,
     }
 }
 
@@ -449,7 +450,7 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
             .all(|(slot, value)| match value {
                 None => abstract_state.stack.bytes[slot * 8..slot * 8 + 8]
                     .iter()
-                    .all(|b| matches!(b, StackByte::Invalid | StackByte::Misc)),
+                    .all(|b| matches!(b, StackByte::Invalid | StackByte::Misc | StackByte::Dynptr)),
                 Some(value) => {
                     let bytes = &abstract_state.stack.bytes[slot * 8..slot * 8 + 8];
                     bytes.iter().enumerate().all(|(j, b)| match b {
@@ -468,6 +469,8 @@ pub(crate) fn state_covers(abstract_state: &VerifierState, concrete: &ConcreteSt
                         // the concrete merge; they are never read (the
                         // abstract rejects every access touching them)
                         StackByte::Invalid => (value.bits() >> ((7 - j) * 8)) & 0xff == 0,
+                        // dynptr slots are never concretely covered
+                        StackByte::Dynptr => false,
                     })
                 }
             })
@@ -1516,6 +1519,8 @@ fn check_concrete_helper_args(
                 | (ArgType::Scalar, ConcreteValue::Scalar(_))
                 | (ArgType::PtrToMap, ConcreteValue::MapPtr(_))
                 | (ArgType::PtrToMem, ConcreteValue::MemPtr(_))
+                | (ArgType::PtrToDynptr, ConcreteValue::StackPtr(_))
+                | (ArgType::PtrToMapValue, ConcreteValue::MapPtr(_))
         );
         if !ok {
             return Err(ConcreteFailure::HelperArgMismatch { pc, arg: reg });

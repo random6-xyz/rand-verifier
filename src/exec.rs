@@ -83,12 +83,15 @@ pub(crate) fn step(
         }
         // BPF-to-BPF call: save the current frame and enter the
         // subprogram with R1..R5 as arguments (#100)
-        BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
+        BpfInsn::CallSub { .. } => {
             let mut next = *state;
             next.call_subprog(pc + 1)
                 .map_err(|msg| VerificationFailure::new(pc, msg.to_string()))?;
             Ok(next)
         }
+        // kfunc calls (BPF_PSEUDO_KFUNC_CALL, #101): resolved through
+        // the kfunc table with argument validation
+        BpfInsn::CallKfunc { btf_id } => kfunc_call(pc, *btf_id, state),
         // terminal and control flow are expanded by successors();
         // reaching them here is a driver bug
         BpfInsn::Exit
@@ -268,6 +271,18 @@ pub(crate) fn step(
                 next.refs[next.refs_cnt as usize] = id;
                 next.refs_cnt += 1;
                 next.regs[0] = RegState::PtrToMemOrNull { id };
+            } else if matches!(*imm, 197 | 201 | 202 | 203) {
+                // dynptr helpers: validate the dynptr slots, apply the
+                // side effects (buffer init / dynptr creation / slice
+                // return), then fall through to the generic clobber
+                // (kernel check_helper_call + the dynptr arg checks,
+                // #101)
+                dynptr_helper_call(pc, *imm, state, &mut next)?;
+                // bpf_dynptr_data's return carries the dynptr's id —
+                // the helper already set it
+                if *imm != 203 {
+                    next.regs[0] = helper.return_type;
+                }
             } else if helper_releases_ref(*imm) {
                 // release helpers: R1 must hold a live reference; the
                 // reference state is dropped and every register and
@@ -482,6 +497,10 @@ fn alu_imm(
                 ),
             ))
         }
+        RegState::PtrToBtfId { .. } => Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on BTF object pointer r{} is not allowed", dst),
+        )),
         RegState::Uninit => unreachable!("read_reg rejects uninitialized registers"),
     }
 }
@@ -683,6 +702,301 @@ fn mem_access_check(
     Ok(())
 }
 
+/// The dynptr slot pair of a stack pointer argument: an exact,
+/// 16-byte-aligned stack offset whose covered bytes are all
+/// STACK_DYNPTR (kernel check_func_arg for ARG_PTR_TO_DYNPTR, #101).
+fn dynptr_slot_of(
+    pc: u32,
+    state: &VerifierState,
+    reg: u8,
+    argno: usize,
+) -> Result<(usize, crate::state::DynptrState), VerificationFailure> {
+    let RegState::PtrToStack {
+        min_offset,
+        max_offset,
+        align_off,
+    } = state.regs[reg as usize]
+    else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "Expected an initialized dynptr as arg #{} (r{} is not a stack pointer)",
+                argno + 1,
+                reg
+            ),
+        ));
+    };
+    if min_offset != max_offset || align_off != 0 || min_offset.rem_euclid(16) != 0 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "Expected an initialized dynptr as arg #{} (r{} must be an exact 16-byte-aligned stack offset)",
+                argno + 1,
+                reg
+            ),
+        ));
+    }
+    // the dynptr occupies the 16 bytes [min_offset, min_offset + 16);
+    // the kernel anchors the metadata at the slot of the lowest
+    // address (spi = (-off - 1) / 8), the pair being [spi - 1, spi]
+    let spi = (-min_offset - 1) as usize / 8;
+    let lo_slot = spi - 1;
+    for slot in lo_slot..=spi {
+        if state.stack.bytes[slot * 8..slot * 8 + 8]
+            .iter()
+            .any(|b| *b != StackByte::Dynptr)
+        {
+            return Err(VerificationFailure::new(
+                pc,
+                format!("Expected an initialized dynptr as arg #{}", argno + 1),
+            ));
+        }
+    }
+    let Some(ds) = state.stack.dynptr[spi] else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("Expected an initialized dynptr as arg #{}", argno + 1),
+        ));
+    };
+    Ok((spi, ds))
+}
+
+/// The dynptr helper family (197/201/202/203, #101): validates the
+/// dynptr arguments, applies the side effects (a fresh dynptr slot
+/// from bpf_dynptr_from_mem, an initialized buffer for the reads, the
+/// slice return of bpf_dynptr_data) on `next`.
+fn dynptr_helper_call(
+    pc: u32,
+    imm: i32,
+    state: &VerifierState,
+    next: &mut VerifierState,
+) -> Result<(), VerificationFailure> {
+    // the argument registers were validated against the prototype by
+    // the caller; here only the dynptr-specific state checks run
+    match imm {
+        // from_mem(data, size, flags, ptr): the dynptr at arg4's stack
+        // slot is initialized with the data's size
+        197 => {
+            let size = match state.regs[2] {
+                RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as u32,
+                _ => {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        "dynptr_from_mem: the size must be a known non-negative constant",
+                    ));
+                }
+            };
+            let RegState::PtrToStack {
+                min_offset,
+                max_offset,
+                ..
+            } = state.regs[4]
+            else {
+                unreachable!("the prototype validated arg4")
+            };
+            if min_offset != max_offset || min_offset.rem_euclid(16) != 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "dynptr_from_mem: arg #4 must be an exact 16-byte-aligned stack offset",
+                ));
+            }
+            let spi = (-min_offset - 1) as usize / 8;
+            let lo_slot = spi - 1;
+            for slot in lo_slot..=spi {
+                for b in next.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+                    *b = StackByte::Dynptr;
+                }
+            }
+            next.stack.dynptr[spi] = Some(crate::state::DynptrState { size, id: pc + 1 });
+        }
+        // read(dst, len, src, offset, flags): the src must be a live
+        // dynptr and the access must stay in bounds; the dst buffer is
+        // initialized by the helper
+        201 => {
+            // read(dst, len, src, offset, flags): the kernel does not
+            // statically bound the offset/len (the helper returns
+            // -EINVAL at runtime); the dst buffer becomes initialized
+            let _ = dynptr_slot_of(pc, state, 3, 3)?;
+            if let RegState::PtrToStack {
+                min_offset,
+                max_offset,
+                ..
+            } = state.regs[1]
+            {
+                init_stack_buffer(next, min_offset, max_offset);
+            }
+        }
+        // write(dst, offset, src, len, flags): the dst dynptr must be
+        // live; the src buffer must be readable (validated by the
+        // prototype's PtrToStack + the buffer check below)
+        202 => {
+            let _ = dynptr_slot_of(pc, state, 1, 1)?;
+            if let RegState::PtrToStack {
+                min_offset,
+                max_offset,
+                ..
+            } = state.regs[3]
+            {
+                check_stack_range_initialized(pc, next, min_offset, max_offset)?;
+            }
+        }
+        // data(ptr, offset, len): a nullable slice of the dynptr; the
+        // return type carries the dynptr's id (the slice is
+        // invalidated when the dynptr dies, kernel parent_id)
+        203 => {
+            let (_, ds) = dynptr_slot_of(pc, state, 1, 1)?;
+            next.regs[0] = RegState::PtrToMemOrNull { id: ds.id };
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Mark the buffer bytes of an exact stack pointer as initialized
+/// (kernel check_stack_range_initialized with the clobber semantics).
+fn init_stack_buffer(next: &mut VerifierState, min_offset: i32, _max_offset: i32) {
+    // the exact 8-byte buffer [min_offset, min_offset + 8): the frame
+    // bytes [b(min_offset + 7), b(min_offset)]
+    let lo = stack_byte_index(min_offset as i64 + 7);
+    let hi = stack_byte_index(min_offset as i64);
+    for i in lo..=hi {
+        next.stack.bytes[i] = StackByte::Misc;
+    }
+}
+
+/// The covered bytes of `[min_offset, max_offset)` must be readable
+/// (MISC/ZERO/scalar spills; kernel check_stack_range_initialized).
+fn check_stack_range_initialized(
+    pc: u32,
+    state: &VerifierState,
+    min_offset: i32,
+    max_offset: i32,
+) -> Result<(), VerificationFailure> {
+    let lo = stack_byte_index(max_offset as i64 - 1);
+    let hi = stack_byte_index(min_offset as i64);
+    for i in lo..=hi {
+        match state.stack.bytes[i] {
+            StackByte::Misc | StackByte::Zero => {}
+            StackByte::Spill => {
+                if !matches!(state.stack.spilled[i / 8], Some(RegState::Scalar(_))) {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!("invalid read from stack at offset {}", min_offset),
+                    ));
+                }
+            }
+            StackByte::Invalid | StackByte::Dynptr => {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "invalid read from stack: uninitialized bytes at offset {}",
+                        min_offset
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A kfunc call (kernel check_kfunc_call, #101): the btf_id is
+/// resolved through the kfunc table (the vmlinux BTF function ids of
+/// the reference kernel); unknown ids are rejected like the kernel's
+/// BTF-less loads. The arguments are validated against the kfunc's
+/// prototype; acquire kfuncs push a fresh reference, release kfuncs
+/// drop it and invalidate the aliases.
+fn kfunc_call(
+    pc: u32,
+    btf_id: i32,
+    state: &VerifierState,
+) -> Result<VerifierState, VerificationFailure> {
+    let Some(proto) = crate::helper::kfunc_prototype(btf_id) else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("unknown kfunc (no BTF): btf_id {}", btf_id),
+        ));
+    };
+    crate::helper::check_call_args(pc, proto.args, state)?;
+    let mut next = *state;
+    if proto.acquires_ref {
+        if next.refs_cnt as usize >= crate::state::MAX_REFS {
+            return Err(VerificationFailure::new(
+                pc,
+                format!("too many references held (max {})", crate::state::MAX_REFS),
+            ));
+        }
+        let id = next.refs_cnt as u32 + 1;
+        next.refs[next.refs_cnt as usize] = id;
+        next.refs_cnt += 1;
+        // the return's btf id comes from the argument (the kernel
+        // propagates the object's type)
+        let btf = match state.regs[1] {
+            RegState::PtrToBtfId { btf_id: b, .. } => b,
+            _ => 0,
+        };
+        next.regs[0] = RegState::PtrToBtfId {
+            btf_id: btf,
+            ref_obj_id: id,
+        };
+    } else if proto.releases_ref {
+        // the release kfunc: the arg's reference is dropped and every
+        // alias invalidated (kernel release_reference)
+        let id = match state.regs[1] {
+            RegState::PtrToBtfId { ref_obj_id, .. } if ref_obj_id != 0 => ref_obj_id,
+            _ => {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "release of unacquired reference (arg#0 expected a referenced BTF object)",
+                ));
+            }
+        };
+        let mut found = false;
+        for i in 0..next.refs_cnt as usize {
+            if next.refs[i] == id {
+                next.refs[i] = next.refs[next.refs_cnt as usize - 1];
+                next.refs_cnt -= 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(VerificationFailure::new(
+                pc,
+                format!("release of unacquired reference {}", id),
+            ));
+        }
+        for reg in next.regs.iter_mut() {
+            if let RegState::PtrToBtfId {
+                ref_obj_id: rid, ..
+            } = reg
+                && *rid == id
+            {
+                *reg = RegState::Scalar(ScalarBounds::unknown());
+            }
+        }
+        for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
+            if let Some(RegState::PtrToBtfId {
+                ref_obj_id: rid, ..
+            }) = spilled
+                && *rid == id
+                && next.stack.bytes[slot * 8..slot * 8 + 8]
+                    .iter()
+                    .all(|x| *x == StackByte::Spill)
+            {
+                *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
+            }
+        }
+        next.regs[0] = proto.return_type;
+    } else {
+        next.regs[0] = proto.return_type;
+    }
+    // the argument registers are scratch — invalidated by the call
+    for reg in 1..=5 {
+        next.regs[reg] = RegState::Uninit;
+    }
+    Ok(next)
+}
+
 fn non_stack_base_error(pc: u32, reg: u8, kind: &str) -> VerificationFailure {
     VerificationFailure::new(
         pc,
@@ -840,7 +1154,7 @@ fn check_map_buffer(
     let hi = stack_byte_index(off);
     for i in lo..=hi {
         match state.stack.bytes[i] {
-            StackByte::Invalid => {
+            StackByte::Invalid | StackByte::Dynptr => {
                 return Err(VerificationFailure::new(
                     pc,
                     format!(
@@ -1006,7 +1320,7 @@ fn stack_read(
                 let mut unknown = false;
                 for i in lo..=hi {
                     match state.stack.bytes[i] {
-                        StackByte::Invalid => {
+                        StackByte::Invalid | StackByte::Dynptr => {
                             return Err(VerificationFailure::new(
                                 pc,
                                 format!(
@@ -1127,7 +1441,7 @@ fn fixed_stack_read(
             StackByte::Spill => spill_cnt += 1,
             StackByte::Zero => zero_cnt += 1,
             StackByte::Misc => {}
-            StackByte::Invalid => {
+            StackByte::Invalid | StackByte::Dynptr => {
                 invalid = Some(());
                 break;
             }
@@ -6549,5 +6863,138 @@ mod ref_tracking_tests {
         // r1..r5 are clobbered by the call — a second submit has no
         // referenced pointer in r1
         assert!(matches!(after.regs[1], RegState::Uninit));
+    }
+}
+
+#[cfg(test)]
+mod dynptr_kfunc_tests {
+    use super::*;
+    use crate::insn::BpfInsn;
+    use crate::state::{DynptrState, RegState, ScalarBounds, StackByte, VerifierState};
+
+    fn ptr_stack(off: i32) -> RegState {
+        RegState::PtrToStack {
+            min_offset: off,
+            max_offset: off,
+            align_off: off.rem_euclid(8) as u8,
+        }
+    }
+
+    fn dynptr_setup() -> VerifierState {
+        // [r10-32] = the dynptr slot via dynptr_from_mem
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[4] = ptr_stack(-32);
+        step(0, &state, &BpfInsn::Call { imm: 197 }).unwrap()
+    }
+
+    #[test]
+    fn from_mem_initializes_dynptr_slot() {
+        let next = dynptr_setup();
+        // the 16 bytes at r10-32 are DYNPTR, the metadata recorded
+        // (the frame bytes 16..=31; the kernel anchors the metadata at
+        // the slot of the lowest address, spi = 3)
+        assert!(
+            next.stack.bytes[16..32]
+                .iter()
+                .all(|b| *b == StackByte::Dynptr)
+        );
+        assert_eq!(next.stack.dynptr[3], Some(DynptrState { size: 8, id: 1 }));
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::constant(0)));
+    }
+
+    #[test]
+    fn read_uninitialized_dynptr_rejected() {
+        let state = VerifierState::initial();
+        let mut s = state;
+        s.regs[1] = ptr_stack(-56);
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(4));
+        s.regs[3] = ptr_stack(-32);
+        s.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[5] = RegState::Scalar(ScalarBounds::constant(0));
+        let err = step(0, &s, &BpfInsn::Call { imm: 201 }).unwrap_err();
+        assert!(
+            err.message.contains("Expected an initialized dynptr"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn read_initializes_dst_buffer() {
+        let state = dynptr_setup();
+        let mut s = state;
+        s.regs[1] = ptr_stack(-56);
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(4));
+        s.regs[3] = ptr_stack(-32);
+        s.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[5] = RegState::Scalar(ScalarBounds::constant(0));
+        let next = step(0, &s, &BpfInsn::Call { imm: 201 }).unwrap();
+        // the dst buffer at r10-56 is now initialized (the frame bytes
+        // 55..=48 — the access [r10-56, r10-48))
+        assert!(
+            next.stack.bytes[48..56]
+                .iter()
+                .all(|b| *b == StackByte::Misc)
+        );
+    }
+
+    #[test]
+    fn data_slice_is_nullable_mem() {
+        let state = dynptr_setup();
+        let mut s = state;
+        s.regs[1] = ptr_stack(-32);
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[3] = RegState::Scalar(ScalarBounds::constant(4));
+        let next = step(0, &s, &BpfInsn::Call { imm: 203 }).unwrap();
+        // the slice carries the dynptr's id
+        assert!(matches!(next.regs[0], RegState::PtrToMemOrNull { id: 1 }));
+    }
+
+    #[test]
+    fn kfunc_unknown_id_rejected() {
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::CallKfunc { btf_id: 12345 }).unwrap_err();
+        assert!(err.message.contains("unknown kfunc"), "{}", err.message);
+    }
+
+    #[test]
+    fn kfunc_obj_drop_bad_arg_rejected() {
+        let state = VerifierState::initial();
+        let err = step(0, &state, &BpfInsn::CallKfunc { btf_id: 94599 }).unwrap_err();
+        assert!(err.message.contains("arg 1"), "{}", err.message);
+    }
+
+    #[test]
+    fn kfunc_acquire_and_release() {
+        // bpf_refcount_acquire(obj) acquires a reference; bpf_obj_drop
+        // releases it
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToBtfId {
+            btf_id: 100,
+            ref_obj_id: 0,
+        };
+        let acquired = step(0, &state, &BpfInsn::CallKfunc { btf_id: 94881 }).unwrap();
+        assert_eq!(acquired.refs_cnt, 1);
+        let id = match acquired.regs[0] {
+            RegState::PtrToBtfId { ref_obj_id, .. } => ref_obj_id,
+            ref other => panic!("expected PtrToBtfId, got {:?}", other),
+        };
+        assert_eq!(id, 1);
+        // the release with the referenced object
+        let mut s = acquired;
+        s.regs[1] = s.regs[0];
+        let released = step(0, &s, &BpfInsn::CallKfunc { btf_id: 94599 }).unwrap();
+        assert_eq!(released.refs_cnt, 0);
+        // the exit with the unreleased ref is rejected by the mini's
+        // exit path (covered by the ringbuf tests)
     }
 }

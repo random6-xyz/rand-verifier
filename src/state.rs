@@ -292,6 +292,23 @@ pub(crate) enum RegState {
     PtrToMemOrNull {
         id: u32,
     },
+    /// A BTF-typed kernel object pointer (kernel PTR_TO_BTF_ID, #101):
+    /// the kfunc family (bpf_obj_drop / bpf_kptr_xchg /
+    /// bpf_refcount_acquire). `ref_obj_id` links to the reference
+    /// state for the acquire/release kfuncs.
+    PtrToBtfId {
+        btf_id: u32,
+        ref_obj_id: u32,
+    },
+}
+
+/// Metadata of a stack dynptr (kernel `struct bpf_dynptr_kern` view of
+/// the verifier, #101): the buffer size and the identity used to link
+/// data slices (`parent_id`) for invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DynptrState {
+    pub(crate) size: u32,
+    pub(crate) id: u32,
 }
 
 /// Maximum simultaneously held references (kernel: bounded by the
@@ -353,6 +370,9 @@ impl std::fmt::Display for RegState {
                 min_offset, max_offset, id
             ),
             RegState::PtrToMemOrNull { id } => write!(f, "PTR_TO_MEM_OR_NULL(ref:{})", id),
+            RegState::PtrToBtfId { btf_id, ref_obj_id } => {
+                write!(f, "PTR_TO_BTF_ID(btf:{}, ref:{})", btf_id, ref_obj_id)
+            }
         }
     }
 }
@@ -396,6 +416,9 @@ pub(crate) enum StackByte {
     /// Part of a full 8-byte register spill (the register lives in
     /// `StackState::spilled`).
     Spill,
+    /// Part of a 16-byte dynptr slot (kernel STACK_DYNPTR, #101): the
+    /// slot pair's metadata lives in `VerifierState::dynptr`.
+    Dynptr,
 }
 
 impl std::fmt::Display for StackByte {
@@ -405,6 +428,7 @@ impl std::fmt::Display for StackByte {
             StackByte::Misc => write!(f, "MISC"),
             StackByte::Zero => write!(f, "ZERO"),
             StackByte::Spill => write!(f, "SPILL"),
+            StackByte::Dynptr => write!(f, "DYNPTR"),
         }
     }
 }
@@ -417,6 +441,9 @@ impl std::fmt::Display for StackByte {
 pub(crate) struct StackState {
     pub(crate) bytes: [StackByte; STACK_SIZE],
     pub(crate) spilled: [Option<RegState>; STACK_SLOTS],
+    /// Dynptr metadata per slot pair (kernel STACK_DYNPTR, #101),
+    /// anchored at the lower-address slot.
+    pub(crate) dynptr: [Option<DynptrState>; STACK_SLOTS],
 }
 
 impl StackState {
@@ -425,6 +452,7 @@ impl StackState {
         Self {
             bytes: [StackByte::Invalid; STACK_SIZE],
             spilled: [None; STACK_SLOTS],
+            dynptr: [None; STACK_SLOTS],
         }
     }
 }
@@ -609,7 +637,8 @@ pub(crate) fn read_scalar(
         | RegState::PtrToMapValue { .. }
         | RegState::PtrToMapValueOrNull { .. }
         | RegState::PtrToMem { .. }
-        | RegState::PtrToMemOrNull { .. } => Err(VerificationFailure::new(
+        | RegState::PtrToMemOrNull { .. }
+        | RegState::PtrToBtfId { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",

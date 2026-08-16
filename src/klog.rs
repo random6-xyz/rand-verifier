@@ -51,7 +51,11 @@ pub enum ReasonCategory {
 /// first.
 pub fn categorize_reason(message: &str) -> ReasonCategory {
     let msg = message.trim();
-    if msg.contains("Unreleased reference") || msg.contains("release of unacquired reference") {
+    if msg.contains("Unreleased reference")
+        || msg.contains("release of unacquired reference")
+        || msg.contains("dynptr")
+        || msg.contains("kfunc")
+    {
         ReasonCategory::Ref
     } else if msg.contains("misaligned") {
         ReasonCategory::StackAlign
