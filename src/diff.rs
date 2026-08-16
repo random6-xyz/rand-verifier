@@ -70,6 +70,15 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // mini's loop budget is its complexity mechanism — the kernel
         // rejects non-converging loops with "BPF program is too large"
         ReasonCategory::Complexity
+    } else if msg.contains("kfunc") {
+        // "unknown kfunc", "calling kernel function ... is not
+        // allowed" (kernel check_kfunc_call, #101)
+        ReasonCategory::Ref
+    } else if msg.contains("dynptr") {
+        // "Expected an initialized dynptr as arg #N", "dynptr read out
+        // of bounds" (kernel check_func_arg for ARG_PTR_TO_DYNPTR,
+        // #101)
+        ReasonCategory::Ref
     } else if msg.contains("reference") || msg.contains("Unreleased") {
         // "Unreleased reference id=N", "release of unacquired
         // reference" (kernel check_reference_leak, #101)
