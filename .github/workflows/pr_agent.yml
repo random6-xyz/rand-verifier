@@ -1,0 +1,67 @@
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+
+jobs:
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'COLLABORATOR' || github.event.comment.author_association == 'MEMBER'))) }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+    name: Run pr agent on every pull request, respond to user comments
+    steps:
+      - name: PR Agent action step
+        id: pragent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          config.model: "openai/deepseek-v4-flash"
+          config.fallback_models: '["openai/mimo-v2.5"]'
+          OPENAI.API_BASE: "https://opencode.ai/zen/go/v1"
+          OPENAI.KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          config.custom_model_max_tokens: "128000"
+          config.ai_timeout: "600"
+          config.reasoning_effort: "medium"
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "false"
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review", "synchronize"]'
+
+          pr_reviewer.extra_instructions: >-
+            This repo is rand-verifier: a differential-testing and bug-discovery
+            framework for the Linux eBPF verifier, written in Rust. The same eBPF
+            program runs through three oracles — an abstract-interpretation verifier
+            (mini), a concrete interpreter (the truth axis), and the real kernel
+            verifier via the raw bpf() syscall — and every verdict disagreement is
+            classified as a precision or soundness candidate. Review for correctness
+            of verifier semantics, not style. (1) Mini verifier parity with the
+            kernel: scalar ranges/tnum, ALU32/64, byte-level stack state
+            (spill/fill, STACK_ZERO/MISC/SPILL/DYNPTR), pointer bounds, helper and
+            kfunc argument validation, BPF-to-BPF call frames, state pruning
+            (regsafe/stacksafe/states_equal, liveness masks), precision
+            backtracking, register id/ref tracking. Any claimed kernel-parity
+            behavior must match kernel/bpf/verifier.c (and states.c, tnum.c)
+            semantics — flag every divergence, since a model gap is a false
+            accept/reject risk. (2) The concrete interpreter must stay sound: the
+            abstract state must cover every concrete reachable state. (3)
+            Differential classification: verdict-matrix logic, precision vs
+            soundness candidate labels, and whitelist entries must be correct — a
+            wrong whitelist entry can hide a real kernel bug. (4) Fuzzer/reducer
+            determinism: fixed-seed reproducibility, finding replay, classification
+            invariants. (5) Test and CI discipline: verifier-rule changes need
+            corpus fixtures in tests/programs/ (accept/ and reject/), the test
+            suite must stay green, and any verdict/state-count change needs a
+            drift-baseline assessment (tools/drift-baseline/, .github/workflows/ci.yml).
+            Explain the WHY behind each issue — which verifier rule or kernel
+            behavior is at stake — not just WHAT to change. Keep suggestions
+            proportionate to a research tool that hunts real kernel bugs; do not
+            demand production-grade hardening. Keep the review concise and
+            structured with markdown. Write all comments in English.
+
