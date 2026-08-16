@@ -799,6 +799,21 @@ fn dynptr_slot_of(
         ));
     }
     // the dynptr occupies the 16 bytes [min_offset, min_offset + 16);
+    // the offset must fit inside the frame: a pathologically negative
+    // offset (e.g. r10 - 4096 from a fuzzed program) would otherwise
+    // underflow the slot arithmetic and panic on the stack slice below
+    // (the kernel rejects it as an out-of-frame stack access).
+    if min_offset < -(crate::state::STACK_SIZE as i32) || min_offset > -16 {
+        return Err(VerificationFailure::new(
+            pc,
+            format!(
+                "Expected an initialized dynptr as arg #{} (r{} stack offset {} is out of frame)",
+                argno + 1,
+                reg,
+                min_offset
+            ),
+        ));
+    }
     // the kernel anchors the metadata at the slot of the lowest
     // address (spi = (-off - 1) / 8), the pair being [spi - 1, spi]
     let spi = (-min_offset - 1) as usize / 8;
