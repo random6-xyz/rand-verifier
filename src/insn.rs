@@ -294,6 +294,9 @@ pub enum BpfInsn {
         fd: u32,
         key_size: u32,
         value_size: u32,
+        /// The kernel map type (0 = ARRAY, 1 = RINGBUF), filled at
+        /// load time from the fd (#101).
+        map_type: u8,
     },
     /// `BPF_PSEUDO_MAP_VALUE`: second-slot imm is the offset into the
     /// value; sizes filled at load time.
@@ -886,6 +889,7 @@ pub fn parse_ldimm64(first: &[u8], second: &[u8]) -> Result<BpfInsn, DecodeError
                 fd: imm_lo,
                 key_size: 0,
                 value_size: 0,
+                map_type: 0,
             })
         }
         opcode::PSEUDO_MAP_VALUE => Ok(BpfInsn::LdMapValue {

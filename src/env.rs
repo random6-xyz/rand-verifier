@@ -179,11 +179,16 @@ impl BpfVerifierEnv {
                         fd,
                         key_size,
                         value_size,
+                        map_type,
                         ..
                     } => match self.maps.get(fd) {
                         Some(info) => {
                             *key_size = info.key_size;
                             *value_size = info.value_size;
+                            *map_type = match info.map_type {
+                                MapType::Array => 0,
+                                MapType::Ringbuf => 1,
+                            };
                         }
                         None => {
                             decode_error = Some(VerificationFailure::new(
