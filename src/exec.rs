@@ -270,7 +270,7 @@ pub(crate) fn step(
                 let id = next.refs_cnt as u32 + 1;
                 next.refs[next.refs_cnt as usize] = id;
                 next.refs_cnt += 1;
-                next.regs[0] = RegState::PtrToMemOrNull { id };
+                next.regs[0] = RegState::PtrToMemOrNull { id, parent_id: 0 };
             } else if matches!(*imm, 197 | 201 | 202 | 203) {
                 // dynptr helpers: validate the dynptr slots, apply the
                 // side effects (buffer init / dynptr creation / slice
@@ -313,20 +313,31 @@ pub(crate) fn step(
                         format!("release of unacquired reference {}", id),
                     ));
                 }
-                // cascade: every register and spill sharing the id is
-                // invalidated (kernel mark_reg_invalid)
+                // cascade: every register and spill sharing the id (or
+                // derived from it via parent_id — the kernel's
+                // release_reference idstack walk, #99) is invalidated
                 for reg in next.regs.iter_mut() {
                     if matches!(
                         reg,
-                        RegState::PtrToMem { id: rid, .. } | RegState::PtrToMemOrNull { id: rid }
-                            if *rid == id
+                        RegState::PtrToMem {
+                            id: rid,
+                            parent_id: pid,
+                            ..
+                        } | RegState::PtrToMemOrNull {
+                            id: rid,
+                            parent_id: pid,
+                        } if *rid == id || *pid == id
                     ) {
                         *reg = RegState::Scalar(ScalarBounds::unknown());
                     }
                 }
                 for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
-                    if let Some(RegState::PtrToMem { id: rid, .. }) = spilled
-                        && *rid == id
+                    if let Some(RegState::PtrToMem {
+                        id: rid,
+                        parent_id: pid,
+                        ..
+                    }) = spilled
+                        && (*rid == id || *pid == id)
                         && next.stack.bytes[slot * 8..slot * 8 + 8]
                             .iter()
                             .all(|x| *x == StackByte::Spill)
@@ -845,7 +856,12 @@ fn dynptr_helper_call(
         // invalidated when the dynptr dies, kernel parent_id)
         203 => {
             let (_, ds) = dynptr_slot_of(pc, state, 1, 1)?;
-            next.regs[0] = RegState::PtrToMemOrNull { id: ds.id };
+            // the kernel: the slice gets the dynptr's id as parent_id
+            // (the slice dies with the dynptr, #99)
+            next.regs[0] = RegState::PtrToMemOrNull {
+                id: ds.id,
+                parent_id: ds.id,
+            };
         }
         _ => unreachable!(),
     }
@@ -1516,6 +1532,36 @@ fn stack_write(
             }
             let (lo, hi) = stack_byte_range(min_off, max_off);
             let mut next = *state;
+            // a write covering a dynptr slot destroys the dynptr and
+            // invalidates every slice derived from it (kernel
+            // destroy_if_dynptr_stack_slot + the parent_id cascade,
+            // #99)
+            let mut destroyed = None;
+            for slot in lo / 8..=hi / 8 {
+                if next.stack.bytes[slot * 8] == StackByte::Dynptr {
+                    // the metadata is anchored at the lowest-address
+                    // slot of the pair
+                    if let Some(ds) = next.stack.dynptr[slot] {
+                        destroyed = Some(ds.id);
+                    }
+                    for b in next.stack.bytes[slot * 8..slot * 8 + 8].iter_mut() {
+                        *b = StackByte::Invalid;
+                    }
+                    next.stack.dynptr[slot] = None;
+                }
+            }
+            if let Some(did) = destroyed {
+                for reg in next.regs.iter_mut() {
+                    if let RegState::PtrToMemOrNull {
+                        id: rid,
+                        parent_id: pid,
+                    } = reg
+                        && (*rid == did || *pid == did)
+                    {
+                        *reg = RegState::Scalar(ScalarBounds::unknown());
+                    }
+                }
+            }
             let fixed = min_offset == max_offset;
             // the stored value is read after the access checks (kernel
             // check_stack_write_fixed_off); the corrupt-spill check for
@@ -3162,8 +3208,8 @@ fn cond_branch_impl(
         // mark_ptr_or_null_regs: "No one could have freed the
         // reference state before doing the NULL check"), the valid
         // side refines every alias into a referenced PTR_TO_MEM.
-        (RegState::PtrToMemOrNull { id }, RegState::Scalar(s))
-        | (RegState::Scalar(s), RegState::PtrToMemOrNull { id })
+        (RegState::PtrToMemOrNull { id, .. }, RegState::Scalar(s))
+        | (RegState::Scalar(s), RegState::PtrToMemOrNull { id, .. })
             if s.is_zero() =>
         {
             match op {
@@ -3192,7 +3238,7 @@ fn cond_branch_impl(
                     for reg in null_state.regs.iter_mut() {
                         if matches!(
                             reg,
-                            RegState::PtrToMem { id: rid, .. } | RegState::PtrToMemOrNull { id: rid }
+                            RegState::PtrToMem { id: rid, .. } | RegState::PtrToMemOrNull { id: rid, parent_id: 0 }
                                 if *rid == id
                         ) {
                             *reg = RegState::Scalar(ScalarBounds::constant(0));
@@ -3201,7 +3247,10 @@ fn cond_branch_impl(
                     for (slot, spilled) in null_state.stack.spilled.iter_mut().enumerate() {
                         if let Some(
                             RegState::PtrToMem { id: rid, .. }
-                            | RegState::PtrToMemOrNull { id: rid },
+                            | RegState::PtrToMemOrNull {
+                                id: rid,
+                                parent_id: 0,
+                            },
                         ) = spilled
                             && *rid == id
                             && null_state.stack.bytes[slot * 8..slot * 8 + 8]
@@ -3214,7 +3263,7 @@ fn cond_branch_impl(
                     // the valid side: every alias becomes a non-null
                     // referenced buffer (the ref survives)
                     for reg in valid.regs.iter_mut() {
-                        if let RegState::PtrToMemOrNull { id: rid } = reg
+                        if let RegState::PtrToMemOrNull { id: rid, parent_id } = reg
                             && *rid == id
                         {
                             *reg = RegState::PtrToMem {
@@ -3222,11 +3271,12 @@ fn cond_branch_impl(
                                 max_offset: 0,
                                 align_off: 0,
                                 id,
+                                parent_id: *parent_id,
                             };
                         }
                     }
                     for (slot, spilled) in valid.stack.spilled.iter_mut().enumerate() {
-                        if let Some(RegState::PtrToMemOrNull { id: rid }) = spilled
+                        if let Some(RegState::PtrToMemOrNull { id: rid, parent_id }) = spilled
                             && *rid == id
                             && valid.stack.bytes[slot * 8..slot * 8 + 8]
                                 .iter()
@@ -3237,6 +3287,7 @@ fn cond_branch_impl(
                                 max_offset: 0,
                                 align_off: 0,
                                 id,
+                                parent_id: *parent_id,
                             });
                         }
                     }
@@ -3246,6 +3297,7 @@ fn cond_branch_impl(
                         max_offset: 0,
                         align_off: 0,
                         id,
+                        parent_id: 0,
                     };
                     vec![(null_side, null_state), (valid_side, valid)]
                 }
@@ -6738,7 +6790,7 @@ mod ref_tracking_tests {
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
         let next = step(0, &state, &BpfInsn::Call { imm: 131 }).unwrap();
         let id = match next.regs[0] {
-            RegState::PtrToMemOrNull { id } => id,
+            RegState::PtrToMemOrNull { id, .. } => id,
             ref other => panic!("expected PtrToMemOrNull, got {:?}", other),
         };
         assert_eq!(next.refs_cnt, 1);
@@ -6750,7 +6802,13 @@ mod ref_tracking_tests {
     fn reserve_acquires_reference() {
         let (state, id) = reserve_state();
         assert_eq!(id, 1);
-        assert_eq!(state.regs[0], RegState::PtrToMemOrNull { id: 1 });
+        assert_eq!(
+            state.regs[0],
+            RegState::PtrToMemOrNull {
+                id: 1,
+                parent_id: 0
+            }
+        );
     }
 
     #[test]
@@ -6830,6 +6888,7 @@ mod ref_tracking_tests {
             max_offset: 0,
             align_off: 0,
             id: 0,
+            parent_id: 0,
         };
         state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
         let err = step(0, &state, &BpfInsn::Call { imm: 132 }).unwrap_err();
@@ -6956,7 +7015,13 @@ mod dynptr_kfunc_tests {
         s.regs[3] = RegState::Scalar(ScalarBounds::constant(4));
         let next = step(0, &s, &BpfInsn::Call { imm: 203 }).unwrap();
         // the slice carries the dynptr's id
-        assert!(matches!(next.regs[0], RegState::PtrToMemOrNull { id: 1 }));
+        assert!(matches!(
+            next.regs[0],
+            RegState::PtrToMemOrNull {
+                id: 1,
+                parent_id: 1
+            }
+        ));
     }
 
     #[test]
@@ -6996,5 +7061,62 @@ mod dynptr_kfunc_tests {
         assert_eq!(released.refs_cnt, 0);
         // the exit with the unreleased ref is rejected by the mini's
         // exit path (covered by the ringbuf tests)
+    }
+}
+
+#[cfg(test)]
+mod parent_id_tests {
+    use super::*;
+    use crate::insn::BpfInsn;
+    use crate::state::{RegState, ScalarBounds, VerifierState};
+
+    #[test]
+    fn dynptr_slice_dies_with_its_dynptr() {
+        // a dynptr slice (bpf_dynptr_data) keeps the dynptr's id as
+        // parent_id; a store over the dynptr slot invalidates the
+        // slice (kernel destroy_if_dynptr_stack_slot + parent cascade,
+        // #99)
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[4] = RegState::PtrToStack {
+            min_offset: -32,
+            max_offset: -32,
+            align_off: 0,
+        };
+        state.regs[6] = state.regs[4];
+        let state = step(0, &state, &BpfInsn::Call { imm: 197 }).unwrap();
+        let mut s = state;
+        s.regs[1] = s.regs[6];
+        s.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        s.regs[3] = RegState::Scalar(ScalarBounds::constant(4));
+        let sliced = step(0, &s, &BpfInsn::Call { imm: 203 }).unwrap();
+        let slice = sliced.regs[0];
+        assert!(matches!(slice, RegState::PtrToMemOrNull { .. }));
+        // a store over the dynptr slot at r10-32
+        let mut s2 = sliced;
+        s2.regs[2] = RegState::Scalar(ScalarBounds::constant(1));
+        let after = step(
+            0,
+            &s2,
+            &BpfInsn::StMem {
+                src: 2,
+                base: 10,
+                offset: -32,
+                size: crate::insn::MemSize::W,
+            },
+        )
+        .unwrap();
+        // the slice was invalidated (it referenced the destroyed dynptr)
+        assert_eq!(after.regs[0], RegState::Scalar(ScalarBounds::unknown()));
+        // the dynptr slot is gone
+        assert_ne!(after.stack.bytes[24], crate::state::StackByte::Dynptr);
     }
 }

@@ -177,7 +177,10 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
         // id is assigned at the call site)
         131 => Some(&HelperPrototype {
             args: &[ArgType::PtrToMap, ArgType::Scalar, ArgType::Scalar],
-            return_type: RegState::PtrToMemOrNull { id: 0 },
+            return_type: RegState::PtrToMemOrNull {
+                id: 0,
+                parent_id: 0,
+            },
         }),
         // BPF_FUNC_dynptr_from_mem (197): from_mem(data, size, flags,
         // ptr) — initializes the 16-byte dynptr at the stack pointer in
@@ -222,7 +225,10 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
         // call site
         203 => Some(&HelperPrototype {
             args: &[ArgType::PtrToDynptr, ArgType::Scalar, ArgType::Scalar],
-            return_type: RegState::PtrToMemOrNull { id: 0 },
+            return_type: RegState::PtrToMemOrNull {
+                id: 0,
+                parent_id: 0,
+            },
         }),
         // BPF_FUNC_ringbuf_submit / BPF_FUNC_ringbuf_discard:
         // submit(mem, flags) — releases the reference in R1 and

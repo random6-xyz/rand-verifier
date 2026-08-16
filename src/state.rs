@@ -285,12 +285,18 @@ pub(crate) enum RegState {
         /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
         align_off: u8,
         id: u32,
+        /// The id of the parent object this pointer was derived from
+        /// (kernel `parent_id`, #99): dynptr data slices carry the
+        /// dynptr's id, so a dynptr's destruction invalidates its
+        /// slices (kernel release_reference's parent cascade).
+        parent_id: u32,
     },
     /// The nullable acquire result (kernel PTR_TO_MEM_OR_NULL): a
     /// NULL check both refines the pointer and releases the reference
     /// on the null side (kernel mark_ptr_or_null_regs).
     PtrToMemOrNull {
         id: u32,
+        parent_id: u32,
     },
     /// A BTF-typed kernel object pointer (kernel PTR_TO_BTF_ID, #101):
     /// the kfunc family (bpf_obj_drop / bpf_kptr_xchg /
@@ -363,13 +369,16 @@ impl std::fmt::Display for RegState {
                 min_offset,
                 max_offset,
                 id,
+                parent_id,
                 ..
             } => write!(
                 f,
-                "PTR_TO_MEM(off:{}..{}, ref:{})",
-                min_offset, max_offset, id
+                "PTR_TO_MEM(off:{}..{}, ref:{}, parent:{})",
+                min_offset, max_offset, id, parent_id
             ),
-            RegState::PtrToMemOrNull { id } => write!(f, "PTR_TO_MEM_OR_NULL(ref:{})", id),
+            RegState::PtrToMemOrNull { id, parent_id } => {
+                write!(f, "PTR_TO_MEM_OR_NULL(ref:{}, parent:{})", id, parent_id)
+            }
             RegState::PtrToBtfId { btf_id, ref_obj_id } => {
                 write!(f, "PTR_TO_BTF_ID(btf:{}, ref:{})", btf_id, ref_obj_id)
             }
