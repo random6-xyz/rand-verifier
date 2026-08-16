@@ -224,8 +224,7 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
     let want = pending.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while pending.iter().any(|(name, _, _)| {
-        job.join(format!("{name}.bin")).exists()
-            || !out.join(format!("{name}.out")).is_file()
+        job.join(format!("{name}.bin")).exists() || !out.join(format!("{name}.out")).is_file()
     }) {
         if std::time::Instant::now() > deadline {
             eprintln!("qemu: timeout waiting for {want} results; marking rest skipped");
@@ -655,16 +654,15 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &
             };
             let mut env = BpfVerifierEnv::new();
             env.setup_prog_bytes(&bytes)?;
-            let verdict = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                env.verify()
-            })) {
-                Ok(Ok(v)) => v,
-                // a model crash on a seed is recorded via the campaign
-                // stream itself; here the seed is skipped so the
-                // campaign can start (the mutated copies will re-trigger
-                // the path through run_program's catcher)
-                _ => continue,
-            };
+            let verdict =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
+                    Ok(Ok(v)) => v,
+                    // a model crash on a seed is recorded via the campaign
+                    // stream itself; here the seed is skipped so the
+                    // campaign can start (the mutated copies will re-trigger
+                    // the path through run_program's catcher)
+                    _ => continue,
+                };
             let verdict = match verdict {
                 Verdict::Safe => "ACCEPT",
                 Verdict::Unsafe(_) => "REJECT",
@@ -729,36 +727,35 @@ fn run_program(
     // rand-verifier side (mini + concrete)
     let mut env = BpfVerifierEnv::new();
     env.setup_prog_bytes(&bytes)?;
-    let (mini, mini_reason, mini_insn, panic_msg) = match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| env.verify()),
-    ) {
-        Ok(Ok(Verdict::Safe)) => (SideVerdict::Accept, None, None, None),
-        Ok(Ok(Verdict::Unsafe(failure))) => {
-            let category = categorize_mini_reason(&failure);
-            let insn = failure.insn_idx();
-            (
-                SideVerdict::Reject { category },
-                Some(failure.message),
-                Some(insn),
-                None,
-            )
-        }
-        Ok(Err(e)) => return Err(e),
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                .unwrap_or("<non-string panic>")
-                .to_string();
-            (
-                SideVerdict::Skipped,
-                Some(format!("mini panicked: {msg}")),
-                None,
-                Some(msg),
-            )
-        }
-    };
+    let (mini, mini_reason, mini_insn, panic_msg) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
+            Ok(Ok(Verdict::Safe)) => (SideVerdict::Accept, None, None, None),
+            Ok(Ok(Verdict::Unsafe(failure))) => {
+                let category = categorize_mini_reason(&failure);
+                let insn = failure.insn_idx();
+                (
+                    SideVerdict::Reject { category },
+                    Some(failure.message),
+                    Some(insn),
+                    None,
+                )
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>")
+                    .to_string();
+                (
+                    SideVerdict::Skipped,
+                    Some(format!("mini panicked: {msg}")),
+                    None,
+                    Some(msg),
+                )
+            }
+        };
 
     // kernel side: qemu guest agent (preferred) or host kernel
     let (kernel, kernel_message, kernel_insn) = if let Some(qemu) = qemu {
