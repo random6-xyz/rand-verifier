@@ -12,6 +12,7 @@
 //! for solver-time readability.
 
 pub mod range;
+pub mod synth;
 pub mod tnum;
 pub mod verify;
 

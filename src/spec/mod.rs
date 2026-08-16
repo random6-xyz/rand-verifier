@@ -23,4 +23,8 @@ pub(crate) mod runner;
 pub(crate) mod state;
 pub(crate) mod value;
 
+/// The interval arithmetic shared with the SMT tooling (issues
+/// #115-#117): sound wrapping-u64 interval operators.
+pub use value::{rng_add, rng_and, rng_mul, rng_or, rng_sub, rng_xor};
+
 pub use runner::{SpecFailure, SpecVerdict, verify_spec};

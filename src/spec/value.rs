@@ -94,7 +94,7 @@ impl SpecValue {
 /// The pointwise image of `[a0,a1] ⊞ [b0,b1]` under 64-bit wrapping
 /// addition, as a single interval when it is one, the full range
 /// otherwise.
-pub(crate) fn rng_add(a: Range, b: Range) -> Range {
+pub fn rng_add(a: Range, b: Range) -> Range {
     let lo = a.0 as u128 + b.0 as u128;
     let hi = a.1 as u128 + b.1 as u128;
     if lo >> 64 == hi >> 64 {
@@ -105,7 +105,7 @@ pub(crate) fn rng_add(a: Range, b: Range) -> Range {
 }
 
 /// Wrapping subtraction: `[a0,a1] ⊟ [b0,b1] = [a0-b1, a1-b0]`.
-pub(crate) fn rng_sub(a: Range, b: Range) -> Range {
+pub fn rng_sub(a: Range, b: Range) -> Range {
     let lo = a.0 as i128 - b.1 as i128;
     let hi = a.1 as i128 - b.0 as i128;
     // map the i128 span [lo, hi] into u64 wrapping; a single interval
@@ -129,18 +129,18 @@ pub(crate) fn rng_sub(a: Range, b: Range) -> Range {
 /// Bitwise AND: only the intersection of the possible 1-bits can
 /// survive, so `[0, min(a1, b1)]` is sound (and exact for the upper
 /// part).
-pub(crate) fn rng_and(a: Range, b: Range) -> Range {
+pub fn rng_and(a: Range, b: Range) -> Range {
     (0, a.1.min(b.1))
 }
 
 /// Bitwise OR: the result is at least each operand's minimum (bit
 /// setting never clears), upper bound is the full range.
-pub(crate) fn rng_or(a: Range, b: Range) -> Range {
+pub fn rng_or(a: Range, b: Range) -> Range {
     (a.0 | b.0, u64::MAX)
 }
 
 /// Bitwise XOR on intervals: only the coarse bounds are sound.
-pub(crate) fn rng_xor(_a: Range, _b: Range) -> Range {
+pub fn rng_xor(_a: Range, _b: Range) -> Range {
     (0, u64::MAX)
 }
 
@@ -185,7 +185,7 @@ pub(crate) fn rng_arsh(a: Range, k: u32) -> Range {
 
 /// Multiplication: exact for constants, the full range otherwise
 /// (sound; the corpus never multiplies non-constants).
-pub(crate) fn rng_mul(a: Range, b: Range) -> Range {
+pub fn rng_mul(a: Range, b: Range) -> Range {
     if a.0 == a.1 && b.0 == b.1 {
         let v = a.0.wrapping_mul(b.0);
         (v, v)

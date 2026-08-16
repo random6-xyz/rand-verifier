@@ -1,0 +1,5 @@
+   0: MovImm { dst: 1, imm: 14 }
+   1: MovImm { dst: 2, imm: 19 }
+   2: XorReg { dst: 1, src: 2 }
+   3: MovReg { dst: 0, src: 1 }
+   4: Exit
