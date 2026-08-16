@@ -1717,8 +1717,11 @@ fn helper_return_seeds(
 
 /// The concrete side's own verdict on a program (v0.7, #68): what the
 /// concrete interpreter actually found, independent of the abstract
-/// verdict. This is the fuzzer oracle's truth axis — `Safe`/`Unsafe`
-/// feed the classification matrix, `Inconclusive` is a non-finding.
+/// verdict. This is the fuzzer oracle's witness axis — a concrete
+/// failure is a genuine unsafe witness, a clean run is bounded evidence
+/// (one seed per value set, a budget per path), not a proof. `Safe`/
+/// `Unsafe` feed the classification matrix, `Inconclusive` is a
+/// non-finding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ConcreteVerdict {
     /// The concrete run executed the program without failures and the

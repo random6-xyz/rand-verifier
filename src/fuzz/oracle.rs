@@ -1,9 +1,14 @@
 // ── Fuzzer oracle: mini + concrete + kernel classification (v0.7, #68) ──────
 
 //! Turns one program's three verdict sources into exactly one bucket of
-//! the classification matrix (FUZZ_PLAN §3). Concrete is the truth
-//! axis; mini additionally finds rand-verifier's own bugs; the kernel
-//! side (when available) finds kernel precision/soundness candidates.
+//! the classification matrix (FUZZ_PLAN §3). Concrete is the witness
+//! axis: a concrete failure is a genuine unsafe witness, while a clean
+//! concrete run is bounded evidence — the exploration covers one seed
+//! per value set and a budget per path, so `Safe` means "no unsafe
+//! witness found", not a proof of safety (the candidate buckets are
+//! named "candidate" for this reason). Mini additionally finds
+//! rand-verifier's own bugs; the kernel side (when available) finds
+//! kernel precision/soundness candidates.
 //! The v0.6 diff whitelist is reused, never forked.
 
 use crate::concrete::{ConcreteFailure, ConcreteReport, ConcreteVerdict};
@@ -11,10 +16,13 @@ use crate::diff::{SideVerdict, whitelisted};
 use crate::env::BpfVerifierEnv;
 use crate::klog::ReasonCategory;
 
-/// The concrete side of one program — the oracle's truth axis.
+/// The concrete side of one program — the oracle's witness axis (a
+/// concrete failure is a real unsafe witness; a clean run is bounded
+/// evidence, not a proof).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcreteSide {
-    /// The concrete run executed the program safely.
+    /// The concrete run found no unsafe witness (bounded exploration —
+    /// evidence of safety, not a proof).
     Safe,
     /// The concrete run failed, or the abstract states failed to cover
     /// it (accepted programs).
@@ -36,10 +44,13 @@ pub(crate) fn concrete_side(report: &ConcreteReport) -> ConcreteSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Finding {
     /// 🎯 Kernel REJECT + concrete SAFE (non-whitelisted) — the v0.7
-    /// target: the kernel rejects a concretely safe program.
+    /// target: the kernel rejects a program the bounded concrete run
+    /// found no unsafe witness for. A candidate: `concrete SAFE` is
+    /// evidence, not a proof of safety.
     PrecisionCandidate,
     /// 🚨 Kernel ACCEPT + concrete UNSAFE — the v1.0 target: the kernel
-    /// accepts a concretely unsafe program. Saved separately.
+    /// accepts a program with a genuine unsafe witness. Saved
+    /// separately.
     SoundnessCandidate,
     /// mini REJECT + kernel ACCEPT (concrete SAFE) — rand-verifier is
     /// more conservative than the kernel (our side).
@@ -206,20 +217,23 @@ pub fn classify(input: &OracleInput) -> Finding {
                     return Finding::Whitelisted;
                 }
                 // strict mode: without CAP_PERFMON the kernel sanitizes
-                // speculative paths (bypass_spec_v1 = false) and rejects
-                // loops reachable only under speculative execution
-                // ("from N to M (speculative execution)"). The concrete
-                // run never takes those paths, so a kernel loop
-                // rejection with a mini ACCEPT is the unprivileged
-                // Spectre-v1 hardening, not a precision gap (verified
-                // on mseed-20260815-216: privileged load ACCEPTs the
-                // same program).
-                if *strict
-                    && matches!(category, ReasonCategory::Loop)
-                    && matches!(mini, SideVerdict::Accept)
-                {
-                    return Finding::Whitelisted;
-                }
+                // speculative paths (bypass_spec_v1 = false) and explores
+                // statically-decided-dead branches with sanitized
+                // registers. When such a dead branch targets a back edge,
+                // the speculative exploration re-reaches the branch insn
+                // with an EXACT-equal state, and is_state_visited()
+                // rejects the whole program with "infinite loop detected"
+                // (kernel/bpf/states.c — the check exists "to avoid
+                // unnecessary doomed work", i.e. exploration cost, not as
+                // a semantic rule). The intended hardening is the
+                // sanitized exploration of the dead branch itself;
+                // rejecting a program whose real paths all terminate
+                // (the concrete run found no unsafe witness and the
+                // privileged load accepts it) is a kernel-side false
+                // reject, so a mini ACCEPT here stays a precision
+                // candidate. A real infinite loop never reaches this
+                // branch: mini rejects it and the concrete run is
+                // inconclusive.
                 Finding::PrecisionCandidate
             }
         },
@@ -534,6 +548,41 @@ mod tests {
                 false
             ),
             Finding::Whitelisted
+        );
+    }
+
+    /// Strict mode: a kernel loop rejection with a mini ACCEPT is a
+    /// precision candidate, not whitelisted Spectre-v1 hardening — the
+    /// speculative sanitization (bypass_spec_v1 = false) explores
+    /// dead branches with sanitized registers, and a dead back edge
+    /// makes the speculative state repeat exactly until
+    /// is_state_visited() rejects the program with "infinite loop
+    /// detected" (kernel/bpf/states.c, a doomed-work side effect). The
+    /// program's real paths terminate: the concrete run is safe and
+    /// the privileged load accepts the same program.
+    #[test]
+    fn strict_speculative_loop_is_precision_candidate() {
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(ReasonCategory::Loop),
+                Some("infinite loop detected at insn 1"),
+                true,
+            ),
+            Finding::PrecisionCandidate
+        );
+        // outside strict mode the shape is a precision candidate too
+        // (the privileged kernel never sanitizes speculative paths)
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(ReasonCategory::Loop),
+                Some("infinite loop detected at insn 1"),
+                false,
+            ),
+            Finding::PrecisionCandidate
         );
     }
 

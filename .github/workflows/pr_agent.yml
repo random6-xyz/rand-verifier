@@ -38,7 +38,7 @@ jobs:
             This repo is rand-verifier: a differential-testing and bug-discovery
             framework for the Linux eBPF verifier, written in Rust. The same eBPF
             program runs through three oracles — an abstract-interpretation verifier
-            (mini), a concrete interpreter (the truth axis), and the real kernel
+            (mini), a concrete interpreter (the witness axis), and the real kernel
             verifier via the raw bpf() syscall — and every verdict disagreement is
             classified as a precision or soundness candidate. Review for correctness
             of verifier semantics, not style. (1) Mini verifier parity with the

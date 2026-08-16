@@ -146,9 +146,15 @@ pub enum DiffClass {
     /// Both verifiers reject (reasons are compared separately).
     MatchReject,
     /// The kernel is stricter: rand-verifier accepts, the kernel rejects.
+    /// This is the precision-candidate direction of the v0.7 fuzzer
+    /// oracle (a candidate additionally requires a clean concrete run).
     KernelStricter,
-    /// 🎯 The kernel accepts what rand-verifier rejects — a precision
-    /// candidate for manual analysis (Phase 6 entry point).
+    /// The kernel accepts what rand-verifier rejects — rand-verifier
+    /// over-rejects. In the v0.7 fuzzer oracle taxonomy the pair is an
+    /// `rv-precision-gap` when the concrete run is safe and a
+    /// `soundness-candidate` when it found an unsafe witness; the v0.6
+    /// diff harness does not consult the concrete axis (Phase 6
+    /// analysis follows up manually).
     KernelAccepts,
     /// One side could not produce a verdict.
     Skipped,

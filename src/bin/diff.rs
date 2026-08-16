@@ -7,9 +7,11 @@
 //! ```
 //!
 //! Exit code: 1 when a non-whitelisted `kernel-accepts` finding exists
-//! (a kernel precision candidate); 0 otherwise. The kernel side needs
-//! root / CAP_BPF (run with sudo on hosts with unprivileged BPF
-//! disabled).
+//! (rand-verifier over-rejection — in the v0.7 fuzzer oracle taxonomy
+//! the pair is an `rv-precision-gap` or a `soundness-candidate`
+//! depending on the concrete side, which this v0.6 tool does not
+//! consult); 0 otherwise. The kernel side needs root / CAP_BPF (run
+//! with sudo on hosts with unprivileged BPF disabled).
 
 use std::env;
 use std::fs;
