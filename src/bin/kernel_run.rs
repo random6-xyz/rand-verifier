@@ -50,6 +50,7 @@ fn category_name(category: ReasonCategory) -> &'static str {
         ReasonCategory::Unreachable => "Unreachable",
         ReasonCategory::ExitR0 => "ExitR0",
         ReasonCategory::Complexity => "Complexity",
+        ReasonCategory::Ref => "Ref",
         ReasonCategory::Other => "Other",
     }
 }

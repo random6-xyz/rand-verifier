@@ -274,7 +274,29 @@ pub(crate) enum RegState {
         value_size: u32,
         id: u32,
     },
+    /// A referenced memory buffer returned by an acquire helper
+    /// (kernel PTR_TO_MEM, #101): the ringbuf reserve family. `id` is
+    /// the reference identity; every register and spilled slot holding
+    /// the same id must be released before the exit (kernel
+    /// check_reference_leak).
+    PtrToMem {
+        min_offset: i32,
+        max_offset: i32,
+        /// Known offset modulo 8 ([`ALIGN_UNKNOWN`] when not determined).
+        align_off: u8,
+        id: u32,
+    },
+    /// The nullable acquire result (kernel PTR_TO_MEM_OR_NULL): a
+    /// NULL check both refines the pointer and releases the reference
+    /// on the null side (kernel mark_ptr_or_null_regs).
+    PtrToMemOrNull {
+        id: u32,
+    },
 }
+
+/// Maximum simultaneously held references (kernel: bounded by the
+/// registers and stack slots).
+pub(crate) const MAX_REFS: usize = 8;
 
 impl std::fmt::Display for RegState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -320,6 +342,17 @@ impl std::fmt::Display for RegState {
             RegState::PtrToMapValueOrNull { value_size, .. } => {
                 write!(f, "PTR_MAP_VALUE_OR_NULL(sz:{})", value_size)
             }
+            RegState::PtrToMem {
+                min_offset,
+                max_offset,
+                id,
+                ..
+            } => write!(
+                f,
+                "PTR_TO_MEM(off:{}..{}, ref:{})",
+                min_offset, max_offset, id
+            ),
+            RegState::PtrToMemOrNull { id } => write!(f, "PTR_TO_MEM_OR_NULL(ref:{})", id),
         }
     }
 }
@@ -443,6 +476,10 @@ pub(crate) struct VerifierState {
     pub(crate) curframe: u8,
     /// The current frame's return address (#100).
     pub(crate) ret_pc: u32,
+    /// Acquired reference ids (kernel `acquired_refs` + `refs[]`,
+    /// #101): every id must be released before the exit.
+    pub(crate) refs: [u32; MAX_REFS],
+    pub(crate) refs_cnt: u8,
 }
 
 impl VerifierState {
@@ -455,6 +492,8 @@ impl VerifierState {
             saved: [None; MAX_CALL_FRAMES - 1],
             curframe: 0,
             ret_pc: 0,
+            refs: [0; MAX_REFS],
+            refs_cnt: 0,
         }
     }
 
@@ -568,7 +607,9 @@ pub(crate) fn read_scalar(
         | RegState::PtrToCtx
         | RegState::PtrToMap { .. }
         | RegState::PtrToMapValue { .. }
-        | RegState::PtrToMapValueOrNull { .. } => Err(VerificationFailure::new(
+        | RegState::PtrToMapValueOrNull { .. }
+        | RegState::PtrToMem { .. }
+        | RegState::PtrToMemOrNull { .. } => Err(VerificationFailure::new(
             pc,
             format!(
                 "register-offset pointer arithmetic on r{} is not supported yet (only immediate offsets)",
