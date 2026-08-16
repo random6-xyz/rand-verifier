@@ -42,6 +42,108 @@ pub(crate) fn find_subprog_range(insn_idx: u32, subprogs: &[u32], insn_cnt: u32)
     (start, end)
 }
 
+/// The kernel's `check_max_stack_depth` (kernel/bpf/verifier.c): each
+/// subprogram's static stack usage (r10-based accesses, rounded up to
+/// 8 bytes) is summed along every call chain; a chain whose combined
+/// depth exceeds the 512-byte frame budget is rejected ("combined
+/// stack size of %d calls is %d. Too large"). Caller-frame stack
+/// pointers (frameno, #100) cannot smuggle unbounded stack use into a
+/// chain — the kernel checks the chain, not the current frame
+/// (mseed-202608161-10021 etc.: subprog chains with 300-byte frames
+/// per call, mini accepted, kernel rejects).
+pub fn check_combined_stack_depth(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+) -> Result<(), VerificationFailure> {
+    use crate::state::STACK_SIZE;
+
+    let insn_cnt = insns.len() as u32;
+    let round_up_8 = |x: usize| x.div_ceil(8) * 8;
+    // static stack usage per subprogram: the deepest r10-based access
+    let mut depth = vec![0usize; subprogs.len()];
+    for (i, &start) in subprogs.iter().enumerate() {
+        let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt);
+        for pc in start..end {
+            let (off, size) = match &insns[pc as usize] {
+                BpfInsn::LdMem {
+                    base: 10,
+                    offset,
+                    size,
+                    ..
+                }
+                | BpfInsn::StMem {
+                    base: 10,
+                    offset,
+                    size,
+                    ..
+                }
+                | BpfInsn::StMemImm {
+                    base: 10,
+                    offset,
+                    size,
+                    ..
+                } => (*offset, size.bytes()),
+                _ => continue,
+            };
+            let use_bytes = (-off as i64 + size as i64).max(0) as usize;
+            depth[i] = depth[i].max(round_up_8(use_bytes));
+        }
+    }
+    // call chains: DFS from the main program; a recursive call is
+    // rejected by the other structural checks, so chains stay acyclic
+    fn visit(
+        idx: usize,
+        insns: &[BpfInsn],
+        subprogs: &[u32],
+        depth: &[usize],
+        chain: &mut Vec<usize>,
+    ) -> Result<(), VerificationFailure> {
+        let insn_cnt = insns.len() as u32;
+        let (start, end) = find_subprog_range(subprogs[idx], subprogs, insn_cnt);
+        for pc in start..end {
+            if let BpfInsn::CallSub { offset } = &insns[pc as usize] {
+                let target = pc as i32 + 1 + *offset;
+                let Some(callee) = subprogs.iter().position(|&s| s as i32 == target) else {
+                    continue;
+                };
+                if chain.contains(&callee) {
+                    continue;
+                }
+                chain.push(callee);
+                // the kernel's MAX_CALL_FRAMES check (verifier.c
+                // check_max_stack_depth / do_check_subprogs): the
+                // STATIC call chain depth is limited, independent of
+                // which branches actually execute ("the call stack of
+                // %d frames is too deep !", errno E2BIG). mini's path
+                // exploration alone never builds the full chain when a
+                // branch skips a call (mseed-202608161-1736: a 17-deep
+                // chain where the first call is statically skipped).
+                if chain.len() > crate::state::MAX_CALL_FRAMES {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!("the call stack of {} frames is too deep", chain.len() - 1),
+                    ));
+                }
+                let total: usize = chain.iter().map(|&c| depth[c]).sum();
+                if total > STACK_SIZE {
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!(
+                            "combined stack size of {} calls is {}. Too large",
+                            chain.len(),
+                            total
+                        ),
+                    ));
+                }
+                visit(callee, insns, subprogs, depth, chain)?;
+                chain.pop();
+            }
+        }
+        Ok(())
+    }
+    visit(0, insns, subprogs, &depth, &mut vec![0usize])
+}
+
 /// DFS visit state: NotVisited → Discovering → Explored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VisitState {

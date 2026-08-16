@@ -135,13 +135,15 @@ pub(crate) fn regs_exact(old: &RegState, new: &RegState) -> bool {
                 min_offset: a_min,
                 max_offset: a_max,
                 align_off: a_align,
+                frameno: a_frame,
             },
             RegState::PtrToStack {
                 min_offset: b_min,
                 max_offset: b_max,
                 align_off: b_align,
+                frameno: b_frame,
             },
-        ) => a_min == b_min && a_max == b_max && a_align == b_align,
+        ) => a_min == b_min && a_max == b_max && a_align == b_align && a_frame == b_frame,
         (RegState::PtrToCtx, RegState::PtrToCtx) => true,
         (
             RegState::PtrToMap {

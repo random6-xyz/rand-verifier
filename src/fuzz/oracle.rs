@@ -234,6 +234,24 @@ pub fn classify(input: &OracleInput) -> Finding {
                 // candidate. A real infinite loop never reaches this
                 // branch: mini rejects it and the concrete run is
                 // inconclusive.
+                // strict mode: the unprivileged stack-write rule
+                // (check_stack_write_fixed_off without bpf_capable) does
+                // NOT initialize the unwritten bytes of a partially
+                // covered slot — a subsequent load of those bytes is
+                // "invalid read from stack". mini models the privileged
+                // rule (save_register_state marks the slot's remainder
+                // MISC), so a mini ACCEPT here is the privileged-model
+                // design difference, not a kernel precision gap
+                // (mseed-202608161-12581: 4-byte store at -8, 4-byte
+                // load at -4 — concretely safe, kernel rejects in
+                // strict mode only).
+                if *strict
+                    && matches!(category, ReasonCategory::UninitRead)
+                    && matches!(mini, SideVerdict::Accept)
+                    && kernel_reason.is_some_and(|m| m.contains("invalid read from stack"))
+                {
+                    return Finding::Whitelisted;
+                }
                 Finding::PrecisionCandidate
             }
         },
@@ -411,6 +429,29 @@ mod tests {
                 Some("R6 variable stack access prohibited for !root, var_off=0xffff... off=0"),
                 false,
             ),
+            Finding::PrecisionCandidate
+        );
+    }
+
+    /// Strict mode: the unprivileged stack-write rule
+    /// (check_stack_write_fixed_off without bpf_capable) leaves the
+    /// unwritten bytes of a partially covered slot uninitialized; mini
+    /// models the privileged rule (the slot's remainder becomes MISC),
+    /// so a mini ACCEPT + kernel "invalid read from stack" is the
+    /// privileged-model design difference (mseed-202608161-12581: 4-byte
+    /// store at -8, 4-byte load at -4). Outside strict mode the kernel
+    /// uses the privileged rule too and accepts — the rejection stays a
+    /// precision candidate there.
+    #[test]
+    fn strict_whitelist_unprivileged_partial_store() {
+        let s = ReasonCategory::UninitRead;
+        let reason = Some("invalid read from stack off -4+0 size 4");
+        assert_eq!(
+            classify_with_kernel_reason(acc(), ConcreteSide::Safe, rej(s), reason, true),
+            Finding::Whitelisted
+        );
+        assert_eq!(
+            classify_with_kernel_reason(acc(), ConcreteSide::Safe, rej(s), reason, false),
             Finding::PrecisionCandidate
         );
     }

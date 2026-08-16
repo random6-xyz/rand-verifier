@@ -71,9 +71,16 @@ pub(crate) struct MapMem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConcreteValue {
     Scalar(u64),
-    /// Pointer into the stack frame: `value = STACK_BASE + offset`, the
-    /// concrete counterpart of `RegState::PtrToStack`.
-    StackPtr(u64),
+    /// Pointer into the stack frame: `addr = STACK_BASE + offset`, the
+    /// concrete counterpart of `RegState::PtrToStack`. `frameno` is the
+    /// absolute depth of the owning frame (the concrete counterpart of
+    /// `PtrToStack::frameno`, #100): a subprogram that receives the
+    /// caller's stack pointer keeps the caller's depth, so accesses
+    /// through it hit the caller frame's stack.
+    StackPtr {
+        addr: u64,
+        frameno: u8,
+    },
     /// The context pointer, the concrete counterpart of `RegState::PtrToCtx`.
     CtxPtr(u64),
     /// A map pointer or map-value pointer (#89): the concrete
@@ -91,7 +98,7 @@ impl ConcreteValue {
     pub(crate) fn bits(self) -> u64 {
         match self {
             ConcreteValue::Scalar(v) => v,
-            ConcreteValue::StackPtr(v) => v,
+            ConcreteValue::StackPtr { addr: v, .. } => v,
             ConcreteValue::CtxPtr(v) => v,
             ConcreteValue::MapPtr(v) => v,
             ConcreteValue::MemPtr(v) => v,
@@ -156,7 +163,10 @@ impl ConcreteState {
     pub(crate) fn initial() -> Self {
         let mut regs = [None; NUM_REGS];
         regs[1] = Some(ConcreteValue::CtxPtr(CTX_BASE));
-        regs[10] = Some(ConcreteValue::StackPtr(STACK_BASE));
+        regs[10] = Some(ConcreteValue::StackPtr {
+            addr: STACK_BASE,
+            frameno: 0,
+        });
         Self {
             regs,
             stack: [None; STACK_SLOTS],
@@ -184,7 +194,12 @@ impl ConcreteState {
         for (i, v) in args.into_iter().enumerate() {
             self.regs[1 + i] = v;
         }
-        self.regs[10] = Some(ConcreteValue::StackPtr(STACK_BASE));
+        // R10 belongs to the callee's own frame (the concrete
+        // counterpart of the abstract call_subprog frameno init)
+        self.regs[10] = Some(ConcreteValue::StackPtr {
+            addr: STACK_BASE,
+            frameno: self.curframe,
+        });
         self.ret_pc = return_pc;
         Ok(())
     }
@@ -343,6 +358,20 @@ fn tnum_contains(t: Tnum, value: u64) -> bool {
 /// are derived from the 64-bit ones by the sync (#41), so re-checking
 /// them is redundant.
 fn scalar_covers(bounds: ScalarBounds, value: u64) -> bool {
+    // the kernel's imprecise-scalar shortcut, mirrored on the coverage
+    // side (states.c regsafe: `if (!rold->precise && exact == NOT_EXACT)
+    // return true;`): an imprecise scalar's range is not enforced
+    // because precision backtracking (#98) guarantees it never affects
+    // a safety decision — any concrete value is covered. This keeps
+    // the abstract↔concrete coverage check consistent with the
+    // kernel-style state pruning: a path pruned at a checkpoint by the
+    // imprecise shortcut is a real concrete execution, but its scalar
+    // values cannot matter (mseed-202608161-240: helper-return scalar
+    // refined to u:0x1.. on one branch, concrete executes with 0 on
+    // the other, kernel accepts both — the abstract accept is sound).
+    if !bounds.precise {
+        return true;
+    }
     (bounds.smin..=bounds.smax).contains(&(value as i64))
         && (bounds.umin..=bounds.umax).contains(&value)
         && tnum_contains(bounds.tnum, value)
@@ -383,8 +412,9 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
                 min_offset,
                 max_offset,
                 align_off,
+                ..
             },
-            ConcreteValue::StackPtr(v),
+            ConcreteValue::StackPtr { addr: v, .. },
         ) => stack_ptr_covers(min_offset, max_offset, align_off, v),
         (RegState::PtrToCtx, ConcreteValue::CtxPtr(v)) => v == CTX_BASE,
         // map pointers (#89): CONST_PTR_TO_MAP lives in a map region;
@@ -534,17 +564,51 @@ fn concrete_stack_range(
 /// Merge a partial store into a slot value: the covered bytes are
 /// overwritten; the uncovered bytes keep their previous value (or zero
 /// on an unwritten slot — covered by the abstract MISC mark).
+/// The stack array of the frame a stack pointer belongs to (the
+/// concrete counterpart of the abstract `frame_stack`, #100): the
+/// current frame's stack for `frameno == state.curframe`, otherwise the
+/// saved caller frame at that depth.
+fn concrete_frame_stack(
+    state: &ConcreteState,
+    frameno: u8,
+) -> &[Option<ConcreteValue>; STACK_SLOTS] {
+    if frameno == state.curframe {
+        &state.stack
+    } else {
+        &state.saved[frameno as usize]
+            .as_ref()
+            .expect("a stack pointer always targets an active frame")
+            .stack
+    }
+}
+
+fn concrete_frame_stack_mut(
+    state: &mut ConcreteState,
+    frameno: u8,
+) -> &mut [Option<ConcreteValue>; STACK_SLOTS] {
+    if frameno == state.curframe {
+        &mut state.stack
+    } else {
+        &mut state.saved[frameno as usize]
+            .as_mut()
+            .expect("a stack pointer always targets an active frame")
+            .stack
+    }
+}
+
 fn concrete_merge(
     state: &mut ConcreteState,
+    frameno: u8,
     slot: usize,
     in_slot: usize,
     size: usize,
     value: ConcreteValue,
 ) {
+    let stack = concrete_frame_stack_mut(state, frameno);
     // a full-slot aligned store preserves the value (and its pointer
     // kind) for the round-trip (#30)
     if in_slot == 0 && size == 8 {
-        state.stack[slot] = Some(value);
+        stack[slot] = Some(value);
         return;
     }
     let bits = size * 8;
@@ -554,10 +618,10 @@ fn concrete_merge(
         (1u64 << bits) - 1
     };
     let raw = value.bits() & low_mask;
-    let existing = state.stack[slot].map(|v| v.bits()).unwrap_or(0);
+    let existing = stack[slot].map(|v| v.bits()).unwrap_or(0);
     let lo_bit = in_slot * 8;
     let merged = (existing & !(low_mask << lo_bit)) | (raw << lo_bit);
-    state.stack[slot] = Some(ConcreteValue::Scalar(merged));
+    stack[slot] = Some(ConcreteValue::Scalar(merged));
 }
 
 /// Extract the covered bytes of a slot value, zero/sign-extended to 64
@@ -596,6 +660,17 @@ fn alu_value(op: AluOp, width: AluWidth, a: u64, b: u64) -> u64 {
     }
 }
 
+/// The owning frame of a stack pointer value (the concrete counterpart
+/// of `PtrToStack::frameno`): which frame's stack an access through
+/// `base` touches. 0 is the main program; a pointer received from a
+/// caller keeps the caller's depth.
+fn stack_ptr_frameno(pc: u32, reg: u8, base: ConcreteValue) -> Result<u8, ConcreteFailure> {
+    match base {
+        ConcreteValue::StackPtr { frameno, .. } => Ok(frameno),
+        _ => Err(ConcreteFailure::NonStackBase { pc, reg }),
+    }
+}
+
 /// Resolve a memory access `[base + off]` to an r10-relative offset
 /// (#87): the base must be a stack pointer; the access-time frame and
 /// alignment checks happen in `concrete_stack_slot`.
@@ -606,7 +681,9 @@ fn stack_ptr_access_offset(
     off: i32,
 ) -> Result<i32, ConcreteFailure> {
     match base {
-        ConcreteValue::StackPtr(v) => Ok((v as i64 - STACK_BASE as i64 + off as i64) as i32),
+        ConcreteValue::StackPtr { addr: v, .. } => {
+            Ok((v as i64 - STACK_BASE as i64 + off as i64) as i32)
+        }
         _ => Err(ConcreteFailure::NonStackBase { pc, reg }),
     }
 }
@@ -657,14 +734,16 @@ fn concrete_alu_imm(
         // stack pointer + immediate: only ADD is allowed (#20); the
         // result offset is exact, frame bounds are validated at access
         // time (#87, mirroring the abstract side and the kernel)
-        ConcreteValue::StackPtr(v) => {
+        ConcreteValue::StackPtr { addr: v, frameno } => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
             let offset = (v as i64 - STACK_BASE as i64).saturating_add(imm as i64);
             let mut next = *state;
-            next.regs[dst as usize] =
-                Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            next.regs[dst as usize] = Some(ConcreteValue::StackPtr {
+                addr: (STACK_BASE as i64 + offset) as u64,
+                frameno,
+            });
             Ok(next)
         }
         // map value pointer + immediate: only ADD (the address just
@@ -724,7 +803,7 @@ fn concrete_alu_reg(
         // computed stack pointer arithmetic (#87): only ADD; the exact
         // offset result is computed by wrapping arithmetic — frame
         // bounds are validated at access time
-        (ConcreteValue::StackPtr(v), ConcreteValue::Scalar(s)) => {
+        (ConcreteValue::StackPtr { addr: v, frameno }, ConcreteValue::Scalar(s)) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
@@ -732,14 +811,16 @@ fn concrete_alu_reg(
                 .wrapping_sub(STACK_BASE as i64)
                 .wrapping_add(s as i64);
             let mut next = *state;
-            next.regs[dst as usize] =
-                Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            next.regs[dst as usize] = Some(ConcreteValue::StackPtr {
+                addr: (STACK_BASE as i64 + offset) as u64,
+                frameno,
+            });
             Ok(next)
         }
         // scalar += stack pointer: the destination inherits the pointer
         // value (kernel: "dst_reg inherits the complete pointer register
         // state")
-        (ConcreteValue::Scalar(d), ConcreteValue::StackPtr(v)) => {
+        (ConcreteValue::Scalar(d), ConcreteValue::StackPtr { addr: v, frameno }) => {
             if op != AluOp::Add || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
@@ -747,8 +828,10 @@ fn concrete_alu_reg(
                 .wrapping_sub(STACK_BASE as i64)
                 .wrapping_add(d as i64);
             let mut next = *state;
-            next.regs[dst as usize] =
-                Some(ConcreteValue::StackPtr((STACK_BASE as i64 + offset) as u64));
+            next.regs[dst as usize] = Some(ConcreteValue::StackPtr {
+                addr: (STACK_BASE as i64 + offset) as u64,
+                frameno,
+            });
             Ok(next)
         }
         // map value pointer + scalar / scalar + map value pointer:
@@ -973,11 +1056,12 @@ pub(crate) fn concrete_step(
             size,
         } => {
             let base_value = read_concrete_reg(pc, state, *base)?;
+            let frameno = stack_ptr_frameno(pc, *base, base_value)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
             let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
             let value = read_concrete_reg(pc, state, *src)?;
             let mut next = *state;
-            concrete_merge(&mut next, slot, in_slot, size.bytes(), value);
+            concrete_merge(&mut next, frameno, slot, in_slot, size.bytes(), value);
             Ok(next)
         }
         // [base + off] = imm → store an immediate (#100)
@@ -988,11 +1072,13 @@ pub(crate) fn concrete_step(
             size,
         } => {
             let base_value = read_concrete_reg(pc, state, *base)?;
+            let frameno = stack_ptr_frameno(pc, *base, base_value)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
             let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
             let mut next = *state;
             concrete_merge(
                 &mut next,
+                frameno,
                 slot,
                 in_slot,
                 size.bytes(),
@@ -1013,9 +1099,11 @@ pub(crate) fn concrete_step(
         } => {
             check_concrete_reg(pc, *dst)?;
             let base_value = read_concrete_reg(pc, state, *base)?;
+            let frameno = stack_ptr_frameno(pc, *base, base_value)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
             let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
-            let value = match state.stack[slot] {
+            let stack = concrete_frame_stack(state, frameno);
+            let value = match stack[slot] {
                 None => {
                     return Err(ConcreteFailure::UninitializedStackRead { pc, offset });
                 }
@@ -1189,17 +1277,26 @@ pub(crate) fn run_concrete_with_maps(
 
         // a subprogram's exit returns to the caller (#100); the
         // outermost exit ends the path (R0 must hold a valid value
-        // there — mirror of the abstract "r0 is uninitialized at exit")
+        // there — mirror of the abstract "r0 is uninitialized at
+        // exit"). Like the kernel (process_bpf_exit_full), a NESTED
+        // exit runs no R0 init check — only the outermost exit
+        // requires R0 (mseed-202608161-1098: subprog never writes R0,
+        // kernel accepts). prepare_func_exit still rejects returning
+        // the callee's own stack pointer ("cannot return stack pointer
+        // to the caller").
         if matches!(insn, BpfInsn::Exit) {
-            read_concrete_reg(pc, &state, 0)
-                .map_err(|_| ConcreteFailure::UninitializedRead { pc, reg: 0 })?;
             if state.curframe > 0 {
+                if matches!(state.regs[0], Some(ConcreteValue::StackPtr { .. })) {
+                    return Err(ConcreteFailure::PointerArithmetic { pc, reg: 0 });
+                }
                 let return_pc = state.ret_pc;
                 let mut returned = state;
                 returned.return_from_subprog();
                 worklist.push((return_pc, returned));
                 continue;
             }
+            read_concrete_reg(pc, &state, 0)
+                .map_err(|_| ConcreteFailure::UninitializedRead { pc, reg: 0 })?;
             // deduplicate identical exit states (e.g. converging seeds)
             if !outcomes.iter().any(|o| o.state == state) {
                 outcomes.push(ConcreteOutcome { pc, state });
@@ -1404,7 +1501,7 @@ fn concrete_cond(
             CondOp::Sle => (d as i64) <= (s as i64),
         },
         // same-kind pointers: equality comparisons only
-        (ConcreteValue::StackPtr(d), ConcreteValue::StackPtr(s))
+        (ConcreteValue::StackPtr { addr: d, .. }, ConcreteValue::StackPtr { addr: s, .. })
         | (ConcreteValue::CtxPtr(d), ConcreteValue::CtxPtr(s))
         | (ConcreteValue::MapPtr(d), ConcreteValue::MapPtr(s))
         | (ConcreteValue::MemPtr(d), ConcreteValue::MemPtr(s)) => match op {
@@ -1522,11 +1619,11 @@ fn check_concrete_helper_args(
         let actual = read_concrete_reg(pc, state, reg)?;
         let ok = matches!(
             (expected, actual),
-            (ArgType::PtrToStack, ConcreteValue::StackPtr(_))
+            (ArgType::PtrToStack, ConcreteValue::StackPtr { .. })
                 | (ArgType::Scalar, ConcreteValue::Scalar(_))
                 | (ArgType::PtrToMap, ConcreteValue::MapPtr(_))
                 | (ArgType::PtrToMem, ConcreteValue::MemPtr(_))
-                | (ArgType::PtrToDynptr, ConcreteValue::StackPtr(_))
+                | (ArgType::PtrToDynptr, ConcreteValue::StackPtr { .. })
                 | (ArgType::PtrToMapValue, ConcreteValue::MapPtr(_))
         );
         if !ok {
@@ -1613,7 +1710,7 @@ fn concrete_map_buffer(
     size: u32,
     _what: &str,
 ) -> Result<u64, ConcreteFailure> {
-    let Some(ConcreteValue::StackPtr(addr)) = state.regs[reg as usize] else {
+    let Some(ConcreteValue::StackPtr { addr, frameno }) = state.regs[reg as usize] else {
         return Err(ConcreteFailure::HelperArgMismatch { pc, arg: reg });
     };
     if size > 8 {
@@ -1621,7 +1718,7 @@ fn concrete_map_buffer(
     }
     let offset = (addr as i64 - STACK_BASE as i64) as i32;
     let (slot, in_slot) = concrete_stack_range(pc, offset, size as usize)?;
-    match state.stack[slot] {
+    match concrete_frame_stack(state, frameno)[slot] {
         None => Err(ConcreteFailure::UninitializedStackRead { pc, offset }),
         Some(value) => match concrete_extract(value, in_slot, size as usize, false) {
             ConcreteValue::Scalar(v) => Ok(v),
@@ -1836,7 +1933,7 @@ pub(crate) fn check_coverage(
 fn render_concrete_value(value: &ConcreteValue) -> String {
     match value {
         ConcreteValue::Scalar(v) => format!("Scalar({})", v),
-        ConcreteValue::StackPtr(v) => format!("StackPtr({:#x})", v),
+        ConcreteValue::StackPtr { addr: v, .. } => format!("StackPtr({:#x})", v),
         ConcreteValue::CtxPtr(v) => format!("CtxPtr({:#x})", v),
         ConcreteValue::MapPtr(v) => format!("MapPtr({:#x})", v),
         ConcreteValue::MemPtr(v) => format!("MemPtr({:#x})", v),
@@ -1919,7 +2016,13 @@ mod tests {
         let state = ConcreteState::initial();
         // R1 = context, R10 = frame pointer, everything else uninitialized
         assert_eq!(state.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
-        assert_eq!(state.regs[10], Some(ConcreteValue::StackPtr(STACK_BASE)));
+        assert_eq!(
+            state.regs[10],
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE,
+                frameno: 0
+            })
+        );
         assert!(state.regs[0..1].iter().all(|r| r.is_none()));
         assert!(state.regs[2..=9].iter().all(|r| r.is_none()));
         assert!(state.stack.iter().all(|s| s.is_none()));
@@ -1927,7 +2030,9 @@ mod tests {
 
     #[test]
     fn scalar_constant_covers_exact() {
-        let reg = RegState::Scalar(ScalarBounds::constant(42));
+        let mut bounds = ScalarBounds::constant(42);
+        bounds.precise = true;
+        let reg = RegState::Scalar(bounds);
         assert!(abstract_covers(reg, ConcreteValue::Scalar(42)));
         assert!(!abstract_covers(reg, ConcreteValue::Scalar(43)));
         assert!(!abstract_covers(reg, ConcreteValue::Scalar(41)));
@@ -1936,7 +2041,9 @@ mod tests {
     #[test]
     fn scalar_range_boundaries() {
         // signed range -10..=10: both interpretations cover it, tnum unknown
-        let reg = RegState::Scalar(ScalarBounds::from_signed(-10, 10));
+        let mut bounds = ScalarBounds::from_signed(-10, 10);
+        bounds.precise = true;
+        let reg = RegState::Scalar(bounds);
         assert!(abstract_covers(reg, ConcreteValue::Scalar(10)));
         assert!(abstract_covers(reg, ConcreteValue::Scalar(0)));
         assert!(abstract_covers(
@@ -1956,7 +2063,9 @@ mod tests {
         // a range straddling zero has no single u64 interval: the
         // unsigned side is the full range, so only the signed side
         // discriminates (and both sides must pass — #40)
-        let reg = RegState::Scalar(ScalarBounds::from_signed(-10, 10));
+        let mut bounds = ScalarBounds::from_signed(-10, 10);
+        bounds.precise = true;
+        let reg = RegState::Scalar(bounds);
         // u64::MAX = -1 signed: inside the signed range and unsigned range
         assert!(abstract_covers(reg, ConcreteValue::Scalar(u64::MAX)));
         // 11: unsigned pass, signed fail → not covered
@@ -1968,6 +2077,7 @@ mod tests {
         // wide range with a constant tnum: only the tnum discriminates
         let mut bounds = ScalarBounds::from_signed(0, 15);
         bounds.tnum = Tnum::constant(0b1010);
+        bounds.precise = true;
         let reg = RegState::Scalar(bounds);
         assert!(abstract_covers(reg, ConcreteValue::Scalar(0b1010)));
         // same range, wrong known bit
@@ -1981,11 +2091,21 @@ mod tests {
             min_offset: 0,
             max_offset: 0,
             align_off: 0,
+            frameno: 0,
         };
-        assert!(abstract_covers(reg, ConcreteValue::StackPtr(STACK_BASE)));
+        assert!(abstract_covers(
+            reg,
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE,
+                frameno: 0
+            }
+        ));
         assert!(!abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 8)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 8,
+                frameno: 0
+            }
         ));
 
         // computed offset range -16..=-8 (#45): boundary values only
@@ -1993,22 +2113,35 @@ mod tests {
             min_offset: -16,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         assert!(abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 16)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 16,
+                frameno: 0
+            }
         ));
         assert!(abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 8)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 8,
+                frameno: 0
+            }
         ));
         assert!(!abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 7)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 7,
+                frameno: 0
+            }
         ));
         assert!(!abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 17)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 17,
+                frameno: 0
+            }
         ));
     }
 
@@ -2019,14 +2152,21 @@ mod tests {
             min_offset: -16,
             max_offset: -8,
             align_off: 0,
+            frameno: 0,
         };
         assert!(abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 16)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 16,
+                frameno: 0
+            }
         ));
         assert!(!abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 15)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 15,
+                frameno: 0
+            }
         ));
 
         // unknown alignment accepts any offset in range (#45)
@@ -2034,10 +2174,14 @@ mod tests {
             min_offset: -16,
             max_offset: -8,
             align_off: ALIGN_UNKNOWN,
+            frameno: 0,
         };
         assert!(abstract_covers(
             reg,
-            ConcreteValue::StackPtr(STACK_BASE - 15)
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE - 15,
+                frameno: 0
+            }
         ));
     }
 
@@ -2061,7 +2205,10 @@ mod tests {
     fn uninit_never_covers_value() {
         for value in [
             ConcreteValue::Scalar(0),
-            ConcreteValue::StackPtr(0),
+            ConcreteValue::StackPtr {
+                addr: 0,
+                frameno: 0,
+            },
             ConcreteValue::CtxPtr(0),
         ] {
             assert!(!abstract_covers(RegState::Uninit, value));
@@ -2093,7 +2240,10 @@ mod tests {
         for reg in regs {
             for value in [
                 ConcreteValue::Scalar(1),
-                ConcreteValue::StackPtr(0),
+                ConcreteValue::StackPtr {
+                    addr: 0,
+                    frameno: 0,
+                },
                 ConcreteValue::CtxPtr(0),
             ] {
                 assert!(!abstract_covers(reg, value));
@@ -2159,6 +2309,7 @@ mod tests {
             min_offset: 0,
             max_offset: 0,
             align_off: 0,
+            frameno: 0,
         };
         assert!(!abstract_covers(reg, ConcreteValue::Scalar(STACK_BASE)));
         assert!(!abstract_covers(
@@ -2171,7 +2322,13 @@ mod tests {
     fn pointer_kind_does_not_cover_scalar() {
         // a pointer value is not a scalar, whatever its bits
         let reg = RegState::Scalar(ScalarBounds::constant(STACK_BASE as i64));
-        assert!(!abstract_covers(reg, ConcreteValue::StackPtr(STACK_BASE)));
+        assert!(!abstract_covers(
+            reg,
+            ConcreteValue::StackPtr {
+                addr: STACK_BASE,
+                frameno: 0
+            }
+        ));
     }
 
     #[test]
@@ -2196,7 +2353,10 @@ mod tests {
         assert!(state_covers(&abstract_state, &concrete));
         concrete.stack[3] = Some(ConcreteValue::Scalar(0));
         assert!(state_covers(&abstract_state, &concrete));
-        concrete.stack[3] = Some(ConcreteValue::StackPtr(STACK_BASE - 24));
+        concrete.stack[3] = Some(ConcreteValue::StackPtr {
+            addr: STACK_BASE - 24,
+            frameno: 0,
+        });
         assert!(state_covers(&abstract_state, &concrete));
     }
 
@@ -2216,12 +2376,16 @@ mod tests {
             min_offset: 0,
             max_offset: 0,
             align_off: 0,
+            frameno: 0,
         };
         let mut concrete = ConcreteState::initial();
         concrete.regs[0] = Some(ConcreteValue::Scalar(STACK_BASE));
         assert!(!state_covers(&abstract_state, &concrete));
         // the proper stack pointer kind is covered
-        concrete.regs[0] = Some(ConcreteValue::StackPtr(STACK_BASE));
+        concrete.regs[0] = Some(ConcreteValue::StackPtr {
+            addr: STACK_BASE,
+            frameno: 0,
+        });
         assert!(state_covers(&abstract_state, &concrete));
     }
 
@@ -2418,7 +2582,13 @@ mod tests {
         assert_eq!(state.regs[2], Some(ConcreteValue::CtxPtr(CTX_BASE)));
         // pointer kind copy (stack)
         let state = run(&[BpfInsn::MovReg { dst: 2, src: 10 }]);
-        assert_eq!(state.regs[2], Some(ConcreteValue::StackPtr(STACK_BASE)));
+        assert_eq!(
+            state.regs[2],
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE,
+                frameno: 0
+            })
+        );
     }
 
     #[test]
@@ -2731,7 +2901,10 @@ mod tests {
         let state = run(&[BpfInsn::AddImm { dst: 10, imm: -8 }]);
         assert_eq!(
             state.regs[10],
-            Some(ConcreteValue::StackPtr(STACK_BASE - 8))
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE - 8,
+                frameno: 0
+            })
         );
     }
 
@@ -2743,12 +2916,18 @@ mod tests {
         let state = run(&[BpfInsn::AddImm { dst: 10, imm: 100 }]);
         assert_eq!(
             state.regs[10],
-            Some(ConcreteValue::StackPtr(STACK_BASE + 100))
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE + 100,
+                frameno: 0
+            })
         );
         let state = run(&[BpfInsn::AddImm { dst: 10, imm: -520 }]);
         assert_eq!(
             state.regs[10],
-            Some(ConcreteValue::StackPtr(STACK_BASE - 520))
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE - 520,
+                frameno: 0
+            })
         );
     }
 
@@ -2762,12 +2941,21 @@ mod tests {
         ]);
         assert_eq!(
             state.regs[10],
-            Some(ConcreteValue::StackPtr(STACK_BASE - 8))
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE - 8,
+                frameno: 0
+            })
         );
         // out-of-frame scalar ADD is fine at arithmetic time
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
         let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 10, src: 2 }).unwrap();
-        assert_eq!(next.regs[10], Some(ConcreteValue::StackPtr(STACK_BASE + 8)));
+        assert_eq!(
+            next.regs[10],
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE + 8,
+                frameno: 0
+            })
+        );
     }
 
     #[test]
@@ -2807,7 +2995,13 @@ mod tests {
                 sign_extend: false,
             },
         ]);
-        assert_eq!(state.regs[0], Some(ConcreteValue::StackPtr(STACK_BASE - 8)));
+        assert_eq!(
+            state.regs[0],
+            Some(ConcreteValue::StackPtr {
+                addr: STACK_BASE - 8,
+                frameno: 0
+            })
+        );
     }
 
     #[test]
@@ -3261,7 +3455,9 @@ mod tests {
         );
         abstract_states.insert(0, vec![initial]);
         let mut at_exit = VerifierState::initial();
-        at_exit.regs[0] = RegState::Scalar(ScalarBounds::constant(r0_at_exit));
+        let mut bounds = ScalarBounds::constant(r0_at_exit);
+        bounds.precise = true; // precise: the coverage test targets the range check
+        at_exit.regs[0] = RegState::Scalar(bounds);
         clean_state(
             &mut at_exit,
             liveness.live_regs_before(1),

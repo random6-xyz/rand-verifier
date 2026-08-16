@@ -804,17 +804,24 @@ fn verify_mini_core(
         }
 
         // an exit inside a subprogram returns to the caller (#100):
-        // the callee's R0 becomes the caller's R0 (a scalar return, like
-        // the kernel's check_return_code), the caller frame is restored
-        // with its callee-saved registers, and the path continues at
-        // the call site + 1. The kernel only rejects a STACK pointer
-        // return here ("cannot return stack pointer to the caller" —
-        // other pointer types are legal in static subprogs). The
-        // OUTERMOST exit ends the path and requires a scalar R0.
+        // the callee's R0 becomes the caller's R0, the caller frame is
+        // restored with its callee-saved registers, and the path
+        // continues at the call site + 1. The kernel runs NO return
+        // CODE check on a nested (static) subprogram exit —
+        // process_bpf_exit_full: `if (env->cur_state->curframe) { err =
+        // prepare_func_exit(...); return; }` — an uninitialized R0 is
+        // legal there (the R0 check happens in the CALLER when it uses
+        // R0, and in check_return_code at the main exit). Only global
+        // subprograms (BTF-declared) go through
+        // check_global_subprog_return_code; BTF-less programs have no
+        // global subprogs (mseed-202608161-1098 etc.: kernel ACCEPTs a
+        // subprog that never writes R0, mini rejected — model gap).
+        // prepare_func_exit DOES reject one thing: returning the
+        // callee's own stack pointer ("cannot return stack pointer to
+        // the caller") — the pointer dies with the frame (verified in
+        // the bpf-next guest).
         if matches!(insn, BpfInsn::Exit) && item.state.curframe > 0 {
-            let r0 = read_reg(pc, &item.state, 0)
-                .map_err(|_| VerificationFailure::new(pc, "r0 is uninitialized at subprog exit"))?;
-            if matches!(r0, RegState::PtrToStack { .. }) {
+            if matches!(item.state.regs[0], RegState::PtrToStack { .. }) {
                 return Err(VerificationFailure::new(
                     pc,
                     "cannot return stack pointer to the caller",

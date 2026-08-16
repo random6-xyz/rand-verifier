@@ -5,7 +5,7 @@ use std::fs;
 
 use anyhow::Result;
 
-use crate::cfg::{add_subprog, check_cfg};
+use crate::cfg::{add_subprog, check_cfg, check_combined_stack_depth};
 use crate::concrete::{
     ConcreteLimits, ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report,
     run_concrete_with_maps,
@@ -263,6 +263,11 @@ impl BpfVerifierEnv {
             Err(failure) => return self.reject_with_cross_check(failure, &[]),
         };
         self.prog.subprogs = subprogs;
+        // the kernel's check_max_stack_depth: per-chain stack budgets
+        // (combined stack size of N calls is M. Too large)
+        if let Err(failure) = check_combined_stack_depth(&self.prog.insns, &self.prog.subprogs) {
+            return self.reject_with_cross_check(failure, &[]);
+        }
         let loop_heads = match check_cfg(&self.prog.insns, &self.prog.subprogs) {
             Ok(loop_heads) => loop_heads,
             Err(failure) => return self.reject_with_cross_check(failure, &[]),
