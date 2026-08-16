@@ -282,7 +282,9 @@ pub fn privileged_stack_leniency(mini: &SideVerdict, mini_reason: Option<&str>) 
         SideVerdict::Reject {
             category: ReasonCategory::UninitRead
         }
-    ) && mini_reason.is_some_and(|r| r.contains("stack slot") || r.contains("indirect read"))
+    ) && mini_reason.is_some_and(|r| {
+        r.contains("stack slot") || r.contains("indirect read") || r.contains("uninitialized stack")
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
