@@ -244,6 +244,10 @@ impl BpfVerifierEnv {
     /// error — it is returned as Ok(Verdict::Unsafe). The verdict is
     /// unchanged by the concrete side: an unsoundness is a model bug
     /// and is reported via [`BpfVerifierEnv::concrete_report_text`].
+    pub fn program_insns(&self) -> &[BpfInsn] {
+        &self.prog.insns
+    }
+
     pub fn verify(&mut self) -> Result<Verdict> {
         self.concrete_report = None;
         // a decode failure is a rejection: the program could not even be

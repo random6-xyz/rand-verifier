@@ -114,3 +114,30 @@ jobs:
           name: fuzz-summary
           path: /tmp/fuzz-out/summary.json
           if-no-files-found: error
+
+  drift:
+    name: Drift check (bpf-next 7.2.0-rc6 baseline)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the drift tool
+        run: cargo build --bin drift
+
+      - name: Compare mini verdicts and state counts against the baseline
+        # The kernel side of the baseline is recorded in the bpf-next
+        # qemu guest (tools/drift-baseline/); the CI re-verifies the
+        # deterministic mini side on every push and exits 1 on a
+        # verdict flip or a checkpoint-count change (#102).
+        run: |
+          ./target/debug/drift --record --mini-only /tmp/drift-ci.json
+          ./target/debug/drift --compare tools/drift-baseline/v0.9-bpfnext-7.2.0-rc6.json --new /tmp/drift-ci.json
+
+      - name: Upload the drift report
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report
+          path: /tmp/drift-ci.json
+          if-no-files-found: error

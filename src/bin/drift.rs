@@ -77,41 +77,79 @@ fn parse_kernel_summary(log: &str) -> (u64, u64, u64) {
     (insns, total, peak)
 }
 
-fn mini_side(program: &[rand_verifier::insn::BpfInsn]) -> MiniSide {
-    let subprogs = match rand_verifier::cfg::add_subprog(program) {
-        Ok(s) => s,
-        Err(f) => {
-            return MiniSide {
-                verdict: format!("REJECT({})", f.message),
-                states: 0,
+fn mini_side(path: &Path, _bytes: &[u8]) -> MiniSide {
+    // run through the env so the map sidecar resolves (the ringbuf
+    // map-type check needs the registry); the checkpoint count comes
+    // from the same verifier the env uses
+    let mut env = rand_verifier::env::BpfVerifierEnv::new();
+    if env.setup_prog(path.to_string_lossy().into_owned()).is_err() {
+        return MiniSide {
+            verdict: "REJECT(decode)".to_string(),
+            states: 0,
+        };
+    }
+    match env.verify() {
+        Ok(rand_verifier::error::Verdict::Safe) => {
+            let insns = env.program_insns().to_vec();
+            let subprogs = match rand_verifier::cfg::add_subprog(&insns) {
+                Ok(s) => s,
+                Err(f) => {
+                    return MiniSide {
+                        verdict: format!("REJECT({})", f.message),
+                        states: 0,
+                    };
+                }
             };
-        }
-    };
-    let loop_heads = match rand_verifier::cfg::check_cfg(program, &subprogs) {
-        Ok(h) => h,
-        Err(f) => {
-            return MiniSide {
-                verdict: format!("REJECT({})", f.message),
-                states: 0,
+            let loop_heads = match rand_verifier::cfg::check_cfg(&insns, &subprogs) {
+                Ok(h) => h,
+                Err(f) => {
+                    return MiniSide {
+                        verdict: format!("REJECT({})", f.message),
+                        states: 0,
+                    };
+                }
             };
+            let states =
+                match verify_mini_with_limits(&insns, &loop_heads, &VerifierLimits::default()) {
+                    Ok(n) => n,
+                    Err(f) => {
+                        return MiniSide {
+                            verdict: format!("REJECT({})", f.message),
+                            states: 0,
+                        };
+                    }
+                };
+            MiniSide {
+                verdict: "ACCEPT".to_string(),
+                states,
+            }
         }
-    };
-    match verify_mini_with_limits(program, &loop_heads, &VerifierLimits::default()) {
-        Ok(states) => MiniSide {
-            verdict: "ACCEPT".to_string(),
-            states,
-        },
-        Err(f) => MiniSide {
+        Ok(rand_verifier::error::Verdict::Unsafe(f)) => MiniSide {
             verdict: format!("REJECT({})", f.message),
+            states: 0,
+        },
+        Err(e) => MiniSide {
+            verdict: format!("REJECT({})", e),
             states: 0,
         },
     }
 }
 
-fn run_program(path: &Path) -> DriftRecord {
+/// The verdict class of a mini side (ACCEPT vs REJECT) — the compare
+/// ignores the message wording.
+fn mini_class(verdict: Option<&str>) -> Option<bool> {
+    verdict.map(|v| v.starts_with("ACCEPT"))
+}
+
+fn run_program(path: &Path, mini_only: bool) -> DriftRecord {
     let data = std::fs::read(path).unwrap_or_default();
-    let insns = rand_verifier::insn::decode_program(&data).unwrap_or_default();
-    let mini = mini_side(&insns);
+    let mini = mini_side(path, &data);
+    if mini_only {
+        return DriftRecord {
+            mini: Some(mini),
+            kernel: None,
+        };
+    }
     let maps = rand_verifier::env::parse_maps_sidecar(path.to_str().unwrap());
     let (outcome, log) = rand_verifier::krun::load_with_kernel_maps_level(&data, &maps, 1);
     let kernel = match outcome {
@@ -143,7 +181,7 @@ fn run_program(path: &Path) -> DriftRecord {
     }
 }
 
-fn record_corpus() -> Snapshot {
+fn record_corpus(mini_only: bool) -> Snapshot {
     let mut snap = Snapshot::new();
     for sub in ["accept", "reject"] {
         let dir = Path::new("tests/programs").join(sub);
@@ -160,7 +198,7 @@ fn record_corpus() -> Snapshot {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            snap.insert(name, run_program(&path));
+            snap.insert(name, run_program(&path, mini_only));
         }
     }
     snap
@@ -178,15 +216,25 @@ fn compare(base: &Snapshot, new: &Snapshot, verbose: bool) -> usize {
         let n = new.get(name);
         let verdict_flip = match (b, n) {
             (Some(b), Some(n)) => {
-                let bv = (
-                    b.mini.as_ref().map(|m| &m.verdict),
-                    b.kernel.as_ref().map(|k| &k.verdict),
-                );
-                let nv = (
-                    n.mini.as_ref().map(|m| &m.verdict),
-                    n.kernel.as_ref().map(|k| &k.verdict),
-                );
-                bv != nv
+                // a mini-only snapshot (the CI drift job) compares the
+                // mini side only; the kernel side is recorded in the
+                // bpf-next qemu guest
+                if n.kernel.is_none() {
+                    // the verdict class, not the message text (the
+                    // wording legitimately evolves)
+                    mini_class(b.mini.as_ref().map(|m| m.verdict.as_str()))
+                        != mini_class(n.mini.as_ref().map(|m| m.verdict.as_str()))
+                } else {
+                    let bv = (
+                        b.mini.as_ref().map(|m| &m.verdict),
+                        b.kernel.as_ref().map(|k| &k.verdict),
+                    );
+                    let nv = (
+                        n.mini.as_ref().map(|m| &m.verdict),
+                        n.kernel.as_ref().map(|k| &k.verdict),
+                    );
+                    bv != nv
+                }
             }
             _ => b.is_some() != n.is_some(),
         };
@@ -240,14 +288,21 @@ fn compare(base: &Snapshot, new: &Snapshot, verbose: bool) -> usize {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--record") {
+        // the output path is the last positional argument (flags like
+        // --mini-only may precede it)
         let out = args
             .iter()
-            .position(|a| a == "--record")
-            .and_then(|i| args.get(i + 1))
+            .rev()
+            .find(|a| !a.starts_with("--"))
+            .cloned()
             .expect("usage: drift --record <out.json>");
-        let snap = record_corpus();
+        // --mini-only skips the kernel loads (the CI drift job: the
+        // mini side is deterministic; the kernel side is recorded in
+        // the bpf-next qemu guest)
+        let mini_only = args.iter().any(|a| a == "--mini-only");
+        let snap = record_corpus(mini_only);
         let json = serde_json::to_string_pretty(&snap).unwrap();
-        std::fs::write(out, json).expect("cannot write the snapshot");
+        std::fs::write(&out, json).expect("cannot write the snapshot");
         eprintln!("drift snapshot written to {out} ({} programs)", snap.len());
         return;
     }
