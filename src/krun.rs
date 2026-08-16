@@ -106,7 +106,11 @@ fn bpf_map_create(info: &MapInfo) -> Result<i32, i32> {
         )
     };
     if rc < 0 {
-        Err(rc as i32)
+        // libc::syscall reports every failure as -1 with the cause in
+        // errno — return the real (positive) errno like bpf_prog_load
+        // does, never the raw -1 (which aliases -EPERM and made every
+        // map-create failure look like a privilege problem).
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
     } else {
         Ok(rc as i32)
     }
@@ -185,7 +189,8 @@ pub fn load_with_kernel_maps_level(
                 live.insert(fd, real);
             }
             Err(errno) => {
-                if errno == -libc::EPERM {
+                // positive errno, the same convention as bpf_prog_load
+                if errno == libc::EPERM {
                     return (KernelOutcome::Privilege, String::new());
                 }
                 return (KernelOutcome::NoErrorLine { errno }, String::new());
@@ -394,7 +399,6 @@ mod tests {
     /// Smoke tests against the real kernel: skipped (not failed) when
     /// the bpf() syscall is not permitted — on privileged hosts (CI
     /// root runner, sudo) they assert the kernel behavior itself.
-
     #[test]
     fn kernel_load_accept_smoke() {
         match load_with_kernel(&MINIMAL_EXIT) {
@@ -426,5 +430,28 @@ mod tests {
     fn kernel_load_invalid_program() {
         assert_eq!(load_with_kernel(&[]), KernelOutcome::InvalidProgram);
         assert_eq!(load_with_kernel(&[0u8, 1u8]), KernelOutcome::InvalidProgram);
+    }
+
+    /// Regression test for the map-create errno path: libc::syscall
+    /// reports every failure as -1 with the cause in errno, so
+    /// returning the raw return value as the errno made every
+    /// map-create failure look like `-EPERM` (also -1) and misreported
+    /// the real cause as a privilege problem. On privileged hosts the
+    /// create succeeds (fd > 0); on unprivileged hosts it fails with
+    /// the real, positive errno (EPERM).
+    #[test]
+    fn map_create_errno_is_positive() {
+        match bpf_map_create(&MapInfo::array_default()) {
+            Ok(fd) => {
+                assert!(fd > 0, "map fd must be positive, got {fd}");
+                unsafe { libc::close(fd) };
+            }
+            Err(errno) => {
+                assert!(
+                    errno > 0,
+                    "map-create failure must report the real positive errno, got {errno}"
+                );
+            }
+        }
     }
 }

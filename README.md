@@ -2,7 +2,7 @@
 
 A differential-testing and bug-discovery framework for the **Linux eBPF verifier**, written in Rust.
 
-It runs the same eBPF program through three oracles — an abstract-interpretation verifier (mini), a concrete interpreter (the truth axis), and the real kernel verifier via the raw `bpf()` syscall — and classifies every disagreement as a precision or soundness candidate. A program fuzzer and a ddmin-based reducer feed the pipeline, and qemu campaigns run it against bpf-next.
+It runs the same eBPF program through three oracles — an abstract-interpretation verifier (mini), a concrete interpreter (the witness axis: a concrete failure is a genuine unsafe witness, a clean run is bounded evidence rather than a proof of safety), and the real kernel verifier via the raw `bpf()` syscall — and classifies every disagreement as a precision or soundness candidate. A program fuzzer and a ddmin-based reducer feed the pipeline, and qemu campaigns run it against bpf-next.
 
 ## How it works
 
@@ -10,7 +10,7 @@ It runs the same eBPF program through three oracles — an abstract-interpretati
 eBPF program
      │
      ├─► mini verifier        abstract interpretation: scalar ranges, tnum, pointers, stack
-     ├─► concrete interpreter truth axis: real values; coverage check catches model unsoundness
+     ├─► concrete interpreter witness axis: real values; a concrete failure is an unsafe witness, a clean run is bounded evidence (not a proof)
      └─► Linux verifier       raw bpf() syscall (host kernel or qemu bpf-next guest)
               │
               ▼
@@ -36,7 +36,7 @@ Programs use the kernel `struct bpf_insn` encoding (8 bytes/instruction). Build:
 
 ## Kernel findings
 
-- **Speculative dead-branch exploration rejects concretely-safe programs (strict loads)** — with `bypass_spec_v1` off (no `CAP_PERFMON`, e.g. the lab's `--strict` campaigns), the kernel explores statically-decided-dead branches speculatively (`sanitize_speculative_path`, kernel/bpf/verifier.c). A fixed-point loop inside such a dead branch — e.g. `r1 = -4; r2 = 100; if r1 < r2 goto -1; exit` (the unsigned compare is never taken) — then trips the infinite-loop detector on the speculative path and rejects the program, although the fall-through is concretely safe and the privileged load accepts it (bypass_spec_v1 on with `CAP_PERFMON`). mini follows the privileged behavior (accept); the strict-mode divergence is a kernel-side false reject (campaign class `precision-candidate`, first seen in the v0.8.4 campaigns, re-confirmed on bpf-next 7.2.0-rc6).
+- **Speculative dead-branch exploration rejects concretely-safe programs (strict loads)** — with `bypass_spec_v1` off (no `CAP_PERFMON`, e.g. the lab's `--strict` campaigns), the kernel explores statically-decided-dead branches speculatively (`sanitize_speculative_path`, kernel/bpf/verifier.c). A fixed-point loop inside such a dead branch — e.g. `r1 = -4; r2 = 100; if r1 < r2 goto -1; exit` (the unsigned compare is never taken) — then re-reaches the branch insn with an exact-equal speculative state, and `is_state_visited()` rejects the whole program with "infinite loop detected" (kernel/bpf/states.c). The intended hardening is the sanitized exploration of the dead branch itself; the rejection is a doomed-work side effect (the kernel comments the check as "to avoid unnecessary doomed work") on a path that never executes at runtime — real infinite loops are still rejected in strict mode. The concrete run executes the fall-through safely and the privileged load accepts the program (bypass_spec_v1 on with `CAP_PERFMON`). mini follows the privileged behavior (accept); the strict-mode divergence is a kernel-side false reject (fuzzer-oracle class `precision-candidate`, first seen in the v0.8.4 campaigns, re-confirmed on bpf-next 7.2.0-rc6).
 
 ## Roadmap
 

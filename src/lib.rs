@@ -14,7 +14,8 @@
 //! - [`state_eq`] — kernel-style state equality (#97)
 //! - [`mini`] — path-sensitive exploration (mini pass)
 //! - [`helper`] — helper function prototypes and argument validation
-//! - [`tnum`] — tracked number abstraction (not wired into `RegState` yet)
+//! - [`tnum`] — tracked number abstraction (wired into the [`state`]
+//!   scalar bounds, intersected with the range on every narrowing)
 //! - [`trace`] — execution trace rendering
 //! - [`error`] — verification error types and the final verdict
 //! - [`env`] — program loading and the full verification pipeline
