@@ -294,9 +294,16 @@ pub(crate) fn regsafe(
                 ..
             },
         ) => old_min <= new_min && old_max >= new_max && check_ids(idmap, *old_id, *new_id),
-        (RegState::PtrToMemOrNull { id: old_id }, RegState::PtrToMemOrNull { id: new_id }) => {
-            check_ids(idmap, *old_id, *new_id)
-        }
+        (
+            RegState::PtrToMemOrNull {
+                id: old_id,
+                parent_id: old_parent,
+            },
+            RegState::PtrToMemOrNull {
+                id: new_id,
+                parent_id: new_parent,
+            },
+        ) => check_ids(idmap, *old_id, *new_id) && check_ids(idmap, *old_parent, *new_parent),
         // different types are never comparable
         _ => false,
     }
@@ -317,9 +324,16 @@ fn check_reg_ids(idmap: &mut IdMap, old: &RegState, new: &RegState) -> bool {
         (RegState::PtrToMem { id: a, .. }, RegState::PtrToMem { id: b, .. }) => {
             check_ids(idmap, *a, *b)
         }
-        (RegState::PtrToMemOrNull { id: a }, RegState::PtrToMemOrNull { id: b }) => {
-            check_ids(idmap, *a, *b)
-        }
+        (
+            RegState::PtrToMemOrNull {
+                id: a,
+                parent_id: ap,
+            },
+            RegState::PtrToMemOrNull {
+                id: b,
+                parent_id: bp,
+            },
+        ) => check_ids(idmap, *a, *b) && check_ids(idmap, *ap, *bp),
         (
             RegState::PtrToBtfId { ref_obj_id: a, .. },
             RegState::PtrToBtfId { ref_obj_id: b, .. },
