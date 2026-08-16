@@ -54,6 +54,9 @@ pub struct MapInfo {
 pub enum MapType {
     #[default]
     Array,
+    /// A per-CPU ring buffer (kernel BPF_MAP_TYPE_RINGBUF, #101): the
+    /// ringbuf reserve helpers take its pointer as R1.
+    Ringbuf,
 }
 
 impl MapInfo {

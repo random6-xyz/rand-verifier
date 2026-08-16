@@ -35,6 +35,9 @@ pub enum ReasonCategory {
     /// Exploration complexity limits ("The sequence of %d jumps is too
     /// complex.", "BPF program is too large. Processed %d insn").
     Complexity,
+    /// Reference tracking problems ("Unreleased reference id=...",
+    /// "release of unacquired reference", #101).
+    Ref,
     /// Anything not matched yet — the raw message is kept for manual
     /// analysis and the diff whitelist (#60).
     Other,
@@ -48,7 +51,9 @@ pub enum ReasonCategory {
 /// first.
 pub fn categorize_reason(message: &str) -> ReasonCategory {
     let msg = message.trim();
-    if msg.contains("misaligned") {
+    if msg.contains("Unreleased reference") || msg.contains("release of unacquired reference") {
+        ReasonCategory::Ref
+    } else if msg.contains("misaligned") {
         ReasonCategory::StackAlign
     } else if msg.contains("stack") && msg.contains("off=") && msg.contains("invalid") {
         // "invalid read/write to stack R10 off=N size=N" — out of bounds

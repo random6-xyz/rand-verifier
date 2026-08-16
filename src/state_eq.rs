@@ -277,6 +277,26 @@ pub(crate) fn regsafe(
                 id: new_id,
             },
         ) => old_size == new_size && check_ids(idmap, *old_id, *new_id),
+        // referenced memory buffers: the offset range contained, the
+        // reference identity preserved (kernel PTR_TO_MEM: the ref id
+        // relationship is checked through the idmap, #101)
+        (
+            RegState::PtrToMem {
+                min_offset: old_min,
+                max_offset: old_max,
+                id: old_id,
+                ..
+            },
+            RegState::PtrToMem {
+                min_offset: new_min,
+                max_offset: new_max,
+                id: new_id,
+                ..
+            },
+        ) => old_min <= new_min && old_max >= new_max && check_ids(idmap, *old_id, *new_id),
+        (RegState::PtrToMemOrNull { id: old_id }, RegState::PtrToMemOrNull { id: new_id }) => {
+            check_ids(idmap, *old_id, *new_id)
+        }
         // different types are never comparable
         _ => false,
     }
@@ -294,6 +314,12 @@ fn check_reg_ids(idmap: &mut IdMap, old: &RegState, new: &RegState) -> bool {
             RegState::PtrToMapValueOrNull { id: a, .. },
             RegState::PtrToMapValueOrNull { id: b, .. },
         ) => check_ids(idmap, *a, *b),
+        (RegState::PtrToMem { id: a, .. }, RegState::PtrToMem { id: b, .. }) => {
+            check_ids(idmap, *a, *b)
+        }
+        (RegState::PtrToMemOrNull { id: a }, RegState::PtrToMemOrNull { id: b }) => {
+            check_ids(idmap, *a, *b)
+        }
         _ => true,
     }
 }
@@ -437,8 +463,18 @@ pub(crate) fn states_equal(
     if old.curframe != new.curframe {
         return false;
     }
+    // the kernel's `refsafe`: the same number of acquired references,
+    // the ids related through the idmap (#101)
+    if old.refs_cnt != new.refs_cnt {
+        return false;
+    }
     // one idmap per comparison (kernel reset_idmap_scratch)
     let mut idmap = IdMap::default();
+    for i in 0..old.refs_cnt as usize {
+        if !check_ids(&mut idmap, old.refs[i], new.refs[i]) {
+            return false;
+        }
+    }
     // the frame pointer (R10) is never part of the live mask comparison
     // — the kernel never cleans it, and it is identical in every state
     for r in 0..NUM_REGS {
@@ -503,11 +539,14 @@ pub(crate) fn clean_state(state: &mut VerifierState, live_regs: u16, live_stack:
 pub(crate) fn states_maybe_looping(old: &VerifierState, new: &VerifierState) -> bool {
     // the kernel's memcmp up to `frameno` — every field except the
     // precision bit (which lives after frameno and only drives the
-    // NOT_EXACT scalar shortcut)
-    old.regs
-        .iter()
-        .zip(&new.regs)
-        .all(|(a, b)| regs_exact(a, b))
+    // NOT_EXACT scalar shortcut); the reference count is part of the
+    // state (kernel refsafe)
+    old.refs_cnt == new.refs_cnt
+        && old
+            .regs
+            .iter()
+            .zip(&new.regs)
+            .all(|(a, b)| regs_exact(a, b))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────

@@ -853,6 +853,14 @@ fn verify_mini_core(
                     "r0 is not a scalar value at exit",
                 ));
             }
+            // the kernel's check_reference_leak (#101): every acquired
+            // reference must be released before the exit
+            if item.state.refs_cnt > 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!("Unreleased reference id={}", item.state.refs[0]),
+                ));
+            }
             // the path ends here — consume the item (kernel
             // process_bpf_exit → bpf_update_branch_counts)
             bump_branches(&mut checkpoints, item.last_cp, -1);
@@ -860,6 +868,16 @@ fn verify_mini_core(
         }
 
         let nexts = successors(pc, insn, &item.state)?;
+        #[cfg(debug_assertions)]
+        if std::env::var("RV_DBG_REFS").is_ok() && (matches!(insn, BpfInsn::Exit) || pc == 5) {
+            eprintln!(
+                "item pc={} refs_cnt={} nexts={} nextpcs={:?}",
+                pc,
+                item.state.refs_cnt,
+                nexts.len(),
+                nexts.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+            );
+        }
 
         // ── precision requirements (#98) ─────────────────────────────
         // A conditional branch with exactly ONE successor used the

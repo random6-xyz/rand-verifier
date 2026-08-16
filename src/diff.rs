@@ -70,6 +70,10 @@ pub fn categorize_mini_reason(failure: &VerificationFailure) -> ReasonCategory {
         // mini's loop budget is its complexity mechanism — the kernel
         // rejects non-converging loops with "BPF program is too large"
         ReasonCategory::Complexity
+    } else if msg.contains("reference") || msg.contains("Unreleased") {
+        // "Unreleased reference id=N", "release of unacquired
+        // reference" (kernel check_reference_leak, #101)
+        ReasonCategory::Ref
     } else if msg.contains("infinite loop") {
         // kernel/bpf/states.c: "infinite loop detected at insn N"
         ReasonCategory::Loop

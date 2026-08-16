@@ -81,6 +81,9 @@ pub(crate) enum ConcreteValue {
     /// `PtrToMapValueOrNull`. NULL is `Scalar(0)` — matching the
     /// abstract null refinement.
     MapPtr(u64),
+    /// A referenced memory buffer (#101): the concrete counterpart of
+    /// `PtrToMem` / `PtrToMemOrNull`. NULL is `Scalar(0)`.
+    MemPtr(u64),
 }
 
 impl ConcreteValue {
@@ -91,6 +94,7 @@ impl ConcreteValue {
             ConcreteValue::StackPtr(v) => v,
             ConcreteValue::CtxPtr(v) => v,
             ConcreteValue::MapPtr(v) => v,
+            ConcreteValue::MemPtr(v) => v,
         }
     }
 }
@@ -402,13 +406,24 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
             map_value_offset(v) >= 0
         }
         (RegState::PtrToMapValueOrNull { .. }, ConcreteValue::Scalar(0)) => true,
+        // referenced memory buffers: any non-null buffer address is
+        // covered by the abstract pointer (the concrete cannot know
+        // the actual address), and NULL is the scalar 0
+        (RegState::PtrToMem { .. } | RegState::PtrToMemOrNull { .. }, ConcreteValue::MemPtr(_)) => {
+            true
+        }
+        (RegState::PtrToMem { .. } | RegState::PtrToMemOrNull { .. }, ConcreteValue::Scalar(0)) => {
+            true
+        }
         // type mismatches are never covered
         (RegState::Scalar(_), _)
         | (RegState::PtrToStack { .. }, _)
         | (RegState::PtrToCtx, _)
         | (RegState::PtrToMap { .. }, _)
         | (RegState::PtrToMapValue { .. }, _)
-        | (RegState::PtrToMapValueOrNull { .. }, _) => false,
+        | (RegState::PtrToMapValueOrNull { .. }, _)
+        | (RegState::PtrToMem { .. }, _)
+        | (RegState::PtrToMemOrNull { .. }, _) => false,
     }
 }
 
@@ -660,6 +675,10 @@ fn concrete_alu_imm(
             }
             Ok(*state)
         }
+        // referenced memory pointers reject arithmetic (the abstract
+        // side rejects it first; the concrete mirrors for the
+        // exhaustiveness)
+        ConcreteValue::MemPtr(_) => Err(ConcreteFailure::PointerArithmetic { pc, reg: dst }),
     }
 }
 
@@ -1377,15 +1396,18 @@ fn concrete_cond(
         // same-kind pointers: equality comparisons only
         (ConcreteValue::StackPtr(d), ConcreteValue::StackPtr(s))
         | (ConcreteValue::CtxPtr(d), ConcreteValue::CtxPtr(s))
-        | (ConcreteValue::MapPtr(d), ConcreteValue::MapPtr(s)) => match op {
+        | (ConcreteValue::MapPtr(d), ConcreteValue::MapPtr(s))
+        | (ConcreteValue::MemPtr(d), ConcreteValue::MemPtr(s)) => match op {
             CondOp::Eq => d == s,
             CondOp::Ne => d != s,
             _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
         },
-        // a NULL map value pointer is the scalar 0 (the abstract null
-        // refinement) — equality against 0 is decidable
+        // a NULL map value / mem pointer is the scalar 0 (the abstract
+        // null refinement) — equality against 0 is decidable
         (ConcreteValue::MapPtr(_), ConcreteValue::Scalar(0))
-        | (ConcreteValue::Scalar(0), ConcreteValue::MapPtr(_)) => match op {
+        | (ConcreteValue::Scalar(0), ConcreteValue::MapPtr(_))
+        | (ConcreteValue::MemPtr(_), ConcreteValue::Scalar(0))
+        | (ConcreteValue::Scalar(0), ConcreteValue::MemPtr(_)) => match op {
             CondOp::Eq => false,
             CondOp::Ne => true,
             _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
@@ -1428,10 +1450,10 @@ fn concrete_cond_imm(
             CondOp::Slt => (d as i64) < (imm as i64),
             CondOp::Sle => (d as i64) <= (imm as i64),
         },
-        // a NULL map value pointer is the scalar 0 — equality against
-        // the constant 0 is decidable (#89); other pointer/immediate
-        // comparisons are never comparable
-        ConcreteValue::MapPtr(_) if imm == 0 => match op {
+        // a NULL map value / mem pointer is the scalar 0 — equality
+        // against the constant 0 is decidable (#89, #101); other
+        // pointer/immediate comparisons are never comparable
+        ConcreteValue::MapPtr(_) | ConcreteValue::MemPtr(_) if imm == 0 => match op {
             CondOp::Eq => false,
             CondOp::Ne => true,
             _ => return Err(ConcreteFailure::InvalidComparisonImm { pc, dst }),
@@ -1492,6 +1514,8 @@ fn check_concrete_helper_args(
             (expected, actual),
             (ArgType::PtrToStack, ConcreteValue::StackPtr(_))
                 | (ArgType::Scalar, ConcreteValue::Scalar(_))
+                | (ArgType::PtrToMap, ConcreteValue::MapPtr(_))
+                | (ArgType::PtrToMem, ConcreteValue::MemPtr(_))
         );
         if !ok {
             return Err(ConcreteFailure::HelperArgMismatch { pc, arg: reg });
@@ -1668,6 +1692,11 @@ fn helper_return_seeds(
             .into_iter()
             .map(ConcreteValue::Scalar)
             .collect()),
+        // acquire results: a concrete buffer address (NULL is the
+        // scalar 0, matching the abstract null refinement, #101)
+        RegState::PtrToMemOrNull { .. } | RegState::PtrToMem { .. } => {
+            Ok(vec![ConcreteValue::MemPtr(0x5000)])
+        }
         // pointer returns have no concrete address class yet; reaching
         // this is a model gap, not a fake value
         _ => Err(ConcreteFailure::UnsupportedHelperReturn { pc, imm }),
@@ -1795,6 +1824,7 @@ fn render_concrete_value(value: &ConcreteValue) -> String {
         ConcreteValue::StackPtr(v) => format!("StackPtr({:#x})", v),
         ConcreteValue::CtxPtr(v) => format!("CtxPtr({:#x})", v),
         ConcreteValue::MapPtr(v) => format!("MapPtr({:#x})", v),
+        ConcreteValue::MemPtr(v) => format!("MemPtr({:#x})", v),
     }
 }
 

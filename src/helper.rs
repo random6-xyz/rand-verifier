@@ -13,6 +13,21 @@ pub(crate) enum ArgType {
     PtrToStack,
     /// Any scalar value (flags etc.).
     Scalar,
+    /// A referenced memory pointer (kernel PTR_TO_MEM, #101): the
+    /// argument of the release helpers (ringbuf submit/discard).
+    PtrToMem,
+}
+
+/// Whether the helper acquires a reference into R0 (kernel
+/// RET_PTR_TO_MEM_OR_NULL with the acquire semantics, #101).
+pub(crate) fn helper_acquires_ref(id: i32) -> bool {
+    matches!(id, 131)
+}
+
+/// Whether the helper releases the reference passed in R1 (kernel
+/// ARG_PTR_TO_MEM | OBJ_RELEASE, #101).
+pub(crate) fn helper_releases_ref(id: i32) -> bool {
+    matches!(id, 132 | 133)
 }
 
 /// Helper function prototype: argument types and the register state
@@ -26,6 +41,15 @@ pub(crate) struct HelperPrototype {
 /// (the kernel's RET_INTEGER family — the full range, so every
 /// concrete return value is covered).
 const UNKNOWN_SCALAR: RegState = RegState::Scalar(ScalarBounds::unknown());
+
+/// ringbuf_submit / ringbuf_discard: (mem, flags) → 0.
+const RINGBUF_RELEASE: HelperPrototype = HelperPrototype {
+    args: &[ArgType::PtrToMem, ArgType::Scalar],
+    return_type: UNKNOWN_SCALAR_ZERO,
+};
+
+/// The scalar constant 0 (RET_VOID returns).
+const UNKNOWN_SCALAR_ZERO: RegState = RegState::Scalar(ScalarBounds::constant(0));
 
 /// The helper table: id → prototype (#28). The immediate of a
 /// `BPF_JMP|BPF_CALL` instruction is the helper id (kernel convention);
@@ -89,6 +113,17 @@ pub(crate) fn helper_prototype(id: i32) -> Option<&'static HelperPrototype> {
             args: &[],
             return_type: UNKNOWN_SCALAR,
         }),
+        // BPF_FUNC_ringbuf_reserve: reserve(ringbuf_map, size, flags)
+        // → PTR_TO_MEM_OR_NULL with a fresh reference (#101; the ref
+        // id is assigned at the call site)
+        131 => Some(&HelperPrototype {
+            args: &[ArgType::PtrToMap, ArgType::Scalar, ArgType::Scalar],
+            return_type: RegState::PtrToMemOrNull { id: 0 },
+        }),
+        // BPF_FUNC_ringbuf_submit / BPF_FUNC_ringbuf_discard:
+        // submit(mem, flags) — releases the reference in R1 and
+        // returns 0 (RET_VOID)
+        132 | 133 => Some(&RINGBUF_RELEASE),
         // BPF_FUNC_ktime_get_boot_ns (125), BPF_FUNC_ktime_get_coarse_ns
         // (160), BPF_FUNC_ktime_get_tai_ns (208): no-argument
         // scalar-returning helpers of the socket-filter set
@@ -113,6 +148,7 @@ fn arg_matches(expected: ArgType, actual: RegState) -> bool {
         (expected, actual),
         (ArgType::PtrToMap, RegState::PtrToMap { .. })
             | (ArgType::PtrToStack, RegState::PtrToStack { .. })
+            | (ArgType::PtrToMem, RegState::PtrToMem { .. })
             | (ArgType::Scalar, RegState::Scalar(_))
     )
 }
