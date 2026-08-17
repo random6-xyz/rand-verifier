@@ -28,13 +28,25 @@ pub const QEMU_BATCH: usize = 100;
 
 /// The script the guest runs for one batch: verify every job file,
 /// write `out/<name>.out`.
+///
+/// `timeout 30` guards the guest kernel verifier: a pathological
+/// program can keep BPF_PROG_LOAD busy for minutes (speculative
+/// paths, complexity explosions), which would stall the host's 300s
+/// batch deadline and skip the whole batch tail. When the timeout
+/// kills the agent, write an explicit marker so the host's result
+/// polling terminates quickly instead of waiting out its 300s
+/// deadline.
 pub const QEMU_RUN_SCRIPT: &str = r###"#!/bin/sh
 STRICT=""
 [ -f /mnt/host/strict ] && STRICT="--strict"
 for f in /mnt/host/job/*.bin; do
     [ -e "$f" ] || continue
     b=$(basename "$f" .bin)
-    /sbin/agent "$f" $STRICT > "/mnt/host/out/$b.out" 2>&1
+    timeout 30 /sbin/agent "$f" $STRICT > "/mnt/host/out/$b.out" 2>&1
+    rc=$?
+    if [ $rc -eq 124 ]; then
+        echo "AGENT-TIMEOUT" > "/mnt/host/out/$b.out"
+    fi
     rm -f "$f"
 done
 "###;
@@ -254,13 +266,31 @@ fn fail_all(pending: &mut Vec<QemuJob>, why: &str) {
 }
 
 /// Parse one agent output file: `ACCEPT` or `REJECT <reason> errno=<n>`.
+/// Infrastructure failures (the agent could not read the job file, the
+/// guest verifier hit the per-program timeout, or the load failed
+/// without a verifier-log line) return `None` — they are not kernel
+/// verdicts and must surface as `Skipped`, never as findings (a
+/// cannot-read race with the batch deadline clearing the job dir used
+/// to classify as REJECT(Other) → precision-candidate).
 pub fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> {
     let first = text.lines().find(|l| !l.trim().is_empty())?;
     if first.trim() == "ACCEPT" {
         return Some((SideVerdict::Accept, None));
     }
     let rest = first.trim();
+    if rest.trim() == "AGENT-TIMEOUT" {
+        // the guest kernel verifier exceeded the per-program budget
+        // (pathological program) — not a verdict
+        return None;
+    }
     if let Some(reason) = rest.strip_prefix("REJECT ") {
+        // infrastructure failures: not kernel verdicts
+        if reason.starts_with("cannot-read")
+            || reason.starts_with("invalid-program")
+            || reason.starts_with("no-error-line")
+        {
+            return None;
+        }
         // strip the trailing "errno=<n>"
         let reason = reason
             .rsplit_once(" errno=")
@@ -288,5 +318,15 @@ mod tests {
         assert!(m.unwrap().contains("invalid stack off"));
         assert!(parse_agent_verdict("").is_none());
         assert!(parse_agent_verdict("TIMEOUT\n").is_none());
+    }
+
+    #[test]
+    fn parse_infra_failures_are_none() {
+        // infrastructure failures are not kernel verdicts: they must
+        // surface as Skipped, never as findings
+        assert!(parse_agent_verdict("AGENT-TIMEOUT\n").is_none());
+        assert!(parse_agent_verdict("REJECT cannot-read job file errno=2\n").is_none());
+        assert!(parse_agent_verdict("REJECT invalid-program bytes errno=22\n").is_none());
+        assert!(parse_agent_verdict("REJECT no-error-line errno=28\n").is_none());
     }
 }
