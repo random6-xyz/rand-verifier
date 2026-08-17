@@ -1,65 +1,110 @@
 # rand-verifier
 
-A differential-testing and bug-discovery framework for the **Linux eBPF verifier**, written in Rust.
+`rand-verifier` is a Rust framework for differential testing and independent safety analysis of the Linux eBPF verifier.
 
-It runs the same eBPF program through three oracles — an abstract-interpretation verifier (mini), a concrete interpreter (the witness axis: a concrete failure is a genuine unsafe witness, a clean run is bounded evidence rather than a proof of safety), and the real kernel verifier via the raw `bpf()` syscall — and classifies every disagreement as a precision or soundness candidate. A program fuzzer and a ddmin-based reducer feed the pipeline, and qemu campaigns run it against bpf-next.
+The project combines four verdict axes:
 
-## How it works
+1. **mini** — a path-sensitive abstract interpreter that models scalar ranges, tnum, pointers, stack bytes, calls, references, dynptrs, and kfunc contracts;
+2. **concrete** — a bounded interpreter used as a witness axis. A concrete failure is a real unsafe witness; a clean run means only that no witness was found within the explored seeds and budgets;
+3. **Linux** — the real verifier through the raw `bpf()` syscall, either on the host or through a bpf-next QEMU guest;
+4. **spec** — an independent safety specification with its own value, state, helper, and convergence models.
+
+SMT tooling separately checks the abstract tnum/range operators and synthesizes concrete precision witnesses. The fuzzer, reducer, triage logic, drift monitor, and QEMU backend share the same verdict artifacts.
+
+## Architecture
 
 ```text
-eBPF program
+eBPF bytecode
      │
-     ├─► mini verifier        abstract interpretation: scalar ranges, tnum, pointers, stack
-     ├─► concrete interpreter witness axis: real values; a concrete failure is an unsafe witness, a clean run is bounded evidence (not a proof)
-     └─► Linux verifier       raw bpf() syscall (host kernel or qemu bpf-next guest)
+     ├─► mini verifier       abstract interpretation: ranges, tnum, pointers, stack, calls
+     ├─► concrete runner     bounded execution and unsafe-witness search
+     ├─► safety spec         independent SP1/SP2/SP3 safety checks
+     └─► Linux verifier      raw bpf() syscall or bpf-next QEMU guest
               │
               ▼
-        verdict matrix ──► precision / soundness candidates
+       oracle matrix ──► triage ──► reducer ──► reproducible artifacts
+
+abstract operators ──► SMT soundness checks ──► precision-witness synthesis
 ```
 
-| Tool | Command |
-|------|---------|
-| verify | `cargo run -- <file>` |
-| kernel load | `cargo run --bin kernel_run -- [--strict] [--log2] <file>` |
-| differential | `cargo run --bin diff [--strict]` — corpus-wide verdict matrix, fails on non-whitelisted findings |
-| fuzz | `cargo run --bin fuzz -- --seed N --iters M [--mode mutation] [--kernel]` |
-| reduce | `cargo run --bin reduce -- <finding-dir> [--kernel]` — ddmin to a minimal reproducer |
-
-Programs use the kernel `struct bpf_insn` encoding (8 bytes/instruction). Build: `cargo build --release`.
+The spec is intentionally not a second mini verifier: it uses one wrapping `u64` interval per scalar, a separate dynamic type system and helper table, byte-granular stack state, and a visited-set convergence policy. Unsupported helpers or instruction surfaces return `Inconclusive`, not a false safety verdict.
 
 ## Current state
 
-- **Campaigns**: 24 kernel-backed runs (22 mutation + 2 generation), 340K+ programs, verified inside a qemu bpf-next guest.
-- **Corpus**: 60 accept / 54 reject fixtures in `tests/programs/` (see `tests/programs/README.md`), 544 tests green, with a drift-monitoring baseline against bpf-next 7.2.0-rc6 (`tools/drift-baseline/`, `src/bin/drift.rs --record/--compare`).
-- **CI drift wiring**: the `Drift check` job in `.github/workflows/ci.yml` re-verifies the mini-side verdicts and checkpoint counts against the committed baseline on every push (the kernel side of the baseline is recorded in the bpf-next qemu guest; `drift --record --mini-only` + `--compare`).
-- **Model**: mini covers scalar ranges (signed/unsigned + tnum), ALU32/64, byte-level stack accesses (1/2/4/8-byte loads/stores, sign-extension, spill/fill metadata, STACK_ZERO/MISC/SPILL byte types), map/ctx/stack pointers with access-time bounds, helper calls, bounded loops, BPF-to-BPF calls with multiple verifier frames, kernel-style state pruning (liveness masks, prune points, parent/checkpoint states, `regsafe()`/`stacksafe()`/`states_equal()`), scalar precision tracking with backtracking, register ids with linked-refinement and nullable-alias refinement, reference tracking for acquire/release helpers (ringbuf reserve/submit/discard, `refsafe()`, exit-time `check_reference_leak`), stack dynptr slots (bpf_dynptr_from_mem/read/write/data with STACK_DYNPTR byte types), parent_id-derived pointer invalidation, and a kfunc layer (vmlinux-BTF-keyed table with argument validation, PTR_TO_BTF_ID acquire/release). The mini mirrors the kernel's socket-filter behavior: kfunc calls are rejected ("not allowed") and the dynptr helpers require map-value data.
+The current `main` branch contains the following completed capabilities:
 
-## Kernel findings
+- **Model fidelity**: scalar signed/unsigned ranges, ALU32/ALU64, tnum, branch refinement, pointer provenance and nullable aliases, byte-level stack state, spill/fill metadata, BPF-to-BPF calls, verifier frames, references, dynptr slots, BTF pointers, and kfunc argument validation.
+- **Independent spec oracle**: scalar, stack, pointer, helper, reference, dynptr, NULL-alias, and subprogram checks are wired into the fuzzer as a fourth axis. The corpus has 52 accept and 47 reject bytecode fixtures, and the spec reproduces both fixture classes.
+- **SMT operator verification**: tnum add/sub/bitwise/shift/mul and scalar add/sub/mul encodings are checked exhaustively at small widths and with symbolic or randomized wider checks. `smt_verify` emits a reproducible violation catalog and currently reports zero violations.
+- **Precision synthesis**: `witness_synth` ranks interval-versus-tnum gaps and can emit concrete eBPF programs and dumps under an output directory. The generated witnesses are checked by the mini verifier.
+- **Campaign infrastructure**: generation and mutation fuzzing, deterministic replay, ddmin-style reduction, triage groups, direct kernel loading, and a shared QEMU batch backend. The guest agent has a 30-second per-program guard; timeout and infrastructure failures are skipped rather than classified as verifier verdicts.
+- **Regression monitoring**: `drift` records mini verdicts and checkpoint counts, and compares them with the committed bpf-next baseline. CI runs compilation, tests, formatting, clippy, kernel differential smoke, fuzz smoke, reducer regression, and drift checks.
 
-- **Speculative dead-branch exploration rejects concretely-safe programs (strict loads)** — with `bypass_spec_v1` off (no `CAP_PERFMON`, e.g. the lab's `--strict` campaigns), the kernel explores statically-decided-dead branches speculatively (`sanitize_speculative_path`, kernel/bpf/verifier.c). A fixed-point loop inside such a dead branch — e.g. `r1 = -4; r2 = 100; if r1 < r2 goto -1; exit` (the unsigned compare is never taken) — then re-reaches the branch insn with an exact-equal speculative state, and `is_state_visited()` rejects the whole program with "infinite loop detected" (kernel/bpf/states.c). The intended hardening is the sanitized exploration of the dead branch itself; the rejection is a doomed-work side effect (the kernel comments the check as "to avoid unnecessary doomed work") on a path that never executes at runtime — real infinite loops are still rejected in strict mode. The concrete run executes the fall-through safely and the privileged load accepts the program (bypass_spec_v1 on with `CAP_PERFMON`). mini follows the privileged behavior (accept); the strict-mode divergence is a kernel-side false reject (fuzzer-oracle class `precision-candidate`, first seen in the v0.8.4 campaigns, re-confirmed on bpf-next 7.2.0-rc6).
+The local validation run for this snapshot is **596 tests passed**. Counts can change as the corpus and regression tests evolve; run `cargo test` for the authoritative result.
+
+## Commands
+
+| Task | Command |
+|------|---------|
+| Verify one fixture with mini + concrete | `cargo run -- tests/programs/accept/minimal_exit` |
+| Load one program into the host kernel | `cargo run --bin kernel_run -- <file>` |
+| Strict host-kernel load | `cargo run --bin kernel_run -- --strict --log <file>` |
+| Corpus mini/kernel comparison | `cargo run --bin diff -- [--strict] [--json <path>]` |
+| Generate programs | `cargo run --bin fuzz -- --seed N --iters M` |
+| Mutate a corpus or supplied pool | `cargo run --bin fuzz -- --seed N --iters M --mode mutation --corpus-dir tests/programs/accept` |
+| Add the host kernel column | append `--kernel` (requires root or `CAP_BPF`) |
+| Use a bpf-next QEMU guest | append `--qemu-dir <share-dir>` |
+| Reduce one finding | `cargo run --bin reduce -- <finding-dir>` |
+| Reduce a QEMU-backed finding | `cargo run --bin reduce -- <finding-dir> --qemu-dir <share-dir> --strict --kernel` |
+| Record mini drift | `cargo run --bin drift -- --record --mini-only <snapshot.json>` |
+| Compare drift snapshots | `cargo run --bin drift -- --compare <base.json> --new <snapshot.json>` |
+| Verify abstract operators | `cargo run --bin smt_verify -- [--catalog <path>]` |
+| Synthesize precision witnesses | `cargo run --bin witness_synth -- [--out-dir <dir>]` |
+
+Build all binaries with:
+
+```sh
+cargo build --release
+```
+
+The SMT binaries require the Z3 development library. On Debian/Ubuntu, install `libz3-dev` before building.
+
+## Verdict semantics
+
+The fuzzer keeps the following distinctions explicit:
+
+- `ConcreteSide::Unsafe` is a witness, not a statistical signal.
+- `ConcreteSide::Safe` is bounded evidence and never a proof by itself.
+- `SpecSide::Inconclusive` means that the independent spec does not model the program surface; it is not a finding.
+- `KernelUnsoundCandidate` requires kernel accept, spec reject, and no concrete unsafe witness.
+- `KernelOverstrictCandidate` requires kernel reject, spec accept, and no concrete unsafe witness.
+- Mini-only disagreements are reported as model gaps or rand-verifier bugs according to the concrete and kernel sides.
+- Known privilege and design differences are handled by the shared whitelist rather than by silently changing the verdict.
+
+Finding metadata preserves the mini, concrete, kernel, and spec sides so that reduction can preserve the original classification. Older finding directories without a spec field are loaded as `Inconclusive` on the spec axis.
+
+## Test corpus
+
+`tests/programs/` contains raw `struct bpf_insn` fixtures. The accept and reject directories cover ALU32/64, tnum refinement, stack access, pointers, maps, calls, references, dynptrs, kfuncs, control flow, and convergence limits. Map-backed programs use a sibling `.maps` sidecar to describe the map registry used during loading.
+
+Run the complete local suite with:
+
+```sh
+cargo test
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+```
 
 ## Roadmap
 
-### Stage 1 — Model fidelity
+The first model-fidelity milestone is complete. The current focus is the independent-oracle and operator-verification path:
 
-Deepen the abstract state model toward the kernel verifier's. Priority order, and after every step the differential fuzzer runs to compare verdicts and state counts (false reject / false accept / state-count drift):
+1. keep the spec, SMT, fuzzer, reducer, and drift contracts stable;
+2. extend the kernel surface with `const_fold` and static stack-liveness experiments;
+3. use the generated precision witnesses to drive focused model and upstream-quality tests;
+4. later expand the runtime/JIT differential axis and syzkaller integration.
 
-1. **State pruning** — parent states, register/stack liveness, `regsafe()` / `states_equal()` structure, dead-state pruning. ✅
-2. **Precision tracking** — `precise` bit, instruction dependency tracking, precision backtracking. ✅
-3. **Register/pointer realism** — `id` / `parent_id` / provenance, fixed/variable offsets, nullable pointer aliasing, `tnum` + `cnum32/cnum64`. ✅ (issue #99: ids, linked refinement, nullable aliasing, parent_id-derived invalidation; the 32/64-bit subreg id counters are a documented sound over-approximation — ALU32 clears the id)
-4. **Stack / call frames** — byte-level stack state (per-byte slot types, partial-width spill/fill, sign-extending loads), spill/fill metadata, BPF-to-BPF calls, multiple verifier frames. ✅ (issue #100)
-5. **Modern verifier features** — BTF pointers, kfunc, ref acquire/release, dynptr / kptr / iterator. ✅ (issue #101: ref tracking for the ringbuf acquire/release family, STACK_DYNPTR slots with the dynptr helper family, a vmlinux-BTF-keyed kfunc table with argument validation and PTR_TO_BTF_ID acquire/release; kptr map-value slots and the iterator family remain outside the modeled program surface)
-
-Beyond finding bugs, this model doubles as a **drift-monitoring oracle**: re-verify the corpus and fuzz pool against every bpf-next rc in qemu, and report verdict / state-count / processed-insn regressions to maintainers early.
-
-### Stage 2 — Oracle replacement and surface expansion
-
-The mini-vs-kernel-vs-concrete triangle saturates: mini is a small subset of the kernel, so most discrepancies are model gaps, and real kernel bugs only surface in the kernel's own machinery (speculation, const_fold). The next moves change the oracle, not just the model:
-
-1. **Spec-based oracle fuzzing (Veritas-style)** — replace the differential oracle with an independent safety spec in Z3/Dafny and fuzz the kernel against it. The fuzzer/reducer/triage infrastructure carries over as-is. ([Veritas](https://rs3lab.github.io/assets/papers/2025/lyu%3Averitas.pdf), [SEV](https://www.usenix.org/system/files/osdi24-sun-hao.pdf))
-2. **Per-operator SMT verification + precision synthesis (Agni-style)** — verify the tnum/range operators with SMT and synthesize concrete precision witnesses; the more-precise `bpf_mul` upstream merge is the precedent for this contribution route. ([Agni](https://people.cs.rutgers.edu/~sn624/papers/agni-cav23.pdf), [Differential Synthesis](https://www.researchwithrutgers.org/en/publications/comparing-theprecision-ofabstract-operators-intheebpf-verifier-us/))
-3. **New kernel surface: const_fold / static stack liveness** — newly merged rewriting passes are a classic bug source; port const_fold into mini for fold/no-fold verdict diffs and run on/off qemu campaigns. ([LWN](https://lwn.net/Articles/1065872/))
-4. **Runtime / JIT fuzzing** — extend past the verifier: use the concrete interpreter as a JIT-vs-interpreter differential oracle, and syzkaller with KCOV for `bpf()` syscall fuzzing. ([BRF](https://ics.uci.edu/~ardalan/papers/Hung_FSE24.pdf), [Jitterbug](https://www.usenix.org/conference/osdi20/presentation/nelson))
+The detailed project plan is in [`docs/ROADMAP.md`](docs/ROADMAP.md). Operational notes and the upstream contribution workflow are kept under `docs/`.
 
 ## License
 
