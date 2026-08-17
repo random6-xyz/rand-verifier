@@ -7,12 +7,14 @@ Encoding: kernel `struct bpf_insn` (8 bytes per instruction):
 `[code, (src_reg << 4 | dst_reg), off_le16, imm_le32]` — the same encoding
 clang and the kernel selftests emit (issue #56).
 
-All programs are verified with the full pipeline (nano structural checks +
-mini path exploration — the most advanced pass). Since v0.5 the pipeline
-additionally runs every program through the concrete interpreter and checks
-that the abstract states cover the concrete reachable states (issues #49–#54).
-Helper calls are `BPF_JMP|BPF_CALL` with the helper id in the immediate
-(kernel convention); BPF-to-BPF calls (`BPF_PSEUDO_CALL`) are not supported.
+All programs are verified with the full pipeline (structural checks + mini
+path exploration). Every fixture is also checked by the concrete witness
+interpreter, and accept fixtures require abstract-state coverage of concrete
+reachable states. The independent safety spec is exercised by library
+regression tests and the fuzzer oracle. Helper calls are
+`BPF_JMP|BPF_CALL` with the helper id in the immediate (kernel convention);
+BPF-to-BPF calls (`BPF_PSEUDO_CALL`) are supported by the model and covered by
+`subprog_call`.
 
 ## Opcode map (real eBPF ISA)
 
@@ -53,10 +55,12 @@ cleared: `0x15` = `if rX == imm goto +off`, `0x55` (JNE), `0x25` (JGT),
 `0x35` (JGE), `0xa5` (JLT), `0xb5` (JLE), `0x65` (JSGT), `0x75` (JSGE),
 `0xc5` (JSLT), `0xd5` (JSLE) — issue #57.
 
-## Concrete execution (v0.5)
+## Concrete execution and independent spec
 
 The same programs are also executed with real values and the results are
-checked against the abstract verifier state (Phase 2). Execution model:
+checked against the abstract verifier state. The independent spec uses a
+separate interval/type/state model and returns `Inconclusive` for unsupported
+surfaces. Concrete execution model:
 
 - fixed virtual addresses: `R10 = STACK_BASE` (`0x1000`), `R1 = CTX_BASE`
   (`0x2000`); the 512-byte frame spans `0x0E00..0x1000`
