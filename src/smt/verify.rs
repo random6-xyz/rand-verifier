@@ -472,6 +472,8 @@ pub enum RangeOp {
     Add,
     Sub,
     Mul,
+    Or,
+    Xor,
 }
 
 /// The interval arithmetic at a given bit width (the 64-bit
@@ -512,6 +514,8 @@ fn range_op_w(op: RangeOp, a: (u64, u64), b: (u64, u64), width: u32) -> (u64, u6
                 (0, wmask)
             }
         }
+        RangeOp::Or => (a.0.max(b.0) & wmask, wmask),
+        RangeOp::Xor => (0, wmask),
     }
 }
 
@@ -523,6 +527,8 @@ pub fn exhaustive_range_binary(op: RangeOp, width: u32) -> Vec<Violation> {
         RangeOp::Add => "range_add",
         RangeOp::Sub => "range_sub",
         RangeOp::Mul => "range_mul",
+        RangeOp::Or => "range_or",
+        RangeOp::Xor => "range_xor",
     };
     let mut violations = Vec::new();
     let max = if width == 64 {
@@ -544,6 +550,8 @@ pub fn exhaustive_range_binary(op: RangeOp, width: u32) -> Vec<Violation> {
                                 RangeOp::Add => x.wrapping_add(y) & max,
                                 RangeOp::Sub => x.wrapping_sub(y) & max,
                                 RangeOp::Mul => x.wrapping_mul(y) & max,
+                                RangeOp::Or => (x | y) & max,
+                                RangeOp::Xor => (x ^ y) & max,
                             };
                             if r < rlo || r > rhi {
                                 violations.push(Violation {
@@ -575,12 +583,14 @@ pub fn exhaustive_range_binary(op: RangeOp, width: u32) -> Vec<Violation> {
 /// Symbolic 64-bit soundness check of the range operators: the SMT
 /// encodings (src/smt/range.rs) must contain the concrete result.
 pub fn symbolic_range_binary(op: RangeOp, limit: usize) -> Vec<Violation> {
-    use super::range::{SymRange, encode_uadd, encode_umul, encode_usub};
+    use super::range::{SymRange, encode_uadd, encode_umul, encode_uor, encode_usub, encode_uxor};
     type Encoder = fn(&SymRange, &SymRange) -> (BV, BV);
     let (name, encode): (&str, Encoder) = match op {
         RangeOp::Add => ("range_add", encode_uadd),
         RangeOp::Sub => ("range_sub", encode_usub),
         RangeOp::Mul => ("range_mul", encode_umul),
+        RangeOp::Or => ("range_or", encode_uor),
+        RangeOp::Xor => ("range_xor", encode_uxor),
     };
     let cfg = Config::new();
     let mut violations = Vec::new();
@@ -606,6 +616,8 @@ pub fn symbolic_range_binary(op: RangeOp, limit: usize) -> Vec<Violation> {
                 RangeOp::Add => x.bvadd(&y),
                 RangeOp::Sub => x.bvsub(&y),
                 RangeOp::Mul => x.bvmul(&y),
+                RangeOp::Or => x.bvor(&y),
+                RangeOp::Xor => x.bvxor(&y),
             };
             let contained = Bool::and(&[&r.bvuge(&rlo), &r.bvule(&rhi)]);
             solver.assert(contained.not());
@@ -648,11 +660,15 @@ pub fn random_range_binary(op: RangeOp, pairs: usize, members_per_pair: usize) -
         RangeOp::Add => crate::spec::value::rng_add,
         RangeOp::Sub => crate::spec::value::rng_sub,
         RangeOp::Mul => crate::spec::value::rng_mul,
+        RangeOp::Or => crate::spec::value::rng_or,
+        RangeOp::Xor => crate::spec::value::rng_xor,
     };
     let name = match op {
         RangeOp::Add => "range_add",
         RangeOp::Sub => "range_sub",
         RangeOp::Mul => "range_mul",
+        RangeOp::Or => "range_or",
+        RangeOp::Xor => "range_xor",
     };
     let mut rng = rand_like::XorShift(0x8A11_2026_0817);
     let mut violations = Vec::new();
@@ -669,6 +685,8 @@ pub fn random_range_binary(op: RangeOp, pairs: usize, members_per_pair: usize) -
                 RangeOp::Add => x.wrapping_add(y),
                 RangeOp::Sub => x.wrapping_sub(y),
                 RangeOp::Mul => x.wrapping_mul(y),
+                RangeOp::Or => x | y,
+                RangeOp::Xor => x ^ y,
             };
             if r < rlo || r > rhi {
                 violations.push(Violation {

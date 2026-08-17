@@ -77,6 +77,17 @@ pub(crate) fn encode_umul(a: &SymRange, b: &SymRange) -> (BV, BV) {
     )
 }
 
+/// Encodes `rng_or` (src/spec/value.rs): `[max(a0, b0), MAX]`.
+pub(crate) fn encode_uor(a: &SymRange, b: &SymRange) -> (BV, BV) {
+    let lo = Bool::ite(&a.lo.bvugt(&b.lo), &a.lo, &b.lo);
+    (lo, BV::from_u64(u64::MAX, 64))
+}
+
+/// Encodes `rng_xor` (src/spec/value.rs): `[0, MAX]`.
+pub(crate) fn encode_uxor(_a: &SymRange, _b: &SymRange) -> (BV, BV) {
+    (BV::from_u64(0, 64), BV::from_u64(u64::MAX, 64))
+}
+
 #[cfg(test)]
 /// Encodes `rng_and` (src/spec/value.rs): `[0, min(a1, b1)]`.
 pub(crate) fn encode_uand(a: &SymRange, b: &SymRange) -> (BV, BV) {

@@ -133,10 +133,13 @@ pub fn rng_and(a: Range, b: Range) -> Range {
     (0, a.1.min(b.1))
 }
 
-/// Bitwise OR: the result is at least each operand's minimum (bit
-/// setting never clears), upper bound is the full range.
+/// Bitwise OR: `x|y >= max(x,y)` for every pair (OR never clears
+/// bits), so the sound lower bound is `max(a.0, b.0)`; the upper
+/// bound stays the full range. (`a.0 | b.0` is unsound: a=(3,100),
+/// b=(4,4) yields 4, and 4 < 3|4=7 — caught by the soundness harness,
+/// issue #116.)
 pub fn rng_or(a: Range, b: Range) -> Range {
-    (a.0 | b.0, u64::MAX)
+    (a.0.max(b.0), u64::MAX)
 }
 
 /// Bitwise XOR on intervals: only the coarse bounds are sound.
@@ -251,7 +254,8 @@ mod tests {
     #[test]
     fn range_bitwise() {
         assert_eq!(rng_and((0, 255), (0, 15)), (0, 15));
-        assert_eq!(rng_or((8, 8), (1, 2)), (9, u64::MAX));
+        // x|y >= max(x,y): the lower bound is max, not the bitwise OR
+        assert_eq!(rng_or((8, 8), (1, 2)), (8, u64::MAX));
         assert_eq!(rng_xor((0, 1), (0, 1)), (0, u64::MAX));
     }
 

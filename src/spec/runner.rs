@@ -1909,22 +1909,26 @@ fn alu_range(op: Op, d: Range2, s: Range2) -> Range2 {
         Op::Or => rng_or(d, s),
         Op::Xor => rng_xor(d, s),
         Op::Lsh => {
+            // a non-constant amount, or one that may reach the width,
+            // makes the result unbounded — exactly like the kernel's
+            // scalar_min_max_lsh ("if we might shift our top bit out,
+            // then we know nothing"; mseed-20260815-* empirical)
             if s.0 != s.1 || s.0 >= 64 {
-                (0, 0)
+                (0, u64::MAX)
             } else {
                 rng_lsh(d, s.0 as u32)
             }
         }
         Op::Rsh => {
             if s.0 != s.1 || s.0 >= 64 {
-                (0, 0)
+                (0, u64::MAX)
             } else {
                 rng_rsh(d, s.0 as u32)
             }
         }
         Op::Arsh => {
             if s.0 != s.1 || s.0 >= 64 {
-                (0, 0)
+                (0, u64::MAX)
             } else {
                 rng_arsh(d, s.0 as u32)
             }
