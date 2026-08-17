@@ -244,6 +244,11 @@ impl BpfVerifierEnv {
     /// error — it is returned as Ok(Verdict::Unsafe). The verdict is
     /// unchanged by the concrete side: an unsoundness is a model bug
     /// and is reported via [`BpfVerifierEnv::concrete_report_text`].
+    /// The registered maps (fd → info) — used by the spec axis (#113).
+    pub fn maps(&self) -> &HashMap<u32, MapInfo> {
+        &self.maps
+    }
+
     pub fn program_insns(&self) -> &[BpfInsn] {
         &self.prog.insns
     }

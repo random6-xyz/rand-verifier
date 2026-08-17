@@ -28,7 +28,7 @@ use crate::fuzz::reduce::replay::{Baseline, ReduceError, Sides, evaluate_bytes, 
 use crate::insn::parse_insn;
 
 /// The reducer configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReduceConfig {
     /// Max oracle checks (`0` = unlimited).
     pub budget: usize,
@@ -37,6 +37,9 @@ pub struct ReduceConfig {
     pub kernel: bool,
     /// Strict mode: the kernel ran with unprivileged-equivalent rules.
     pub strict: bool,
+    /// Kernel verdicts via a qemu guest's 9p share instead of a host
+    /// bpf() syscall (issue #114: no host privileges needed).
+    pub qemu_dir: Option<std::path::PathBuf>,
 }
 
 /// One timeline entry: the pass that produced the program and the
@@ -66,12 +69,16 @@ pub fn reduce_finding(
     out_dir: &Path,
     config: &ReduceConfig,
 ) -> Result<ReduceReport, ReduceError> {
-    let baseline = load_and_replay(dir, config.kernel, config.strict)?;
+    let mut qemu = config
+        .qemu_dir
+        .clone()
+        .map(|d| crate::fuzz::qemu::QemuBatch::new(d, config.strict));
+    let baseline = load_and_replay(dir, config.kernel, config.strict, qemu.as_mut())?;
     let original = read_prog(dir)?;
 
     // the oracle: the candidate must re-classify to the finding
     let mut oracle = |bytes: &[u8]| -> bool {
-        match evaluate_bytes(bytes, config.kernel, config.strict) {
+        match evaluate_bytes(bytes, config.kernel, config.strict, qemu.as_mut()) {
             Ok(sides) => baseline
                 .invariant
                 .preserves(&baseline.spec.name, &sides, config.strict),
@@ -132,7 +139,7 @@ pub fn reduce_finding(
 
     // mandatory final re-check: the reduced program must still exhibit
     // the finding — anything else is a reducer bug
-    let final_sides = evaluate_bytes(&current, config.kernel, config.strict)?;
+    let final_sides = evaluate_bytes(&current, config.kernel, config.strict, qemu.as_mut())?;
     if !baseline
         .invariant
         .preserves(&baseline.spec.name, &final_sides, config.strict)
@@ -375,6 +382,7 @@ mod tests {
                 budget: 0,
                 kernel: false,
                 strict: false,
+                qemu_dir: None,
             },
         )
         .unwrap();
@@ -418,6 +426,7 @@ mod tests {
                 budget: 0,
                 kernel: false,
                 strict: false,
+                qemu_dir: None,
             },
         )
         .unwrap_err();
@@ -442,6 +451,7 @@ mod tests {
                 budget: 0,
                 kernel: false,
                 strict: false,
+                qemu_dir: None,
             },
         )
         .unwrap();
@@ -452,6 +462,7 @@ mod tests {
                 budget: 0,
                 kernel: false,
                 strict: false,
+                qemu_dir: None,
             },
         )
         .unwrap();
@@ -476,6 +487,7 @@ mod tests {
                 budget: 3,
                 kernel: false,
                 strict: false,
+                qemu_dir: None,
             },
         )
         .unwrap();

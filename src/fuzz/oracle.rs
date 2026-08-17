@@ -15,6 +15,31 @@ use crate::concrete::{ConcreteFailure, ConcreteReport, ConcreteVerdict};
 use crate::diff::{SideVerdict, whitelisted};
 use crate::env::BpfVerifierEnv;
 use crate::klog::ReasonCategory;
+use crate::spec::{SpecVerdict, verify_spec};
+
+/// The spec side of one program — the fourth verdict axis (issue
+/// #113): the independent safety spec (src/spec) either accepts,
+/// rejects, or cannot judge (the program uses a surface the spec does
+/// not model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecSide {
+    /// The spec found no safety violation.
+    Accept,
+    /// The spec found a safety violation.
+    Reject,
+    /// The spec could not produce a verdict (unknown helper,
+    /// unsupported surface) — a non-finding.
+    Inconclusive,
+}
+
+/// Map the spec runner's verdict onto the oracle axis.
+pub fn spec_side(verdict: &SpecVerdict) -> SpecSide {
+    match verdict {
+        SpecVerdict::Accept => SpecSide::Accept,
+        SpecVerdict::Reject(_) => SpecSide::Reject,
+        SpecVerdict::Inconclusive => SpecSide::Inconclusive,
+    }
+}
 
 /// The concrete side of one program — the oracle's witness axis (a
 /// concrete failure is a real unsafe witness; a clean run is bounded
@@ -48,6 +73,15 @@ pub enum Finding {
     /// found no unsafe witness for. A candidate: `concrete SAFE` is
     /// evidence, not a proof of safety.
     PrecisionCandidate,
+    /// 🚨 Kernel ACCEPT + spec REJECT (concrete SAFE) — the spec's
+    /// independent safety judgment says the kernel accepted an unsafe
+    /// program (#113): a soundness candidate backed by the spec, not
+    /// by mini's model.
+    KernelUnsoundCandidate,
+    /// 🎯 Kernel REJECT + spec ACCEPT (concrete SAFE) — the spec
+    /// judged the program safe while the kernel rejected it (#113): a
+    /// precision candidate backed by the spec.
+    KernelOverstrictCandidate,
     /// 🚨 Kernel ACCEPT + concrete UNSAFE — the v1.0 target: the kernel
     /// accepts a program with a genuine unsafe witness. Saved
     /// separately.
@@ -78,6 +112,8 @@ impl Finding {
     pub fn name(&self) -> &'static str {
         match self {
             Finding::PrecisionCandidate => "precision-candidate",
+            Finding::KernelUnsoundCandidate => "kernel-unsound-candidate",
+            Finding::KernelOverstrictCandidate => "kernel-overstrict-candidate",
             Finding::SoundnessCandidate => "soundness-candidate",
             Finding::RvPrecisionGap => "rv-precision-gap",
             Finding::RvSoundnessBug => "rv-soundness-bug",
@@ -94,6 +130,8 @@ impl Finding {
         matches!(
             self,
             Finding::PrecisionCandidate
+                | Finding::KernelUnsoundCandidate
+                | Finding::KernelOverstrictCandidate
                 | Finding::SoundnessCandidate
                 | Finding::RvPrecisionGap
                 | Finding::RvSoundnessBug
@@ -119,6 +157,9 @@ pub struct OracleInput<'a> {
     /// The kernel side (`diff::kernel_side`), `Skipped` when the kernel
     /// was not consulted (unprivileged runs).
     pub kernel: &'a SideVerdict,
+    /// The spec side (`spec_side` of `verify_spec`); `Inconclusive`
+    /// when the program uses a surface the spec does not model (#113).
+    pub spec: SpecSide,
     /// The kernel rejection message, when the kernel rejected — the
     /// strict-mode whitelist keys off the literal "for !root" suffix
     /// the kernel prints for unprivileged-only design rules (e.g.
@@ -144,7 +185,28 @@ pub fn classify(input: &OracleInput) -> Finding {
         kernel,
         kernel_reason,
         strict,
+        spec,
     } = input;
+    // the spec axis (issue #113) augments the three-axis matrix:
+    // spec REJECT + kernel ACCEPT = kernel-unsound candidate, spec
+    // ACCEPT + kernel REJECT = kernel-overstrict candidate. The spec
+    // only judges programs inside its modeled surface; `Inconclusive`
+    // keeps the classic three-axis rules untouched. Precedence stays
+    // model bugs > soundness > precision (the concrete witness axis
+    // outranks the spec's static judgment).
+    if matches!(spec, SpecSide::Reject)
+        && matches!(concrete, ConcreteSide::Safe)
+        && matches!(kernel, SideVerdict::Accept)
+    {
+        // a kernel-accepts pair stays whitelisted when it is a known
+        // design difference (privileged leniency etc.)
+        if whitelisted(name, mini, kernel, *mini_reason).is_some()
+            || crate::diff::privileged_stack_leniency(mini, *mini_reason)
+        {
+            return Finding::Whitelisted;
+        }
+        return Finding::KernelUnsoundCandidate;
+    }
     match concrete {
         ConcreteSide::Inconclusive => Finding::Inconclusive,
         ConcreteSide::Unsafe => match mini {
@@ -169,6 +231,8 @@ pub fn classify(input: &OracleInput) -> Finding {
             SideVerdict::Skipped => Finding::Skipped,
             SideVerdict::Accept => match mini {
                 SideVerdict::Reject { .. } => {
+                    // (the spec-Reject variant of this pair was
+                    // already returned by the top branch above)
                     if whitelisted(name, mini, kernel, *mini_reason).is_some() {
                         Finding::Whitelisted
                     } else {
@@ -178,10 +242,6 @@ pub fn classify(input: &OracleInput) -> Finding {
                 _ => Finding::Agree,
             },
             SideVerdict::Reject { category } => {
-                // name-based diff whitelist (kernel-accepts fixtures)
-                if whitelisted(name, mini, kernel, *mini_reason).is_some() {
-                    return Finding::Whitelisted;
-                }
                 // both sides reject — the kernel is not rejecting a
                 // concretely safe program the way rand-verifier sees
                 // it; different categories just mean the two verifiers
@@ -259,6 +319,13 @@ pub fn classify(input: &OracleInput) -> Finding {
                 {
                     return Finding::Whitelisted;
                 }
+                // spec ACCEPT + kernel REJECT: the independent spec
+                // judged the program safe — a kernel over-strictness
+                // candidate (it outranks the classic precision
+                // candidate, which rests on mini alone; #113)
+                if matches!(spec, SpecSide::Accept) {
+                    return Finding::KernelOverstrictCandidate;
+                }
                 Finding::PrecisionCandidate
             }
         },
@@ -318,6 +385,9 @@ pub fn classify_env(
             return Finding::Whitelisted;
         }
     }
+    // the spec axis (#113): run the independent safety spec on the
+    // decoded program
+    let spec = spec_side(&verify_spec(env.program_insns(), &env.maps));
     classify(&OracleInput {
         name,
         mini,
@@ -326,6 +396,7 @@ pub fn classify_env(
         kernel,
         kernel_reason,
         strict,
+        spec,
     })
 }
 
@@ -363,6 +434,18 @@ mod tests {
         name: &str,
         strict: bool,
     ) -> Finding {
+        classify_with_spec(mini, concrete, kernel, name, strict, SpecSide::Inconclusive)
+    }
+
+    /// `classify_with` plus an explicit spec verdict (#113).
+    fn classify_with_spec(
+        mini: SideVerdict,
+        concrete: ConcreteSide,
+        kernel: SideVerdict,
+        name: &str,
+        strict: bool,
+        spec: SpecSide,
+    ) -> Finding {
         classify(&OracleInput {
             name,
             mini: &mini,
@@ -371,6 +454,7 @@ mod tests {
             kernel: &kernel,
             kernel_reason: None,
             strict,
+            spec,
         })
     }
 
@@ -391,6 +475,7 @@ mod tests {
             kernel: &kernel,
             kernel_reason,
             strict,
+            spec: SpecSide::Inconclusive,
         })
     }
 
@@ -459,6 +544,121 @@ mod tests {
         );
         assert_eq!(
             classify_with_kernel_reason(acc(), ConcreteSide::Safe, rej(s), reason, false),
+            Finding::PrecisionCandidate
+        );
+    }
+
+    /// The spec axis (#113): spec REJECT + kernel ACCEPT is a
+    /// kernel-unsound candidate; spec ACCEPT + kernel REJECT is a
+    /// kernel-overstrict candidate; an inconclusive spec keeps the
+    /// classic rules.
+    #[test]
+    fn classify_matrix_with_spec() {
+        let u = ReasonCategory::UninitRead;
+        let acc = || SideVerdict::Accept;
+        let rej = || SideVerdict::Reject { category: u };
+        // spec REJECT + kernel ACCEPT (concrete safe, mini accept) →
+        // kernel-unsound candidate
+        assert_eq!(
+            classify_with_spec(
+                acc(),
+                ConcreteSide::Safe,
+                acc(),
+                "p",
+                false,
+                SpecSide::Reject
+            ),
+            Finding::KernelUnsoundCandidate
+        );
+        // ... even when mini also rejects (spec independently agrees)
+        assert_eq!(
+            classify_with_spec(
+                rej(),
+                ConcreteSide::Safe,
+                acc(),
+                "p",
+                false,
+                SpecSide::Reject
+            ),
+            Finding::KernelUnsoundCandidate
+        );
+        // the name whitelist outranks the spec axis
+        assert_eq!(
+            classify_with_spec(
+                rej(),
+                ConcreteSide::Safe,
+                acc(),
+                "stack_write_before_read",
+                false,
+                SpecSide::Reject
+            ),
+            Finding::Whitelisted
+        );
+        // the concrete witness axis outranks the spec: a concretely
+        // unsafe program is a model bug, not a spec finding
+        assert_eq!(
+            classify_with_spec(
+                acc(),
+                ConcreteSide::Unsafe,
+                acc(),
+                "p",
+                false,
+                SpecSide::Reject
+            ),
+            Finding::RvSoundnessBug
+        );
+        // spec ACCEPT + kernel REJECT (concrete safe, mini accept) →
+        // kernel-overstrict candidate (outranks precision-candidate)
+        assert_eq!(
+            classify_with_spec(
+                acc(),
+                ConcreteSide::Safe,
+                rej(),
+                "p",
+                false,
+                SpecSide::Accept
+            ),
+            Finding::KernelOverstrictCandidate
+        );
+        // both sides reject: the classic whitelisted rules stay (the
+        // spec does not override a mini+spec double reject against the
+        // kernel)
+        assert_eq!(
+            classify_with_spec(
+                rej(),
+                ConcreteSide::Safe,
+                rej(),
+                "p",
+                false,
+                SpecSide::Accept
+            ),
+            Finding::Whitelisted
+        );
+        // inconclusive spec → classic rules
+        assert_eq!(
+            classify_with_spec(
+                acc(),
+                ConcreteSide::Safe,
+                rej(),
+                "p",
+                false,
+                SpecSide::Inconclusive
+            ),
+            Finding::PrecisionCandidate
+        );
+        // kernel REJECT + spec REJECT + concrete safe + mini accept →
+        // precision candidate (spec agrees with the kernel, but the
+        // kernel-side rejection of a concretely safe program stays a
+        // precision candidate — the classic path)
+        assert_eq!(
+            classify_with_spec(
+                acc(),
+                ConcreteSide::Safe,
+                rej(),
+                "p",
+                false,
+                SpecSide::Reject
+            ),
             Finding::PrecisionCandidate
         );
     }
@@ -696,6 +896,7 @@ mod tests {
                     kernel: &kernel,
                     kernel_reason: None,
                     strict: false,
+                    spec: SpecSide::Inconclusive,
                 });
                 match dir {
                     "tests/programs/accept" => assert_eq!(finding, Finding::Agree, "{name}"),

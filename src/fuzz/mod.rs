@@ -6,6 +6,7 @@ pub mod insn_lib;
 pub mod mutator;
 pub mod oracle;
 pub(crate) mod prng;
+pub mod qemu;
 pub mod reduce;
 pub mod triage;
 
