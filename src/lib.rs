@@ -34,6 +34,7 @@ pub mod klog;
 pub mod krun;
 pub mod liveness;
 pub mod mini;
+#[cfg(feature = "smt")]
 pub mod smt;
 pub mod spec;
 pub mod state;

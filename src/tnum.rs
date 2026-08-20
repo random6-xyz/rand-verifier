@@ -82,6 +82,7 @@ impl Tnum {
     /// multiplication over the bits of `a`; when the LSB of `a` is
     /// uncertain the accumulator takes the union of both partial
     /// products (LSB 0 and LSB 1).
+    #[cfg(feature = "smt")]
     pub(crate) fn mul(self, other: Tnum) -> Self {
         let mut acc = Tnum::constant(0);
         let mut a = self;
@@ -197,6 +198,7 @@ impl Tnum {
     /// value. (`value | value; mask | mask` is NOT the union: it
     /// drops members — e.g. `union({0}, {1})` would return `{1}` —
     /// found by the SMT soundness harness, issue #116.)
+    #[cfg(feature = "smt")]
     pub(crate) fn union(self, other: Tnum) -> Self {
         let v = self.value & other.value;
         let mu = (self.value ^ other.value) | self.mask | other.mask;

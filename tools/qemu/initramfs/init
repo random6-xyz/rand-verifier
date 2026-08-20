@@ -1,0 +1,60 @@
+#!/bin/sh
+# tools/qemu/initramfs/init — PID 1 for the rand-verifier qemu guest.
+#
+# The guest kernel column runs this as the initramfs init. It mounts the
+# 9p share (mount_tag=host) at /mnt/host and then loops: whenever the
+# host writes `run.sh` into the share, run it and remove it. The host
+# (src/fuzz/qemu.rs) writes batches of `job/<name>.bin`, the run.sh
+# script (QEMU_RUN_SCRIPT) calls `/sbin/agent` on each, the agent loads
+# it into the real bpf-next kernel verifier and writes the verdict to
+# `out/<name>.out`.
+#
+# Protocol notes (see src/fuzz/qemu.rs):
+#   * guest-ready : marker the host polls to know the guest booted
+#   * strict      : optional marker; run.sh reads it to pass --strict
+#   * run.sh      : host writes last; the guest runs it exactly once
+#   * poweroff    : marker; when present the guest powers off
+#
+# This is a plain busybox initramfs: no /sbin/init, no inittab.
+
+# mount the minimal filesystems
+/bin/mount -t proc none /proc 2>/dev/null
+/bin/mount -t sysfs none /sys 2>/dev/null
+/bin/mount -t devtmpfs none /dev 2>/dev/null
+/bin/mkdir -p /dev/pts /dev/shm /mnt/host
+/bin/mount -t devpts none /dev/pts 2>/dev/null
+/bin/mount -t tmpfs none /dev/shm 2>/dev/null
+
+# 9p share — the kernel column protocol transport. security_model=none
+# means the host files appear as root-owned; job/ and out/ are world
+# writable on the host side.
+/bin/mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host 2>/dev/null
+
+# announce readiness: the host boot script polls for this file
+/bin/touch /mnt/host/guest-ready
+
+# busybox-initramfs has no shell prompt; attach stdio to the console
+exec 0</dev/console
+exec 1>/dev/console
+exec 2>/dev/console
+
+echo "rand-verifier guest init: ready, waiting for run.sh"
+
+# main loop: run run.sh exactly once per write, poweroff on request
+while :; do
+    if [ -f /mnt/host/poweroff ]; then
+        echo "rand-verifier guest: poweroff requested"
+        /bin/poweroff -f
+        break
+    fi
+    if [ -f /mnt/host/run.sh ]; then
+        # run the batch (QEMU_RUN_SCRIPT); the host clears run.sh when
+        # the batch is done — we just run it and remove it here.
+        /bin/sh /mnt/host/run.sh
+        /bin/rm -f /mnt/host/run.sh
+    fi
+    /bin/sleep 1
+done
+
+# unreachable unless poweroff fails
+/bin/poweroff -f

@@ -10,4 +10,16 @@ libc = "0.2"
 # map registry sidecar parsing (#89)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-z3 = "0.20.2"
+# SMT operator verification is optional so the qemu guest agent can
+# build as a static musl binary WITHOUT z3 (the guest initramfs has no
+# libz3). Enable with the `smt` feature (default on for local dev/CI):
+#   cargo build --release                          # smt on (z3 linked)
+#   cargo build --release --no-default-features --features agent-musl \
+#       --target x86_64-unknown-linux-musl --bin agent
+z3 = { version = "0.20.2", optional = true }
+
+[features]
+default = ["smt"]
+smt = ["dep:z3"]
+# Builds the qemu guest agent as a static musl binary without z3/SMT.
+agent-musl = []
