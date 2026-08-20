@@ -27,31 +27,47 @@
 
 # 9p share — the kernel column protocol transport. security_model=none
 # means the host files appear as root-owned; job/ and out/ are world
-# writable on the host side.
-/bin/mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host 2>/dev/null
-
-# announce readiness: the host boot script polls for this file
-/bin/touch /mnt/host/guest-ready
+# writable on the host side. cache=none is REQUIRED: without it the 9p
+# client caches directory/attribute state and the guest misses files
+# the host creates after boot (run.sh, job/*.bin), which surfaces as
+# REJECT cannot-read job file errno=2 / "<no file>" from the host poll.
+# access=any disables the guest-side permission check so files owned
+# by the host user are readable by the (root) guest even when the 9p
+# server reports non-root ownership (EACCES errno=13 otherwise).
+/bin/mount -t 9p -o trans=virtio,version=9p2000.L,cache=none,access=any host /mnt/host 2>/dev/null
 
 # busybox-initramfs has no shell prompt; attach stdio to the console
+# BEFORE announcing readiness so boot errors are visible on the console.
 exec 0</dev/console
 exec 1>/dev/console
 exec 2>/dev/console
 
 echo "rand-verifier guest init: ready, waiting for run.sh"
 
-# main loop: run run.sh exactly once per write, poweroff on request
+# main loop: run run.sh exactly once per write, poweroff on request.
+# guest-ready is touched only after the loop is actually entered (after
+# the first sleep) so the host never starts the campaign while the
+# guest is still between mount and loop entry — that race left the
+# guest's first run.sh execution to find a job dir the host had
+# already cleared (REJECT cannot-read job file errno=2).
 while :; do
+    /bin/touch /mnt/host/guest-ready
+    /bin/sleep 1
     if [ -f /mnt/host/poweroff ]; then
         echo "rand-verifier guest: poweroff requested"
         /bin/poweroff -f
         break
     fi
-    if [ -f /mnt/host/run.sh ]; then
-        # run the batch (QEMU_RUN_SCRIPT); the host clears run.sh when
-        # the batch is done — we just run it and remove it here.
+    if [ -f /mnt/host/run.sh ] && [ -f /mnt/host/batch-ready ] && [ ! -f /mnt/host/batch-done ]; then
+        # run the batch (QEMU_RUN_SCRIPT). Reading the manifest and
+        # listing the job dir here forces the 9p client to refresh its
+        # cached view of the share before the script opens the job
+        # files — without this, the guest could see a stale (empty)
+        # job dir and the agent would fail to open fresh job files
+        # (REJECT cannot-read job file errno=2).
+        cat /mnt/host/manifest >/dev/null 2>&1
+        ls /mnt/host/job/ >/dev/null 2>&1
         /bin/sh /mnt/host/run.sh
-        /bin/rm -f /mnt/host/run.sh
     fi
     /bin/sleep 1
 done

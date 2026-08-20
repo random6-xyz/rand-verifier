@@ -39,16 +39,43 @@ pub const QEMU_BATCH: usize = 100;
 pub const QEMU_RUN_SCRIPT: &str = r###"#!/bin/sh
 STRICT=""
 [ -f /mnt/host/strict ] && STRICT="--strict"
-for f in /mnt/host/job/*.bin; do
-    [ -e "$f" ] || continue
-    b=$(basename "$f" .bin)
-    timeout 30 /sbin/agent "$f" $STRICT > "/mnt/host/out/$b.out" 2>&1
-    rc=$?
-    if [ $rc -eq 124 ]; then
-        echo "AGENT-TIMEOUT" > "/mnt/host/out/$b.out"
-    fi
-    rm -f "$f"
-done
+# Force a fresh 9p readdir of the job dir BEFORE reading the manifest:
+# the 9p client can serve a stale directory listing, so a job file
+# written just now may not appear in a glob yet. An explicit ls
+# refreshes the readdir cache so the manifest-driven opens below see
+# every file (stale listings surfaced as REJECT cannot-read job file
+# errno=2).
+ls -la /mnt/host/job/ > /mnt/host/out/.diag-jobls 2>&1
+ls /mnt/host/job/ >/dev/null 2>&1
+id > /mnt/host/out/.diag-id 2>&1
+ls -la /sbin/agent >> /mnt/host/out/.diag-id 2>&1
+id /sbin/agent >> /mnt/host/out/.diag-id 2>&1 || true
+# security_model=none can map host files to non-root guest ownership
+# even though we run as root, so make the batch world-readable/writable
+# before opening it (EACCES used to surface as cannot-read errno=13).
+chmod 777 /mnt/host/job /mnt/host/out 2>/dev/null
+for f in /mnt/host/job/*.bin; do chmod 666 "$f" 2>/dev/null; done
+# Process exactly the job files listed in /mnt/host/manifest (one name
+# per line). The manifest is a plain file the host writes AFTER all
+# job/*.bin are on disk, so we never depend on 9p directory readdir
+# visibility — the guest opens the manifest by path, which is reliable
+# even when readdir lags.
+if [ -f /mnt/host/manifest ]; then
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        f="/mnt/host/job/$name.bin"
+        [ -e "$f" ] || continue
+        timeout 30 /sbin/agent "$f" $STRICT > "/mnt/host/out/$name.out" 2>&1
+        rc=$?
+        if [ $rc -eq 124 ]; then
+            echo "AGENT-TIMEOUT" > "/mnt/host/out/$name.out"
+        fi
+        rm -f "$f"
+    done < /mnt/host/manifest
+fi
+# tell the host this batch is fully consumed. The host waits for every
+# out file, not for this marker, so a slow file cannot strand a job.
+touch /mnt/host/batch-done
 "###;
 
 /// Batch kernel-verdict queries to the qemu guest via the 9p share:
@@ -169,38 +196,80 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
         let _ = fs::remove_file(&strict_marker);
     }
 
-    // wait until the guest consumed the previous batch (job/ empty),
-    // then clear stale results
+    // wait until the guest consumed the previous batch: job/ empty AND
+    // the guest's run.sh has finished (batch-done marker). The marker
+    // closes the race where a slow guest is still processing the
+    // previous batch while we clear job/ and out/ below — that used to
+    // surface as REJECT cannot-read job file errno=2 for the tail of
+    // the next batch.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while job_has_files(&job) {
+    while job_has_files(&job) || dir.join("batch-done").exists() {
         if std::time::Instant::now() > deadline {
             eprintln!("qemu: previous batch never consumed; clearing job dir");
             clear_dir(&job);
+            let _ = fs::remove_file(dir.join("batch-done"));
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // stale markers from a previous batch would make the guest re-run
+    // the old run.sh, so clear them before writing anything
+    let _ = fs::remove_file(dir.join("batch-ready"));
+    let _ = fs::remove_file(dir.join("run.sh"));
+    let _ = fs::remove_file(dir.join("manifest"));
     clear_dir(&out);
 
-    // write the batch + the run script
+    // write the batch: job files, then a manifest listing them, then
+    // the run script + batch-ready marker. The guest reads the
+    // manifest by path (reliable) instead of globbing job/ (9p
+    // readdir can lag and miss fresh files).
     let mut ok = true;
+    let mut manifest = String::new();
     for (name, bytes, _) in pending.iter() {
-        if fs::write(job.join(format!("{name}.bin")), bytes).is_err() {
+        let p = job.join(format!("{name}.bin"));
+        if fs::write(&p, bytes).is_err() {
             ok = false;
             break;
         }
+        // security_model=none can surface host files to the guest with
+        // ownership the guest cannot read even as root (EACCES); force
+        // world-read/write so the guest agent can always open them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o666));
+        }
+        manifest.push_str(name);
+        manifest.push('\n');
+    }
+    if ok {
+        ok = fs::write(dir.join("manifest"), manifest.as_bytes()).is_ok();
     }
     if ok {
         ok = fs::write(dir.join("run.sh"), QEMU_RUN_SCRIPT).is_ok();
+    }
+    // batch-ready tells the guest that every job/*.bin and the
+    // manifest are on disk. The guest only runs run.sh when
+    // batch-ready exists, so it never sees a half-written batch.
+    if ok {
+        // give the 9p server a moment to settle the freshly written
+        // files (metadata/ownership) before the guest opens them;
+        // opening too early surfaced as EACCES (errno=13) even for
+        // world-readable files.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        ok = fs::write(dir.join("batch-ready"), b"1").is_ok();
     }
     if !ok {
         fail_all(pending, "qemu: cannot write batch");
         return;
     }
-    // poll until every job has its result and the guest consumed the
-    // whole batch: the job file disappears only after the agent
-    // finished writing its out file, so both conditions together mean
-    // the result is complete
+    // poll until every job has its result AND the guest consumed the
+    // whole batch (job files gone). We do NOT stop on batch-done alone:
+    // the guest touches it after its glob loop, which can finish with
+    // job files still present if 9p showed a stale empty directory —
+    // stopping then would strand those jobs. Waiting for every out
+    // file instead gives the guest's retry globs time to pick up
+    // stragglers.
     let want = pending.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while pending.iter().any(|(name, _, _)| {
@@ -242,6 +311,16 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
             }
         }
     }
+    // signal the guest we parsed everything: remove the batch-done
+    // marker so the next flush_batch's wait loop passes immediately,
+    // and remove run.sh/batch-ready/manifest so the guest does not
+    // re-run the same batch (it must not delete them itself — by-name
+    // removal would also delete the NEXT batch's files, stranding its
+    // jobs).
+    let _ = fs::remove_file(dir.join("batch-done"));
+    let _ = fs::remove_file(dir.join("run.sh"));
+    let _ = fs::remove_file(dir.join("batch-ready"));
+    let _ = fs::remove_file(dir.join("manifest"));
 }
 
 fn job_has_files(job: &Path) -> bool {

@@ -68,7 +68,12 @@ echo "    campaign out: $OUT_DIR"
 
 # 1. assets
 [ -f "$QEMU_KERNEL_IMG" ] || die "kernel image missing: $QEMU_KERNEL_IMG — run tools/qemu-assets.sh -k <bzImage>"
-[ -f "$QEMU_ROOTFS" ] || die "rootfs missing: $QEMU_ROOTFS — run tools/qemu-assets.sh -r <rootfs>"
+if [ ! -f "$QEMU_ROOTFS" ]; then
+    echo "rootfs missing: $QEMU_ROOTFS"
+    echo "  → build the sample initramfs (recommended): tools/qemu-assets.sh --sample-initramfs"
+    echo "  → or copy a user rootfs:                   tools/qemu-assets.sh -r <rootfs.cpio.gz>"
+    exit 1
+fi
 
 # 2. share prep
 say_step 1 5 "9p share"
@@ -84,6 +89,11 @@ fi
 
 # 3. boot guest
 say_step 2 5 "qemu guest boot"
+# a stale qemu.pid from an aborted run would make qemu-boot.sh refuse
+# to start; clear it before booting (qemu-boot.sh --stop is also
+# harmless if nothing is running)
+tools/qemu-boot.sh --stop >/dev/null 2>&1 || true
+rm -f "$QEMU_ASSETS/qemu.pid"
 tools/qemu-boot.sh
 trap 'tools/qemu-boot.sh --stop >/dev/null 2>&1 || true' EXIT
 

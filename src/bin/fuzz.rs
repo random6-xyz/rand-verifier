@@ -178,6 +178,8 @@ fn main() -> anyhow::Result<()> {
             qemu.as_mut(),
         )?;
     } else {
+        let total = args.iters.max(1);
+        let report_every = (total / 10).max(1);
         for i in 0..args.iters {
             let name = format!("seed-{}-{}", args.seed, i);
             // one generator per program: the per-program seed fully
@@ -200,6 +202,16 @@ fn main() -> anyhow::Result<()> {
                 &findings_dir,
                 out,
             )?;
+            if (i + 1) % report_every == 0 || i + 1 == total {
+                let done = i + 1;
+                let pct = done * 100 / total;
+                println!(
+                    "  progress: {done}/{total} ({pct}%) agree={} skip={} findings={}",
+                    counts.get("agree").copied().unwrap_or(0),
+                    counts.get("skipped").copied().unwrap_or(0),
+                    findings.len(),
+                );
+            }
         }
     }
 
@@ -347,6 +359,21 @@ fn run_mutation_campaign(
         }
 
         handle_outcome(counts, coverage, findings, candidates, findings_dir, out)?;
+
+        let done = i + 1;
+        let pct = done * 100 / args.iters.max(1);
+        if done % ((args.iters / 10).max(1)) == 0 || done == args.iters {
+            println!(
+                "  progress: {done}/{} ({pct}%) agree={} skip={} flip={} findings={} mut={}/{}",
+                args.iters,
+                counts.get("agree").copied().unwrap_or(0),
+                counts.get("skipped").copied().unwrap_or(0),
+                flips.len(),
+                findings.len(),
+                mutations.valid,
+                mutations.total,
+            );
+        }
     }
     Ok(())
 }

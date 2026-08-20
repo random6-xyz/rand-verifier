@@ -71,18 +71,8 @@ fn default_maps(insns: &[u8]) -> HashMap<u32, MapInfo> {
     maps
 }
 
-fn run_program(path: &str) {
-    let data = match fs::read(path) {
-        Ok(d) => d,
-        Err(_) => {
-            // the host parser (src/fuzz/qemu.rs) treats a `REJECT
-            // cannot-read ...` line as an infrastructure failure (None),
-            // not a kernel verdict.
-            println!("REJECT cannot-read job file errno=2");
-            return;
-        }
-    };
-    let maps = default_maps(&data);
+fn run_program_bytes(data: &[u8]) {
+    let maps = default_maps(data);
     // AGENT_LOG=1 → full verifier log (level 2) kept for diagnostics; a
     // subset is printed to stderr (captured into the out file by run.sh)
     let log_level = if std::env::var_os("AGENT_LOG").is_some() {
@@ -90,7 +80,7 @@ fn run_program(path: &str) {
     } else {
         1
     };
-    let (outcome, log) = load_with_kernel_maps_level(&data, &maps, log_level);
+    let (outcome, log) = load_with_kernel_maps_level(data, &maps, log_level);
     match outcome {
         KernelOutcome::Accept => println!("ACCEPT"),
         KernelOutcome::Reject { message, .. } => println!("REJECT {message} errno=0"),
@@ -125,9 +115,7 @@ fn main() {
     // redirects stderr into the same out file, and the host parser
     // (src/fuzz/qemu.rs::parse_agent_verdict) keys off the first line,
     // which must be exactly `ACCEPT` or `REJECT ...`.
-    if rest.contains(&"--strict") {
-        let _ = drop_privileged_caps();
-    }
+    let strict = rest.contains(&"--strict");
     let files: Vec<&str> = rest
         .iter()
         .copied()
@@ -137,7 +125,28 @@ fn main() {
         eprintln!("usage: agent [--strict] <program-file>...");
         process::exit(2);
     }
-    for f in files {
-        run_program(f);
+    // Read every program file FIRST, while we still have full root
+    // privileges: the 9p share can surface host-owned files that the
+    // (dropped-privilege) agent cannot open afterwards. Dropping caps
+    // is only safe once the bytes are in memory.
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    for f in &files {
+        match fs::read(f) {
+            Ok(d) => payloads.push(d),
+            Err(e) => {
+                eprintln!(
+                    "cannot-read detail: path={f} errno={}",
+                    e.raw_os_error().unwrap_or(-1)
+                );
+                println!("REJECT cannot-read job file errno=2");
+                return;
+            }
+        }
+    }
+    if strict {
+        let _ = drop_privileged_caps();
+    }
+    for data in payloads {
+        run_program_bytes(&data);
     }
 }
