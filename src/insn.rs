@@ -13,8 +13,8 @@ pub(crate) mod opcode {
     // ALU64 (class 0x07) — BPF_K (0x00) / BPF_X (0x08) source forms
     pub const MOV_IMM: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
     pub const LD_IMM64: u8 = 0x18; // BPF_LD | BPF_DW | BPF_IMM (two slots)
-    // pseudo classes in the src_reg of an ldimm64 first slot (kernel:
-    // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE)
+                                   // pseudo classes in the src_reg of an ldimm64 first slot (kernel:
+                                   // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE)
     pub const PSEUDO_MAP_FD: u8 = 1;
     pub const PSEUDO_MAP_VALUE: u8 = 2;
     pub const MOV_REG: u8 = 0xbf; // BPF_ALU64 | BPF_MOV | BPF_X
@@ -823,19 +823,19 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
 pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)> {
     let mut insns = Vec::new();
     let mut idx = 0usize;
-    let chunks: Vec<&[u8]> = bytes.chunks_exact(8).collect();
+    let (chunks, _) = bytes.as_chunks::<8>();
     while idx < chunks.len() {
         if chunks[idx][0] == opcode::LD_IMM64 {
             let second = chunks
                 .get(idx + 1)
                 .ok_or((idx, DecodeError::LdImm64Truncated))?;
-            insns.push(parse_ldimm64(chunks[idx], second).map_err(|e| (idx, e))?);
+            insns.push(parse_ldimm64(&chunks[idx], second).map_err(|e| (idx, e))?);
             insns.push(BpfInsn::LdImm64Second {
                 imm_hi: u32::from_le_bytes([second[4], second[5], second[6], second[7]]),
             });
             idx += 2;
         } else {
-            insns.push(parse_insn(chunks[idx]).map_err(|e| (idx, e))?);
+            insns.push(parse_insn(&chunks[idx]).map_err(|e| (idx, e))?);
             idx += 1;
         }
     }

@@ -369,7 +369,7 @@ mod tests {
 
     fn decode_all(bytes: &[u8]) -> Vec<BpfInsn> {
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| parse_insn(c).unwrap())
             .collect()
     }

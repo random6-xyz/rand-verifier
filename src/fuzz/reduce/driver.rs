@@ -241,7 +241,7 @@ fn write_artifacts(
         .map_err(|e| ReduceError::Pipeline(e.to_string()))?;
 
     let mut dump = String::new();
-    for (idx, chunk) in reduced.chunks_exact(8).enumerate() {
+    for (idx, chunk) in reduced.as_chunks::<8>().0.iter().enumerate() {
         match parse_insn(chunk) {
             Ok(insn) => dump.push_str(&format!("{idx:4}: {insn:?}\n")),
             Err(e) => dump.push_str(&format!("{idx:4}: decode error: {e}\n")),
