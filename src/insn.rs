@@ -13,8 +13,8 @@ pub(crate) mod opcode {
     // ALU64 (class 0x07) — BPF_K (0x00) / BPF_X (0x08) source forms
     pub const MOV_IMM: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
     pub const LD_IMM64: u8 = 0x18; // BPF_LD | BPF_DW | BPF_IMM (two slots)
-                                   // pseudo classes in the src_reg of an ldimm64 first slot (kernel:
-                                   // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE)
+    // pseudo classes in the src_reg of an ldimm64 first slot (kernel:
+    // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE)
     pub const PSEUDO_MAP_FD: u8 = 1;
     pub const PSEUDO_MAP_VALUE: u8 = 2;
     pub const MOV_REG: u8 = 0xbf; // BPF_ALU64 | BPF_MOV | BPF_X
