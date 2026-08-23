@@ -823,19 +823,19 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
 pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)> {
     let mut insns = Vec::new();
     let mut idx = 0usize;
-    let chunks: Vec<&[u8]> = bytes.chunks_exact(8).collect();
+    let (chunks, _) = bytes.as_chunks::<8>();
     while idx < chunks.len() {
         if chunks[idx][0] == opcode::LD_IMM64 {
             let second = chunks
                 .get(idx + 1)
                 .ok_or((idx, DecodeError::LdImm64Truncated))?;
-            insns.push(parse_ldimm64(chunks[idx], second).map_err(|e| (idx, e))?);
+            insns.push(parse_ldimm64(&chunks[idx], second).map_err(|e| (idx, e))?);
             insns.push(BpfInsn::LdImm64Second {
                 imm_hi: u32::from_le_bytes([second[4], second[5], second[6], second[7]]),
             });
             idx += 2;
         } else {
-            insns.push(parse_insn(chunks[idx]).map_err(|e| (idx, e))?);
+            insns.push(parse_insn(&chunks[idx]).map_err(|e| (idx, e))?);
             idx += 1;
         }
     }
