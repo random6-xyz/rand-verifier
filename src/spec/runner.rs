@@ -466,6 +466,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Eq,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -480,6 +481,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ne,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -494,6 +496,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Gt,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -508,6 +511,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ge,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -522,6 +526,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Lt,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -536,6 +541,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Le,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -550,6 +556,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Gt,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -564,6 +571,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ge,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -578,6 +586,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Lt,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -592,6 +601,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Le,
                         state.reg(src),
                         offset,
+                        dst == src,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -606,6 +616,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Eq,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -620,6 +631,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ne,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -634,6 +646,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Gt,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -648,6 +661,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ge,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -662,6 +676,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Lt,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -676,6 +691,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Le,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -690,6 +706,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Gt,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -704,6 +721,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Ge,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -718,6 +736,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Lt,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -732,6 +751,7 @@ impl<'a> SpecRunner<'a> {
                         Cmp::Le,
                         SpecValue::const_scalar(imm as u64),
                         offset,
+                        false,
                     );
                     if _verdict != SpecVerdict::Accept {
                         return _verdict;
@@ -847,8 +867,10 @@ impl<'a> SpecRunner<'a> {
                 v
             }
         };
-        // pointer arithmetic path: only const/scalar add onto a valid
-        // pointer base is allowed (kernel check_alu_op)
+        // pointer arithmetic path: const/scalar add or subtract onto a
+        // valid pointer base, and scalar += pointer with the result
+        // becoming a pointer — all allowed by the kernel's
+        // check_alu_op → adjust_reg_min_max_vals
         if d.is_pointer() {
             if op == Op::Add && r.is_scalar() {
                 return self.ptr_add(state, pc, dst, r);
@@ -857,7 +879,30 @@ impl<'a> SpecRunner<'a> {
                 if r.is_pointer() {
                     return Err(self.failure(pc, "math between two pointers is not allowed (SUB)"));
                 }
-                return Err(self.failure(pc, "subtracting a scalar from a pointer is not allowed"));
+                // ptr -= scalar is legal for non-stack pointer bases
+                // (kernel adjust_ptr_min_max_vals BPF_SUB negates the
+                // addend). Subtraction from the STACK pointer itself
+                // (R10) is prohibited by the kernel — the stack frame
+                // grows DOWN from R10 and moving R10 breaks spill
+                // tracking. The spec models the base pointer as a
+                // PtrToStack with a non-zero offset; a bare R10 base is
+                // PtrToStack{0,0} before any add. Since the spec loses
+                // the R10-vs-derived distinction, follow the kernel's
+                // observable rule: stack-pointer subtraction is refused
+                // when the base is R10 itself, allowed otherwise. The
+                // spec's PtrToStack offsets are always derived (R10
+                // moves are only expressible through arithmetic), so a
+                // ptr -= scalar on a PtrToStack is a refused fp move
+                // only when the pointer IS R10 (lo == hi == 0). Any
+                // other PtrToStack has already moved off R10 by an add.
+                let is_stack = matches!(state.reg(dst), SpecValue::PtrToStack { .. });
+                let is_r10 = matches!(state.reg(dst), SpecValue::PtrToStack { lo: 0, hi: 0 });
+                if is_stack && is_r10 {
+                    return Err(self.failure(pc, "subtraction from stack pointer is not allowed"));
+                }
+                // ptr -= scalar is legal (kernel: ptr + scalar with the
+                // addend negated). Reuse ptr_add with the negated range.
+                return self.ptr_add(state, pc, dst, negate_scalar(r));
             }
             return Err(self.failure(
                 pc,
@@ -865,6 +910,27 @@ impl<'a> SpecRunner<'a> {
             ));
         }
         if r.is_pointer() {
+            // scalar += pointer is legal — the result is a pointer (the
+            // kernel swaps the operands: adjust_ptr_min_max_vals on the
+            // pointer with the scalar as the addend). Only ADD is
+            // allowed; every other op on pointer+scalar is rejected.
+            if op == Op::Add {
+                if d == SpecValue::Uninit {
+                    return Err(self.failure(pc, "register is uninitialized"));
+                }
+                // The scalar dst becomes a pointer over the SAME base
+                // as the source pointer, shifted by the scalar's range
+                // (kernel: dst gets the pointer type + the combined
+                // offsets). The spec has no base-tagged pointer for
+                // map/ctx outside PtrTo*, so only the stack-pointer
+                // case is precisely modeled: rX += r10 yields a
+                // PtrToStack offset by the scalar range. Other bases
+                // (r10-derived or unknown) conservatively yield the
+                // source pointer refined by nothing — approximated by
+                // copying the source pointer with the scalar range
+                // folded where the shape allows it.
+                return self.scalar_plus_pointer(state, pc, dst, r, d);
+            }
             return Err(self.failure(
                 pc,
                 "arithmetic between a scalar and a pointer is not allowed",
@@ -917,8 +983,29 @@ impl<'a> SpecRunner<'a> {
             range32(d.as_scalar().unwrap()),
             range32(r.as_scalar().unwrap()),
         );
-        // ALU32: compute in 32-bit space; the result is zero-extended
+        // ALU32: compute in 32-bit space; the result is zero-extended.
+        // The 32-bit intervals must WRAP at 2^32 (kernel: a 32-bit add
+        // of 1 to 0xffffffff yields 0). alu_range operates on 64-bit
+        // intervals, so compute in 64-bit space from the exact 32-bit
+        // bounds and fold the carry: a single-interval result that
+        // exceeds 2^32-1 means the operands' 32-bit images wrapped —
+        // conservatively widen to the full 32-bit range (sound; exact
+        // for constants via rng_const folding below).
         let out = alu_range(op, d32, s32);
+        let out = if out.1 <= u32::MAX as u64 {
+            out
+        } else if op == Op::Add || op == Op::Sub {
+            // wrapping add/sub in 32 bits: [0, 2^32-1] unless both
+            // bounds are constants, which rng_const folds exactly
+            if out.0 == out.1 {
+                let wrapped = (out.0 as u32) as u64;
+                (wrapped, wrapped)
+            } else {
+                (0, u32::MAX as u64)
+            }
+        } else {
+            out
+        };
         state.set_reg(
             dst,
             SpecValue::Scalar {
@@ -932,6 +1019,64 @@ impl<'a> SpecRunner<'a> {
     /// The kernel's arithmetic-time pointer sanity checks
     /// (check_reg_sane_offset_scalar, BPF_MAX_VAR_OFF): a huge or
     /// unbounded addend makes the pointer escape the safe range.
+    /// `scalar += pointer` (kernel: legal, the result is a pointer —
+    /// adjust_ptr_min_max_vals is called with the operands swapped).
+    /// The dst register becomes a pointer over the same base as the
+    /// source pointer, offset by the scalar's range. The spec tracks
+    /// offsets precisely for stack pointers (rX += r10 → PtrToStack,
+    /// the dominant fuzzer shape via mseed-...-94327); any other base
+    /// kind copies the source pointer shape (its offset interval is
+    /// widened by the scalar range where the shape carries one).
+    fn scalar_plus_pointer(
+        &self,
+        state: &mut SpecState,
+        pc: u32,
+        dst: u8,
+        ptr: SpecValue,
+        scalar: SpecValue,
+    ) -> Result<(), SpecVerdict> {
+        let (slo, shi) = match scalar.as_scalar().and_then(as_signed) {
+            Some(s) => s,
+            None => {
+                return Err(self.failure(
+                    pc,
+                    "register with unbounded min value is not allowed as an addend",
+                ));
+            }
+        };
+        // sane addend range (mirrors ptr_add's own check)
+        if slo <= -BPF_MAX_VAR_OFF || slo == i64::MIN || shi >= BPF_MAX_VAR_OFF {
+            return Err(self.failure(
+                pc,
+                format!("value {slo}..{shi} makes pointer be out of bounds"),
+            ));
+        }
+        let shifted = |lo: i64, hi: i64| (lo.saturating_add(slo), hi.saturating_add(shi));
+        let result = match ptr {
+            SpecValue::PtrToStack { lo, hi } => {
+                let (lo, hi) = shifted(lo, hi);
+                SpecValue::PtrToStack { lo, hi }
+            }
+            SpecValue::PtrToMapValue { lo, hi, size } => {
+                let (lo, hi) = shifted(lo, hi);
+                SpecValue::PtrToMapValue { lo, hi, size }
+            }
+            // bases the spec models without an offset interval: the
+            // scalar addend may move the pointer, which the spec cannot
+            // track — stay conservative and reject (the kernel only
+            // accepts these when the addend is provably in range; the
+            // fuzzer rarely relies on them)
+            other => {
+                return Err(self.failure(
+                    pc,
+                    format!("scalar += pointer on {other:?} is not tracked by the spec"),
+                ));
+            }
+        };
+        state.set_reg(dst, result);
+        Ok(())
+    }
+
     fn ptr_add(
         &self,
         state: &mut SpecState,
@@ -1218,6 +1363,23 @@ impl<'a> SpecRunner<'a> {
                     // a spill over an existing spill replaces it
                     state.cur.stack.spill[slot] = Some(spill);
                     mark_range_init(&mut state.cur.stack, start, 8);
+                    // the spilled scalar's bytes must land in the byte
+                    // array: a narrow (sub-dword) load from a spilled
+                    // slot reads through the bytes, not the spill (the
+                    // kernel's STACK_SPILL slot also carries the raw
+                    // bytes). Writing only the spill left every byte
+                    // zero, so `ldxb` of a spilled 0x…80 read 0 and
+                    // downstream branches refined the wrong state
+                    // (mseed-202608263555-76710).
+                    if let SpecValue::Scalar { lo, hi } = value
+                        && lo == hi
+                    {
+                        let abs = SPEC_STACK_SIZE as i64 + start;
+                        for i in 0..8 {
+                            state.cur.stack.bytes[(abs + i) as usize] =
+                                (lo >> (8 * i as u32)) as u8;
+                        }
+                    }
                     return Ok(());
                 }
                 // narrow write over a spilled slot refuses pointer
@@ -1483,6 +1645,7 @@ impl<'a> SpecRunner<'a> {
         cmp: Cmp,
         src: SpecValue,
         offset: i16,
+        same_reg: bool,
     ) -> SpecVerdict {
         let target = branch_target(pc, offset);
         let d = state.cur.regs[dst as usize];
@@ -1492,6 +1655,17 @@ impl<'a> SpecRunner<'a> {
         let Some((dlo, dhi)) = d.as_scalar() else {
             return self.failure(pc, "comparison on an uninitialized register");
         };
+        // rX <op> rX compares a register with itself: the two sides are
+        // the SAME value, not independent intervals. Only the exactly
+        // true outcomes survive (rX<rX and rX>rX are dead, rX<=rX,
+        // rX>=rX and rX==rX are always true, rX!=rX is dead). Treating
+        // the sides independently spawned phantom taken paths
+        // (mseed-202608263552-66434: `jlt r0,r0` kept a taken path whose
+        // successor read r1 as an uninitialized register).
+        if same_reg {
+            let (taken, fall) = self_compare_refine(cmp);
+            return self.emit_refined(worklist, state, dst, taken, fall, target, pc + 1);
+        }
         let Some((slo, shi)) = src.as_scalar() else {
             return self.failure(pc, "comparison against an uninitialized register");
         };
@@ -1509,6 +1683,7 @@ impl<'a> SpecRunner<'a> {
         cmp: Cmp,
         src: SpecValue,
         offset: i16,
+        same_reg: bool,
     ) -> SpecVerdict {
         let target = branch_target(pc, offset);
         let d = state.cur.regs[dst as usize];
@@ -1518,6 +1693,10 @@ impl<'a> SpecRunner<'a> {
         let Some((dlo, dhi)) = d.as_scalar() else {
             return self.failure(pc, "signed comparison on an uninitialized register");
         };
+        if same_reg {
+            let (taken, fall) = self_compare_refine(cmp);
+            return self.emit_refined(worklist, state, dst, taken, fall, target, pc + 1);
+        }
         let Some((slo, shi)) = src.as_scalar() else {
             return self.failure(pc, "signed comparison against an uninitialized register");
         };
@@ -1675,6 +1854,9 @@ impl<'a> SpecRunner<'a> {
 
 type Range2 = (u64, u64);
 
+/// The unrefined full u64 interval.
+const FULL: Range2 = (0, u64::MAX);
+
 /// One comparison operator, normalized to `dst CMP src`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cmp {
@@ -1684,6 +1866,34 @@ pub(crate) enum Cmp {
     Le,
     Gt,
     Ge,
+}
+
+/// The refinement for `rX <op> rX`: a register compared with itself.
+/// Only the exactly-true outcomes survive — the interval is unchanged
+/// on the surviving path (no refinement is possible from a tautology).
+fn self_compare_refine(cmp: Cmp) -> (Vec<Range2>, Vec<Range2>) {
+    match cmp {
+        Cmp::Eq | Cmp::Le | Cmp::Ge => (vec![FULL], vec![]),
+        Cmp::Ne | Cmp::Lt | Cmp::Gt => (vec![], vec![FULL]),
+    }
+}
+
+/// Negate a scalar interval with wrapping semantics: `[lo,hi]` becomes
+/// `[-hi, -lo]` in the signed view. Used for `ptr -= scalar`.
+fn negate_scalar(v: SpecValue) -> SpecValue {
+    let (lo, hi) = match v.as_scalar() {
+        Some(r) => r,
+        None => return v,
+    };
+    let (slo, shi) = match as_signed((lo, hi)) {
+        Some(s) => s,
+        None => return SpecValue::unknown_scalar(),
+    };
+    let (nlo, nhi) = (shi.wrapping_neg(), slo.wrapping_neg());
+    SpecValue::Scalar {
+        lo: nlo as u64,
+        hi: nhi as u64,
+    }
 }
 
 fn unsigned_cmp_refine(d: Range2, s: Range2, cmp: Cmp) -> (Vec<Range2>, Vec<Range2>) {
@@ -1902,6 +2112,43 @@ fn caller_exists(saved: [Option<SpecFrame>; 7]) -> bool {
 /// Sound interval ALU over wrapping u64 (32-bit inputs are already
 /// truncated — the result is zero-extended).
 fn alu_range(op: Op, d: Range2, s: Range2) -> Range2 {
+    // constant × constant folds exactly (the kernel's tnum algebra
+    // knows the same): without this, `r2 = 12; r2 &= 10; jslt r2,4`
+    // keeps the dead taken path alive and the spec walks code the
+    // kernel eliminates (mseed-202608263552-88394/88489)
+    if d.0 == d.1 && s.0 == s.1 {
+        let (a, b) = (d.0, s.0);
+        let folded = match op {
+            Op::Add => a.wrapping_add(b),
+            Op::Sub => a.wrapping_sub(b),
+            Op::And => a & b,
+            Op::Or => a | b,
+            Op::Xor => a ^ b,
+            Op::Mul => a.wrapping_mul(b),
+            Op::Lsh => {
+                if b >= 64 {
+                    0
+                } else {
+                    a.wrapping_shl(b as u32)
+                }
+            }
+            Op::Rsh => {
+                if b >= 64 {
+                    0
+                } else {
+                    a.wrapping_shr(b as u32)
+                }
+            }
+            Op::Arsh => {
+                if b >= 64 {
+                    ((a as i64) >> 63) as u64
+                } else {
+                    ((a as i64).wrapping_shr(b as u32)) as u64
+                }
+            }
+        };
+        return (folded, folded);
+    }
     match op {
         Op::Add => rng_add(d, s),
         Op::Sub => rng_sub(d, s),
@@ -2000,6 +2247,7 @@ enum Rhs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::insn::opcode;
     use crate::testutil::insn_bytes;
     use std::collections::HashMap;
 
@@ -2014,6 +2262,132 @@ mod tests {
             SpecVerdict::Reject(f) => f.message.contains(needle),
             _ => false,
         }
+    }
+
+    // ── regression: spec false rejects measured against the bpf-next
+    // guest (7.2.0-rc6-gf79066c78402) during the 20260826-145450
+    // parallel campaign triage. Each program below was REJECTed by the
+    // spec while mini, concrete, and the REAL KERNEL all agreed ACCEPT.
+    // The spec verdicts must be ACCEPT.
+
+    /// S-1: `ptr -= scalar` is legal kernel-side (the addend is
+    /// negated); the spec used to refuse every pointer subtraction.
+    #[test]
+    fn spec_ptr_sub_scalar_accepted() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 2, 0, 0, 10),
+            insn_bytes(opcode::SUB_IMM, 1, 0, 0, 3), // r1 -= 3 (ctx)
+            insn_bytes(opcode::MOV_REG, 0, 2, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(matches!(v, SpecVerdict::Accept), "S-1: {v:?}");
+    }
+
+    /// S-1b: subtraction from R10 itself is still refused (the kernel
+    /// rejects "subtraction from stack pointer").
+    #[test]
+    fn spec_stack_pointer_sub_rejected() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::MOV_REG, 6, 10, 0, 0), // r6 = r10
+            insn_bytes(opcode::SUB_IMM, 6, 0, 0, 4),  // r6 -= 4
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(
+            matches!(v, SpecVerdict::Reject(_)),
+            "S-1b: fp -= scalar must stay rejected: {v:?}"
+        );
+    }
+
+    /// S-2: `scalar += pointer` is legal — the result is a pointer
+    /// (kernel swaps the operands in adjust_ptr_min_max_vals).
+    #[test]
+    fn spec_scalar_plus_pointer_accepted() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 1),
+            insn_bytes(opcode::MOV_IMM, 3, 0, 0, -4),
+            insn_bytes(opcode::ADD_REG, 3, 10, 0, 0), // r3 += r10
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(matches!(v, SpecVerdict::Accept), "S-2: {v:?}");
+    }
+
+    /// S-3: ALU32 wraps at 32 bits: (u32)(-1 + 1) == 0, so a branch on
+    /// the zero-extended result must take the constant path (the
+    /// kernel folds `jeq r0,0` after `w2 += 1`).
+    #[test]
+    fn spec_alu32_wraps_like_kernel() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 2, 0, 0, -1),
+            insn_bytes(opcode::ADD32_IMM, 2, 0, 0, 1), // w2 += 1 → 0
+            insn_bytes(opcode::MOV_REG, 0, 2, 0, 0),
+            insn_bytes(opcode::JEQ_IMM, 0, 0, 1, 0), // taken → skip call
+            insn_bytes(opcode::CALL, 0, 0, 0, 132),  // ringbuf_submit(r1=ctx) — invalid
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(matches!(v, SpecVerdict::Accept), "S-3: {v:?}");
+    }
+
+    /// S-4: constant × constant bitwise ops fold exactly; the dead
+    /// branch of `jslt` after `r2 &= 10` must be pruned like the
+    /// kernel's tnum algebra does.
+    #[test]
+    fn spec_const_bitwise_folds_exactly() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 2, 0, 0, 12),
+            insn_bytes(opcode::AND_IMM, 2, 0, 0, 10), // r2 = 8
+            insn_bytes(opcode::JSLT_IMM, 2, 0, 2, 4), // 8 < 4: never taken
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),  // fall: r0 = 0
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0), // dead taken path
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(matches!(v, SpecVerdict::Accept), "S-4: {v:?}");
+    }
+
+    /// S-5: `jlt r0, r0` compares a register with itself — the taken
+    /// path is dead and the fall-through must not refine r1 away.
+    #[test]
+    fn spec_self_compare_refines_correctly() {
+        let v = run(&[
+            insn_bytes(opcode::CALL, 0, 0, 0, 7),
+            insn_bytes(opcode::ADD_IMM, 0, 0, 0, 1_000_000_000),
+            insn_bytes(opcode::JSLT, 0, 0, 1, 0), // r0 < r0: dead
+            insn_bytes(opcode::MOV_IMM, 1, 0, 0, 0),
+            insn_bytes(opcode::JEQ, 0, 1, 1, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(matches!(v, SpecVerdict::Accept), "S-5: {v:?}");
+    }
+
+    /// Spill bytes: a narrow load from a spilled slot reads the
+    /// spilled value's bytes — storing r2 = 0x80 then `ldxb` must
+    /// yield -128 (not 0), so the downstream signed branches take the
+    /// kernel's path and the uninitialized r6 arithmetic stays dead.
+    #[test]
+    fn spec_spill_bytes_visible_to_narrow_loads() {
+        let v = run(&[
+            insn_bytes(opcode::MOV_IMM, 2, 0, 0, 128),
+            insn_bytes(opcode::ST_STACK, 10, 2, -8, 0), // *(u64*)(r10-8) = r2
+            insn_bytes(0x91, 0, 10, -8, 0),             // r0 = *(s8*)(r10-8)
+            insn_bytes(opcode::MOV_REG, 2, 0, 0, 0),
+            insn_bytes(opcode::MOV_IMM, 3, 0, 0, 255),
+            insn_bytes(opcode::JSLT, 2, 3, 1, 0), // -128 < 255: taken
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+            insn_bytes(opcode::MOV_IMM, 4, 0, 0, 0),
+            insn_bytes(opcode::JSGE, 2, 4, 1, 0), // -128 >= 0: dead
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+            insn_bytes(opcode::AND_IMM, 2, 0, 0, 8),
+            insn_bytes(opcode::ADD_REG, 6, 2, 0, 0), // r6 += r2 (r6 uninit!)
+            insn_bytes(opcode::LD_STACK, 0, 6, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        assert!(
+            matches!(v, SpecVerdict::Accept),
+            "spill bytes: dead r6 path must stay dead: {v:?}"
+        );
     }
 
     /// The unsigned refinement never drops a feasible outcome and

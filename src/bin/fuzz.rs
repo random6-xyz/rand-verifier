@@ -33,6 +33,7 @@ use rand_verifier::fuzz::generator::{GenConfig, Generator};
 use rand_verifier::fuzz::insn_lib::{self, opcode_family};
 use rand_verifier::fuzz::mutator::Mutator;
 use rand_verifier::fuzz::oracle::{Finding, classify_env, first_violation_pc};
+use rand_verifier::fuzz::prng::mix_seed;
 use rand_verifier::fuzz::qemu::QemuBatch;
 use rand_verifier::fuzz::triage::{Candidate, Divergence, Group, group};
 use rand_verifier::insn::BpfInsn;
@@ -184,7 +185,7 @@ fn main() -> anyhow::Result<()> {
             let name = format!("seed-{}-{}", args.seed, i);
             // one generator per program: the per-program seed fully
             // determines the program and every rand-verifier verdict
-            let mut generator = Generator::new(args.seed.wrapping_add(i as u64));
+            let mut generator = Generator::new(mix_seed(args.seed, i as u64));
             let insns = generator.gen_mixed_program(&cfg, IDIOM_RATIO_PERCENT);
             // optional corpus persistence: every generated program
             // becomes a future mutation seed (raw bytecode, .bin)
@@ -301,7 +302,7 @@ fn run_mutation_campaign(
 
     for i in 0..args.iters {
         let name = format!("mseed-{}-{}", args.seed, i);
-        let mut mutator = Mutator::new(args.seed.wrapping_add(i as u64));
+        let mut mutator = Mutator::new(mix_seed(args.seed, i as u64));
 
         let (insns, seed_verdict) = if mutator.chance(args.mutate_ratio) {
             mutations.total += 1;
@@ -320,7 +321,7 @@ fn run_mutation_campaign(
                 }
             }
         } else {
-            let mut generator = Generator::new(args.seed.wrapping_add(i as u64));
+            let mut generator = Generator::new(mix_seed(args.seed, i as u64));
             (generator.gen_mixed_program(cfg, IDIOM_RATIO_PERCENT), None)
         };
 

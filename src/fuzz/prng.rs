@@ -11,6 +11,21 @@ pub(crate) struct SplitMix64 {
     state: u64,
 }
 
+/// Mix a campaign seed and an iteration index into a per-iteration PRNG
+/// seed. Plain `seed + i` is a collision hazard for parallel campaigns:
+/// job k with seed S+k produces, at iteration i, the same PRNG stream as
+/// job 0 (seed S) at iteration S+k+i — the 20260826-145450 parallel run
+/// measured byte-identical program streams across all 8 guests (finding
+/// duplication 428 occurrences → 81 distinct). A SplitMix64
+/// finalizer-style mix scrambles both inputs so neighbouring seeds and
+/// neighbouring iterations produce unrelated streams.
+pub fn mix_seed(seed: u64, iter: u64) -> u64 {
+    let mut z = seed ^ iter.rotate_left(32);
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 impl SplitMix64 {
     pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
@@ -47,6 +62,30 @@ mod tests {
         let mut b = SplitMix64::new(7);
         for _ in 0..1000 {
             assert_eq!(a.next(), b.next());
+        }
+    }
+
+    /// Parallel campaigns use seeds S..S+8 with per-iteration
+    /// streams. `seed + i` collides: job k at iteration i uses the
+    /// same stream as job 0 at iteration i+k (byte-identical programs
+    /// measured across all 8 guests of the 20260826-145450 run). The
+    /// mixer must produce a distinct stream for every (seed, iter)
+    /// pair in that neighbourhood, including the shifted
+    /// (S+k, i) == (S, i+k) pairs that used to collide.
+    #[test]
+    fn mix_seed_separates_parallel_campaign_streams() {
+        let base: u64 = 202608263552;
+        for k in 1..8u64 {
+            for i in [0u64, 1, 500, 11354, 99_999] {
+                let a = mix_seed(base, i + k);
+                let b = mix_seed(base + k, i);
+                assert_ne!(a, b, "job {k} iter {i} collides with job 0 iter {}", i + k);
+            }
+        }
+        // neighbouring iterations must not share a stream either
+        let s = mix_seed(base, 0);
+        for i in 1..=1000u64 {
+            assert_ne!(s, mix_seed(base, i));
         }
     }
 
