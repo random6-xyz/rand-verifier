@@ -77,7 +77,6 @@ pub fn categorize_reason(message: &str) -> ReasonCategory {
     } else if msg.contains("back-edge") || msg.contains("infinite loop detected") {
         ReasonCategory::Loop
     } else if msg.contains("leaks addr as return")
-        || msg.contains("R0 ") // "R0 not a scalar value", "R0 leaks addr ..."
         || msg.contains("cannot return")
         || msg.contains("not a scalar")
     {
@@ -349,6 +348,18 @@ mod tests {
         );
         assert_eq!(
             categorize_reason("R1 32-bit pointer arithmetic prohibited"),
+            ReasonCategory::PointerArith
+        );
+    }
+
+    #[test]
+    fn r0_prefixed_pointer_errors_keep_pointer_category() {
+        assert_eq!(
+            categorize_reason("R0 invalid mem access 'scalar'"),
+            ReasonCategory::PointerArith
+        );
+        assert_eq!(
+            categorize_reason("R0 pointer arithmetic prohibited"),
             ReasonCategory::PointerArith
         );
     }

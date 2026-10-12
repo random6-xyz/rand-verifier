@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! ACCEPT
-//! REJECT <reason text> errno=<n>
+//! REJECT <reason text> insn_idx=<n> errno=<n>
 //! ```
 //!
 //! Usage (invoked by the guest init loop / run.sh):
@@ -71,6 +71,24 @@ fn default_maps(insns: &[u8]) -> HashMap<u32, MapInfo> {
     maps
 }
 
+fn format_kernel_verdict(outcome: &KernelOutcome) -> String {
+    match outcome {
+        KernelOutcome::Accept => "ACCEPT".to_string(),
+        KernelOutcome::Reject {
+            message, insn_idx, ..
+        } => format!("REJECT {message} insn_idx={insn_idx} errno=0"),
+        KernelOutcome::Privilege => "REJECT not-privileged errno=1".to_string(),
+        KernelOutcome::NoErrorLine { errno } => format!("REJECT no-error-line errno={errno}"),
+        KernelOutcome::InvalidProgram => "REJECT invalid-program errno=0".to_string(),
+    }
+}
+
+fn drop_caps_for_strict_mode(
+    drop_caps: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    drop_caps()
+}
+
 fn run_program_bytes(data: &[u8]) {
     let maps = default_maps(data);
     // AGENT_LOG=1 → full verifier log (level 2) kept for diagnostics; a
@@ -81,13 +99,7 @@ fn run_program_bytes(data: &[u8]) {
         1
     };
     let (outcome, log) = load_with_kernel_maps_level(data, &maps, log_level);
-    match outcome {
-        KernelOutcome::Accept => println!("ACCEPT"),
-        KernelOutcome::Reject { message, .. } => println!("REJECT {message} errno=0"),
-        KernelOutcome::Privilege => println!("REJECT not-privileged errno=1"),
-        KernelOutcome::NoErrorLine { errno } => println!("REJECT no-error-line errno={errno}"),
-        KernelOutcome::InvalidProgram => println!("REJECT invalid-program errno=0"),
-    }
+    println!("{}", format_kernel_verdict(&outcome));
     if log_level >= 2 {
         eprintln!("AGENT_LOG: log len {} bytes", log.len());
         eprintln!("--- log head ---");
@@ -143,10 +155,40 @@ fn main() {
             }
         }
     }
-    if strict {
-        let _ = drop_privileged_caps();
+    if strict && drop_caps_for_strict_mode(drop_privileged_caps).is_err() {
+        // A failed capability drop must never fall back to a privileged
+        // kernel verdict. The host classifies this as infrastructure skip.
+        for _ in &payloads {
+            println!("REJECT not-privileged errno=1");
+        }
+        return;
     }
     for data in payloads {
         run_program_bytes(&data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_verifier::klog::ReasonCategory;
+
+    #[test]
+    fn rejection_output_preserves_instruction_index() {
+        let outcome = KernelOutcome::Reject {
+            insn_idx: 7,
+            message: "invalid mem access".into(),
+            category: ReasonCategory::PointerArith,
+        };
+        assert_eq!(
+            format_kernel_verdict(&outcome),
+            "REJECT invalid mem access insn_idx=7 errno=0"
+        );
+    }
+
+    #[test]
+    fn strict_capability_drop_failure_is_propagated() {
+        let result = drop_caps_for_strict_mode(|| Err("capset failed".into()));
+        assert_eq!(result, Err("capset failed".into()));
     }
 }

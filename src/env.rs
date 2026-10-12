@@ -5,7 +5,9 @@ use std::fs;
 
 use anyhow::Result;
 
-use crate::cfg::{add_subprog, check_cfg, check_combined_stack_depth};
+use crate::cfg::{
+    add_subprog, check_cfg, check_combined_stack_depth, check_combined_stack_depth_with_states,
+};
 use crate::concrete::{
     ConcreteLimits, ConcreteReport, ConcreteVerdict, check_coverage, render_coverage_report,
     run_concrete_with_maps,
@@ -281,6 +283,13 @@ impl BpfVerifierEnv {
         match verify_mini_with_states(&self.prog.insns, &loop_heads, &VerifierLimits::default()) {
             Err(failure) => self.reject_with_cross_check(failure, &loop_heads),
             Ok((_, abstract_states)) => {
+                if let Err(failure) = check_combined_stack_depth_with_states(
+                    &self.prog.insns,
+                    &self.prog.subprogs,
+                    &abstract_states,
+                ) {
+                    return self.reject_with_cross_check(failure, &loop_heads);
+                }
                 // ACCEPT: concrete run + coverage check — the Phase 2
                 // soundness question (every concrete visited state must
                 // be covered by an abstract state at the same pc)
@@ -474,6 +483,29 @@ mod tests {
         // a size that is not a multiple of 8 is rejected
         let err = env.setup_prog_bytes(&[0u8; 7]).unwrap_err();
         assert!(err.to_string().contains("not a multiple of 8"));
+    }
+
+    #[test]
+    fn combined_stack_depth_counts_r10_alias_accesses() {
+        let bytes = prog_bytes(&[
+            insn_bytes(opcode::MOV_REG, 6, 10, 0, 0),
+            insn_bytes(opcode::ADD_IMM, 6, 0, 0, -304),
+            insn_bytes(0x7a, 6, 0, 0, 1),         // *(u64 *)(r6 + 0) = 1
+            insn_bytes(opcode::CALL, 0, 1, 0, 2), // call subprogram at pc 6
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+            insn_bytes(0x7a, 10, 0, -240, 1), // *(u64 *)(r10 - 240) = 1
+            insn_bytes(opcode::MOV_IMM, 0, 0, 0, 0),
+            insn_bytes(opcode::EXIT, 0, 0, 0, 0),
+        ]);
+        let mut env = BpfVerifierEnv::new();
+        env.setup_prog_bytes(&bytes).unwrap();
+
+        let verdict = env.verify().unwrap();
+        assert!(
+            matches!(verdict, Verdict::Unsafe(ref f) if f.message.contains("combined stack size")),
+            "{verdict:?}"
+        );
     }
 
     /// The byte-array loading path must behave identically to the file

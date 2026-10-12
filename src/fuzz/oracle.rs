@@ -250,20 +250,10 @@ pub fn classify(input: &OracleInput) -> Finding {
                 if matches!(mini, SideVerdict::Reject { .. }) {
                     return Finding::Whitelisted;
                 }
-                // strict mode: unprivileged-equivalent kernel rules are
-                // design behaviour (v0.6 --strict empirical run:
-                // "R10 pointer comparison prohibited" → PointerArith,
-                // insn limits → Complexity; v0.7 m5: "R6 variable
-                // stack access prohibited for !root" → StackBounds).
-                // The kernel marks every unprivileged-only rule with
-                // the literal "for !root" in its message, so any such
-                // rejection is design behaviour regardless of category.
-                if *strict
-                    && (matches!(
-                        category,
-                        ReasonCategory::PointerArith | ReasonCategory::Complexity
-                    ) || kernel_reason.is_some_and(|m| m.contains("for !root")))
-                {
+                // strict mode: only explicitly marked unprivileged-only
+                // kernel rules are design differences. A broad reason
+                // category can also describe an ordinary precision gap.
+                if *strict && kernel_reason.is_some_and(|m| m.contains("for !root")) {
                     return Finding::Whitelisted;
                 }
                 // both sides reject for the same reason — an intended
@@ -522,6 +512,30 @@ mod tests {
                 false,
             ),
             Finding::PrecisionCandidate
+        );
+    }
+
+    #[test]
+    fn strict_pointer_category_does_not_hide_regular_rejections() {
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(ReasonCategory::PointerArith),
+                Some("R0 invalid mem access 'scalar'"),
+                true,
+            ),
+            Finding::PrecisionCandidate
+        );
+        assert_eq!(
+            classify_with_kernel_reason(
+                acc(),
+                ConcreteSide::Safe,
+                rej(ReasonCategory::PointerArith),
+                Some("pointer arithmetic prohibited for !root"),
+                true,
+            ),
+            Finding::Whitelisted
         );
     }
 

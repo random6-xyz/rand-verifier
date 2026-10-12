@@ -109,6 +109,9 @@ pub struct Sides {
     pub mini_reason: Option<String>,
     pub concrete: ConcreteSide,
     pub kernel: SideVerdict,
+    /// Kernel rejection text is needed to reproduce strict-mode
+    /// whitelisting of explicitly marked `for !root` rules.
+    pub kernel_reason: Option<String>,
     /// The spec side (#113): the independent safety spec's verdict on
     /// the program.
     pub spec: crate::fuzz::oracle::SpecSide,
@@ -154,7 +157,7 @@ impl Invariant {
                     mini_reason: sides.mini_reason.as_deref(),
                     concrete: sides.concrete,
                     kernel: &sides.kernel,
-                    kernel_reason: None,
+                    kernel_reason: sides.kernel_reason.as_deref(),
                     strict,
                     spec: sides.spec,
                 });
@@ -286,16 +289,21 @@ pub fn evaluate_bytes(
         .as_ref()
         .map(concrete_side)
         .unwrap_or(ConcreteSide::Inconclusive);
-    let kernel = if kernel {
+    let (kernel, kernel_reason) = if kernel {
         match qemu {
             Some(q) => {
-                q.ask(&qemu_name(), bytes)
-                    .map_err(|e| ReduceError::KernelRequired(format!("qemu verdict failed: {e}")))?
-                    .0
+                let (side, reason, _) = q.ask(&qemu_name(), bytes).map_err(|e| {
+                    ReduceError::KernelRequired(format!("qemu verdict failed: {e}"))
+                })?;
+                (side, reason)
             }
             None => {
                 let outcome = load_with_kernel(bytes);
-                match kernel_side(&outcome) {
+                let reason = match &outcome {
+                    crate::krun::KernelOutcome::Reject { message, .. } => Some(message.clone()),
+                    _ => None,
+                };
+                let side = match kernel_side(&outcome) {
                     SideVerdict::Skipped => {
                         return Err(ReduceError::KernelRequired(format!(
                             "kernel load produced no verdict ({})",
@@ -303,11 +311,12 @@ pub fn evaluate_bytes(
                         )));
                     }
                     side => side,
-                }
+                };
+                (side, reason)
             }
         }
     } else {
-        SideVerdict::Skipped
+        (SideVerdict::Skipped, None)
     };
     let spec =
         crate::fuzz::oracle::spec_side(&crate::spec::verify_spec(env.program_insns(), &env.maps));
@@ -316,6 +325,7 @@ pub fn evaluate_bytes(
         mini_reason,
         concrete,
         kernel,
+        kernel_reason,
         spec,
     })
 }
@@ -370,7 +380,7 @@ pub fn replay_check(spec: &FindingSpec, sides: &Sides, strict: bool) -> Result<(
             mini_reason: sides.mini_reason.as_deref(),
             concrete: sides.concrete,
             kernel: &sides.kernel,
-            kernel_reason: None,
+            kernel_reason: sides.kernel_reason.as_deref(),
             strict,
             spec: sides.spec,
         });
@@ -573,6 +583,7 @@ mod tests {
             mini_reason: None,
             concrete,
             kernel,
+            kernel_reason: None,
             spec: crate::fuzz::oracle::SpecSide::Inconclusive,
         }
     }
@@ -637,6 +648,7 @@ mod tests {
             mini_reason: None,
             concrete: ConcreteSide::Safe,
             kernel: SideVerdict::Accept,
+            kernel_reason: None,
             spec: SpecSide::Reject,
         };
         assert!(invariant.preserves(&spec.name, &sides, false));
@@ -834,18 +846,30 @@ mod tests {
 
     #[test]
     fn invariant_strict_mode_whitelists() {
-        // strict mode: the `!root` kernel rules (PointerArith,
-        // Complexity) are design behaviour, not findings
+        // strict mode preserves explicit `for !root` message-based
+        // whitelisting, not every rejection in a broad category.
         let inv = Invariant::Classification {
             finding: Finding::Whitelisted,
             kernel_category: None,
         };
         assert!(inv.preserves(
             "seed-1-3",
+            &Sides {
+                kernel_reason: Some("pointer comparison prohibited for !root".into()),
+                ..sides_of(
+                    reject(ReasonCategory::UninitRead),
+                    ConcreteSide::Safe,
+                    reject(ReasonCategory::PointerArith),
+                )
+            },
+            true
+        ));
+        assert!(!inv.preserves(
+            "seed-1-3",
             &sides_of(
-                reject(ReasonCategory::UninitRead),
+                SideVerdict::Accept,
                 ConcreteSide::Safe,
-                reject(ReasonCategory::PointerArith)
+                reject(ReasonCategory::PointerArith),
             ),
             true
         ));

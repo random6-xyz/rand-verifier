@@ -117,8 +117,8 @@ fn read_slots_for(base: u8, offset: i16) -> u64 {
 /// writes an unknown target, so NOTHING may be killed — killing a slot
 /// that is actually read later would under-approximate liveness and
 /// unsoundly clean a live slot (reviewer finding, #97).
-fn write_slots_for(base: u8, offset: i16) -> u64 {
-    if base == 10 {
+fn write_slots_for(base: u8, offset: i16, size: crate::insn::MemSize) -> u64 {
+    if base == 10 && size.bytes() == 8 {
         fixed_slot(offset).map(|s| 1u64 << s).unwrap_or(0)
     } else {
         0
@@ -202,14 +202,19 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         // stores read the value and the base pointer (kernel BPF_STX:
         // `use = dst | src`; BPF_ST: `use = dst`)
         BpfInsn::StMem {
-            src, base, offset, ..
+            src,
+            base,
+            offset,
+            size,
         } => {
             ud.use_regs = reg_bit(*src) | reg_bit(*base);
-            ud.write_slots = write_slots_for(*base, *offset);
+            ud.write_slots = write_slots_for(*base, *offset, *size);
         }
-        BpfInsn::StMemImm { base, offset, .. } => {
+        BpfInsn::StMemImm {
+            base, offset, size, ..
+        } => {
             ud.use_regs = reg_bit(*base);
-            ud.write_slots = write_slots_for(*base, *offset);
+            ud.write_slots = write_slots_for(*base, *offset, *size);
         }
         // ldimm64 family: only the destination is defined (kernel
         // BPF_LD|BPF_IMM: `def = dst`); the second slot is a no-op.
@@ -501,6 +506,29 @@ mod tests {
         assert_eq!(live_slots(&l, 1), Vec::<usize>::new());
         assert_eq!(live_slots(&l, 2), vec![0]);
         assert_eq!(live_slots(&l, 3), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn partial_stack_write_keeps_unwritten_slot_bytes_live() {
+        let program = vec![
+            BpfInsn::StMemImm {
+                imm: 1,
+                base: 10,
+                offset: -8,
+                size: crate::insn::MemSize::B,
+            },
+            BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
+            },
+            BpfInsn::Exit,
+        ];
+        let l = analyze(&program);
+
+        assert_eq!(live_slots(&l, 0), vec![0]);
     }
 
     #[test]

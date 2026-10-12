@@ -772,11 +772,12 @@ impl<'a> SpecRunner<'a> {
                     let caller = SpecFrame {
                         regs: state.cur.regs,
                         stack: state.cur.stack,
-                        ret_pc: pc + 1,
+                        ret_pc: state.cur.ret_pc,
                     };
                     match push_frame(&mut state.saved, caller) {
                         Ok(()) => {
                             let mut callee = SpecFrame::callee();
+                            callee.ret_pc = pc + 1;
                             for r in 1..=5 {
                                 callee.regs[r] = state.cur.regs[r];
                             }
@@ -815,15 +816,16 @@ impl<'a> SpecRunner<'a> {
                     }
                     if caller_exists(state.saved) {
                         let return_pc = state.cur.ret_pc;
+                        let return_value = state.cur.regs[0];
                         let mut state_has_caller = state;
-                        let (mut caller, r0) = pop_frame(&mut state_has_caller.saved).unwrap();
-                        caller.regs[0] = r0;
+                        let mut caller = pop_frame(&mut state_has_caller.saved).unwrap();
+                        caller.regs[0] = return_value;
                         // the call clobbered the caller's argument
                         // registers
                         for r in 1..=5 {
                             caller.regs[r] = SpecValue::Uninit;
                         }
-                        if matches!(r0, SpecValue::PtrToStack { .. }) {
+                        if matches!(return_value, SpecValue::PtrToStack { .. }) {
                             return self.failure(pc, "cannot return stack pointer to the caller");
                         }
                         let mut state = state_has_caller;
@@ -1397,15 +1399,16 @@ impl<'a> SpecRunner<'a> {
                             self.failure(pc, "attempt to corrupt spilled pointer (narrow write)")
                         );
                     }
+                    let had_spill = state.cur.stack.spill[slot].is_some();
+                    // A partial write changes the bytes but no longer
+                    // represents the previous full-width spill value.
+                    state.cur.stack.spill[slot] = None;
                     // the privileged kernel rule: a 4-byte store to the
                     // LSB half of an empty slot initializes the slot's
                     // other half as unknown (save_register_state marks
                     // the remainder MISC) — a later read of the other
                     // half is then initialized (partial_kill_read)
-                    if bytes == 4
-                        && start.rem_euclid(8) == 0
-                        && state.cur.stack.spill[slot].is_none()
-                    {
+                    if bytes == 4 && start.rem_euclid(8) == 0 && !had_spill {
                         for i in 4..8 {
                             let idx = abs + i;
                             state.cur.stack.init[idx as usize] = true;
@@ -2099,10 +2102,9 @@ fn push_frame(saved: &mut [Option<SpecFrame>; 7], frame: SpecFrame) -> Result<()
     Ok(())
 }
 
-fn pop_frame(saved: &mut [Option<SpecFrame>; 7]) -> Option<(SpecFrame, SpecValue)> {
+fn pop_frame(saved: &mut [Option<SpecFrame>; 7]) -> Option<SpecFrame> {
     let slot = saved.iter().rposition(|f| f.is_some())?;
-    let fr = saved[slot].take().unwrap();
-    Some((fr, SpecValue::Uninit)) // r0 filled by the caller below
+    saved[slot].take()
 }
 
 fn caller_exists(saved: [Option<SpecFrame>; 7]) -> bool {
@@ -2456,6 +2458,42 @@ mod tests {
         assert_eq!(run(&insns), SpecVerdict::Accept);
         // the callee's R0 is really 6: without the return-value
         // transfer, r0 = r0 at pc2 would reject on uninitialized r0
+    }
+
+    #[test]
+    fn subprog_return_value_reaches_the_callsite() {
+        let insns = [
+            insn_bytes(0xb7, 1, 0, 0, 5),
+            insn_bytes(0x85, 0, 1, 0, 5), // call subprogram at pc 7
+            insn_bytes(0x15, 0, 0, 2, 6), // returned 6 takes the unsafe path
+            insn_bytes(0xb7, 0, 0, 0, 0),
+            insn_bytes(0x95, 0, 0, 0, 0),
+            insn_bytes(0xbf, 0, 3, 0, 0), // uninitialized source
+            insn_bytes(0x95, 0, 0, 0, 0),
+            insn_bytes(0xbf, 0, 1, 0, 0),
+            insn_bytes(0x07, 0, 0, 0, 1),
+            insn_bytes(0x95, 0, 0, 0, 0),
+        ];
+
+        assert!(matches!(run(&insns), SpecVerdict::Reject(_)));
+    }
+
+    #[test]
+    fn narrow_stack_write_invalidates_stale_scalar_spill() {
+        let insns = [
+            insn_bytes(0xb7, 1, 0, 0, 0),
+            insn_bytes(0x7b, 10, 1, -8, 0), // full-width spill of zero
+            insn_bytes(0xb7, 2, 0, 0, 1),
+            insn_bytes(0x63, 10, 2, -8, 0), // overwrite low 32 bits with 1
+            insn_bytes(0x79, 0, 10, -8, 0), // load the updated 64-bit value
+            insn_bytes(0x15, 0, 0, 2, 1),   // value 1 takes the unsafe path
+            insn_bytes(0xb7, 0, 0, 0, 0),
+            insn_bytes(0x95, 0, 0, 0, 0),
+            insn_bytes(0xbf, 0, 3, 0, 0), // uninitialized source
+            insn_bytes(0x95, 0, 0, 0, 0),
+        ];
+
+        assert!(matches!(run(&insns), SpecVerdict::Reject(_)));
     }
 
     #[test]
