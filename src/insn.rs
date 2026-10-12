@@ -491,6 +491,8 @@ pub enum DecodeError {
     InvalidRegister { reg: u8 },
     /// Non-zero reserved fields (kernel's check_*_fields messages).
     ReservedFields { message: &'static str },
+    /// A raw instruction slot is not the kernel's fixed 8-byte size.
+    InvalidInstructionLength { actual: usize },
     /// A `BPF_LD|BPF_DW|BPF_IMM` first slot without its second slot
     /// (kernel: "invalid bpf_ldimm64 insn").
     LdImm64Truncated,
@@ -505,6 +507,12 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::InvalidRegister { reg } => write!(f, "R{} is invalid", reg),
             DecodeError::ReservedFields { message } => f.write_str(message),
+            DecodeError::InvalidInstructionLength { actual } => {
+                write!(
+                    f,
+                    "invalid instruction length: expected 8 bytes, got {actual}"
+                )
+            }
             DecodeError::LdImm64Truncated => {
                 write!(f, "invalid bpf_ldimm64 insn (missing second slot)")
             }
@@ -597,6 +605,12 @@ fn unsupported_reason(op: u8) -> Option<&'static str> {
 /// kernel opcodes the verifier does not implement are rejected as
 /// unsupported.
 pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
+    if bytes.len() != 8 {
+        return Err(DecodeError::InvalidInstructionLength {
+            actual: bytes.len(),
+        });
+    }
+
     let op = bytes[0];
     let regs = bytes[1];
     let dst = regs & 0x0F;
@@ -823,7 +837,7 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
 pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)> {
     let mut insns = Vec::new();
     let mut idx = 0usize;
-    let (chunks, _) = bytes.as_chunks::<8>();
+    let (chunks, remainder) = bytes.as_chunks::<8>();
     while idx < chunks.len() {
         if chunks[idx][0] == opcode::LD_IMM64 {
             let second = chunks
@@ -839,6 +853,14 @@ pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)
             idx += 1;
         }
     }
+    if !remainder.is_empty() {
+        return Err((
+            idx,
+            DecodeError::InvalidInstructionLength {
+                actual: remainder.len(),
+            },
+        ));
+    }
     Ok(insns)
 }
 
@@ -850,8 +872,17 @@ pub fn decode_program(bytes: &[u8]) -> Result<Vec<BpfInsn>, (usize, DecodeError)
 /// The map fd forms carry `key_size`/`value_size` filled by the program
 /// loader from the map registry (decode yields 0).
 pub fn parse_ldimm64(first: &[u8], second: &[u8]) -> Result<BpfInsn, DecodeError> {
-    debug_assert_eq!(first.len(), 8);
-    debug_assert_eq!(second.len(), 8);
+    if first.len() != 8 {
+        return Err(DecodeError::InvalidInstructionLength {
+            actual: first.len(),
+        });
+    }
+    if second.len() != 8 {
+        return Err(DecodeError::InvalidInstructionLength {
+            actual: second.len(),
+        });
+    }
+
     let regs = first[1];
     let dst = regs & 0x0F;
     let src = (regs >> 4) & 0x0F;
@@ -1173,6 +1204,44 @@ mod tests {
                 offset: 4
             }
         ));
+    }
+
+    #[test]
+    fn decode_program_rejects_trailing_partial_instruction() {
+        let mut bytes = prog_bytes(&[insn_bytes(opcode::EXIT, 0, 0, 0, 0)]);
+        bytes.push(0xb7);
+
+        assert_eq!(
+            decode_program(&bytes),
+            Err((1, DecodeError::InvalidInstructionLength { actual: 1 }))
+        );
+        assert_eq!(
+            decode_program(&[0u8; 7]),
+            Err((0, DecodeError::InvalidInstructionLength { actual: 7 }))
+        );
+    }
+
+    #[test]
+    fn parse_functions_reject_invalid_instruction_lengths() {
+        assert_eq!(
+            parse_insn(&[0u8; 7]),
+            Err(DecodeError::InvalidInstructionLength { actual: 7 })
+        );
+        assert_eq!(
+            parse_insn(&[0u8; 9]),
+            Err(DecodeError::InvalidInstructionLength { actual: 9 })
+        );
+
+        let first = insn_bytes(opcode::LD_IMM64, 0, 0, 0, 0);
+        let second = [0u8; 8];
+        assert_eq!(
+            parse_ldimm64(&first[..7], &second),
+            Err(DecodeError::InvalidInstructionLength { actual: 7 })
+        );
+        assert_eq!(
+            parse_ldimm64(&first, &second[..7]),
+            Err(DecodeError::InvalidInstructionLength { actual: 7 })
+        );
     }
 
     #[test]

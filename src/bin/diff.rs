@@ -101,6 +101,18 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn drop_caps_for_strict_mode(
+    is_root: bool,
+    strict: bool,
+    drop_caps: impl FnOnce() -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    if is_root && strict {
+        drop_caps().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let json_path = args
@@ -113,14 +125,17 @@ fn main() {
     // real-world baseline (root loads get the kernel's lenient rules:
     // allow_uninit_stack etc.). --strict drops everything except
     // CAP_BPF+CAP_NET_ADMIN for an unprivileged-equivalent comparison.
-    if unsafe { libc::geteuid() } == 0 {
-        if args.iter().any(|a| a == "--strict") {
-            match drop_privileged_caps() {
-                Ok(msg) => eprintln!("strict mode: {}", msg),
-                Err(e) => eprintln!("strict mode: {}", e),
-            }
-        } else {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let strict = args.iter().any(|a| a == "--strict");
+    match drop_caps_for_strict_mode(is_root, strict, drop_privileged_caps) {
+        Ok(Some(msg)) => eprintln!("strict mode: {}", msg),
+        Ok(None) if is_root && !strict => {
             eprintln!("privileged mode: full capabilities (kernel lenient rules)");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("strict mode capability drop failed: {e}");
+            std::process::exit(2);
         }
     }
 
@@ -270,5 +285,22 @@ fn main() {
         .count();
     if findings > 0 {
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_capability_drop_failure_is_not_silently_accepted() {
+        let result = drop_caps_for_strict_mode(true, true, || Err("capset failed".into()));
+        assert_eq!(result, Err("capset failed".into()));
+    }
+
+    #[test]
+    fn non_strict_mode_does_not_attempt_capability_drop() {
+        let result = drop_caps_for_strict_mode(true, false, || panic!("unexpected cap drop"));
+        assert_eq!(result, Ok(None));
     }
 }

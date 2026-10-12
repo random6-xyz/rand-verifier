@@ -253,12 +253,19 @@ fn backtrack_insn(
         | BpfInsn::LdMapFd { dst, .. }
         | BpfInsn::LdMapValue { dst, .. } => bt.regs &= !dst_bit(*dst),
         BpfInsn::LdImm64Second { .. } => {}
-        // a helper call or BPF-to-BPF call writes R0; the argument
-        // registers were either consumed by the call's own checks or
-        // are dead — a requirement still pending on them cannot be
-        // resolved here (kernel: verifier_bug; we fall back
-        // conservatively)
-        BpfInsn::Call { .. } | BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => {
+        // A subprogram's returned R0 depends on its arguments and the
+        // callee's execution history, which is not present in this path
+        // segment. Do not treat the call as a constant-defining R0; the
+        // conservative checkpoint fallback keeps caller scalars precise.
+        BpfInsn::CallSub { .. } => {
+            if bt.regs & ((1u16 << 0) | 0b111110) != 0 {
+                return BacktrackOutcome::Fallback;
+            }
+        }
+        // Helper/kfunc return values are modeled by their prototypes. A
+        // requirement still pending on an argument cannot be resolved
+        // here, so fall back conservatively.
+        BpfInsn::Call { .. } | BpfInsn::CallKfunc { .. } => {
             bt.regs &= !(1u16 << 0);
             if bt.regs & 0b111110 != 0 {
                 return BacktrackOutcome::Fallback;
@@ -1849,6 +1856,14 @@ mod tests {
             st.regs[0],
             RegState::Scalar(b) if b.smin == 42
         )));
+    }
+
+    #[test]
+    fn backtracking_through_subprog_return_falls_back() {
+        let mut bt = Backtrack { regs: 1, slots: 0 }; // returned R0 is precise
+        let outcome = backtrack_insn(&BpfInsn::CallSub { offset: 0 }, None, &mut bt);
+
+        assert!(matches!(outcome, BacktrackOutcome::Fallback));
     }
 
     #[test]

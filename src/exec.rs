@@ -277,11 +277,7 @@ pub(crate) fn step(
                         format!("too many references held (max {})", crate::state::MAX_REFS),
                     ));
                 }
-                // the kernel allocates every id from one global counter
-                // (env->id_gen), so the pc-derived ids of the mini can
-                // never collide with the reference ids — the refs live
-                // in a disjoint high space (#101 review fix)
-                let id = crate::state::REF_ID_BASE + next.refs_cnt as u32 + 1;
+                let id = fresh_reference_id(&next);
                 next.refs[next.refs_cnt as usize] = id;
                 next.refs_cnt += 1;
                 // the buffer size comes from the reserve's size
@@ -337,46 +333,9 @@ pub(crate) fn step(
                         format!("release of unacquired reference {}", id),
                     ));
                 }
-                // cascade: every register and spill sharing the id (or
-                // derived from it via parent_id — the kernel's
-                // release_reference idstack walk, #99) is invalidated
-                for reg in next.regs.iter_mut() {
-                    if matches!(
-                        reg,
-                        RegState::PtrToMem {
-                            id: rid,
-                            parent_id: pid,
-                            ..
-                        } | RegState::PtrToMemOrNull {
-                            id: rid,
-                            parent_id: pid,
-                            ..
-                        } if *rid == id || *pid == id
-                    ) {
-                        *reg = RegState::Scalar(ScalarBounds::unknown());
-                    }
-                }
-                for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
-                    if let Some(
-                        RegState::PtrToMem {
-                            id: rid,
-                            parent_id: pid,
-                            ..
-                        }
-                        | RegState::PtrToMemOrNull {
-                            id: rid,
-                            parent_id: pid,
-                            ..
-                        },
-                    ) = spilled
-                        && (*rid == id || *pid == id)
-                        && next.stack.bytes[slot * 8..slot * 8 + 8]
-                            .iter()
-                            .all(|x| *x == StackByte::Spill)
-                    {
-                        *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
-                    }
-                }
+                // Release invalidates aliases in every active frame, including
+                // caller frames saved across BPF-to-BPF calls.
+                invalidate_reference_aliases(&mut next, id);
                 next.regs[0] = helper.return_type;
             } else {
                 next.regs[0] = helper.return_type;
@@ -838,6 +797,70 @@ fn dynptr_slot_of(
     Ok((spi, ds))
 }
 
+/// Allocate an identifier that is distinct from every currently active
+/// reference. Released IDs may be reused only after all frame aliases are
+/// invalidated.
+fn fresh_reference_id(state: &VerifierState) -> u32 {
+    let active = &state.refs[..state.refs_cnt as usize];
+    let mut id = crate::state::REF_ID_BASE + 1;
+    while active.contains(&id) {
+        id += 1;
+    }
+    id
+}
+
+fn invalidate_reference_aliases_in_frame(
+    regs: &mut [RegState; 11],
+    stack: &mut StackState,
+    id: u32,
+) {
+    for reg in regs.iter_mut() {
+        if matches!(
+            reg,
+            RegState::PtrToMem { id: rid, parent_id: pid, .. }
+                | RegState::PtrToMemOrNull { id: rid, parent_id: pid, .. }
+                if *rid == id || *pid == id
+        ) || matches!(reg, RegState::PtrToBtfId { ref_obj_id, .. } if *ref_obj_id == id)
+        {
+            *reg = RegState::Scalar(ScalarBounds::unknown());
+        }
+    }
+    for (slot, spilled) in stack.spilled.iter_mut().enumerate() {
+        if let Some(
+            RegState::PtrToMem {
+                id: rid,
+                parent_id: pid,
+                ..
+            }
+            | RegState::PtrToMemOrNull {
+                id: rid,
+                parent_id: pid,
+                ..
+            },
+        ) = spilled
+            && (*rid == id || *pid == id)
+            && stack.bytes[slot * 8..slot * 8 + 8]
+                .iter()
+                .all(|byte| *byte == StackByte::Spill)
+        {
+            *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
+        } else if matches!(spilled, Some(RegState::PtrToBtfId { ref_obj_id, .. }) if *ref_obj_id == id)
+            && stack.bytes[slot * 8..slot * 8 + 8]
+                .iter()
+                .all(|byte| *byte == StackByte::Spill)
+        {
+            *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
+        }
+    }
+}
+
+fn invalidate_reference_aliases(state: &mut VerifierState, id: u32) {
+    invalidate_reference_aliases_in_frame(&mut state.regs, &mut state.stack, id);
+    for frame in state.saved.iter_mut().flatten() {
+        invalidate_reference_aliases_in_frame(&mut frame.regs, &mut frame.stack, id);
+    }
+}
+
 /// The dynptr helper family (197/201/202/203, #101): validates the
 /// dynptr arguments, applies the side effects (a fresh dynptr slot
 /// from bpf_dynptr_from_mem, an initialized buffer for the reads, the
@@ -877,6 +900,12 @@ fn dynptr_helper_call(
                     "dynptr_from_mem: arg #4 must be an exact 16-byte-aligned stack offset",
                 ));
             }
+            if min_offset < -(STACK_SIZE as i32) || min_offset > -16 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "dynptr_from_mem: arg #4 is outside the stack frame",
+                ));
+            }
             let spi = (-min_offset - 1) as usize / 8;
             let lo_slot = spi - 1;
             for slot in lo_slot..=spi {
@@ -899,8 +928,13 @@ fn dynptr_helper_call(
                 RegState::Scalar(b) if b.is_constant() && b.smin >= 0 => b.smin as i32,
                 _ => 8,
             };
-            if let RegState::PtrToStack { min_offset, .. } = state.regs[1] {
-                init_stack_buffer(next, min_offset, len);
+            if let RegState::PtrToStack {
+                min_offset,
+                max_offset,
+                ..
+            } = state.regs[1]
+            {
+                init_stack_buffer(pc, next, min_offset, max_offset, len as i64)?;
             }
         }
         // write(dst, offset, src, len, flags): the dst dynptr must be
@@ -941,14 +975,34 @@ fn dynptr_helper_call(
 
 /// Mark the buffer bytes of an exact stack pointer as initialized
 /// (kernel check_stack_range_initialized with the clobber semantics).
-fn init_stack_buffer(next: &mut VerifierState, min_offset: i32, len: i32) {
-    // the buffer [min_offset, min_offset + len): the frame bytes
-    // [b(min_offset + len - 1), b(min_offset)]
-    let lo = stack_byte_index(min_offset as i64 + len as i64 - 1);
-    let hi = stack_byte_index(min_offset as i64);
+fn init_stack_buffer(
+    pc: u32,
+    next: &mut VerifierState,
+    min_offset: i32,
+    max_offset: i32,
+    len: i64,
+) -> Result<(), VerificationFailure> {
+    if len < 0 || min_offset > max_offset {
+        return Err(VerificationFailure::new(
+            pc,
+            "invalid dynptr_read buffer range",
+        ));
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    let end = max_offset as i64 + len;
+    if min_offset < -(STACK_SIZE as i32) || end > 0 {
+        return Err(VerificationFailure::new(
+            pc,
+            "dynptr_read destination is outside the stack frame",
+        ));
+    }
+    let (lo, hi) = stack_byte_range(min_offset as i64, end);
     for i in lo..=hi {
         next.stack.bytes[i] = StackByte::Misc;
     }
+    Ok(())
 }
 
 /// The covered bytes of `[min_offset, max_offset)` must be readable
@@ -1012,7 +1066,7 @@ fn kfunc_call(
                 format!("too many references held (max {})", crate::state::MAX_REFS),
             ));
         }
-        let id = crate::state::REF_ID_BASE + next.refs_cnt as u32 + 1;
+        let id = fresh_reference_id(&next);
         next.refs[next.refs_cnt as usize] = id;
         next.refs_cnt += 1;
         // the return's btf id comes from the argument (the kernel
@@ -1052,27 +1106,7 @@ fn kfunc_call(
                 format!("release of unacquired reference {}", id),
             ));
         }
-        for reg in next.regs.iter_mut() {
-            if let RegState::PtrToBtfId {
-                ref_obj_id: rid, ..
-            } = reg
-                && *rid == id
-            {
-                *reg = RegState::Scalar(ScalarBounds::unknown());
-            }
-        }
-        for (slot, spilled) in next.stack.spilled.iter_mut().enumerate() {
-            if let Some(RegState::PtrToBtfId {
-                ref_obj_id: rid, ..
-            }) = spilled
-                && *rid == id
-                && next.stack.bytes[slot * 8..slot * 8 + 8]
-                    .iter()
-                    .all(|x| *x == StackByte::Spill)
-            {
-                *spilled = Some(RegState::Scalar(ScalarBounds::unknown()));
-            }
-        }
+        invalidate_reference_aliases(&mut next, id);
         next.regs[0] = proto.return_type;
     } else {
         next.regs[0] = proto.return_type;
@@ -1586,6 +1620,29 @@ fn frame_stack_mut(state: &mut VerifierState, frameno: u8) -> &mut StackState {
     }
 }
 
+fn memory_store_scalar(
+    pc: u32,
+    state: &VerifierState,
+    src: Option<u8>,
+    imm: Option<i32>,
+    memory_kind: &str,
+) -> Result<(), VerificationFailure> {
+    let value = match src {
+        Some(reg) => read_reg(pc, state, reg)?,
+        None => RegState::Scalar(ScalarBounds::constant(
+            imm.expect("an immediate store carries an imm") as i64,
+        )),
+    };
+    if matches!(value, RegState::Scalar(_)) {
+        Ok(())
+    } else {
+        Err(VerificationFailure::new(
+            pc,
+            format!("cannot store a pointer into {memory_kind}"),
+        ))
+    }
+}
+
 fn stack_write(
     pc: u32,
     base: u8,
@@ -1811,6 +1868,7 @@ fn stack_write(
         // engine tracks the bytes (#89)
         RegState::PtrToMapValue { .. } => {
             map_value_access_check(pc, base, base_state, offset)?;
+            memory_store_scalar(pc, state, src, imm, "map value")?;
             Ok(*state)
         }
         // stores into a referenced memory buffer stay within the
@@ -1828,6 +1886,7 @@ fn stack_write(
                 max_offset,
                 size.bytes() as i64,
             )?;
+            memory_store_scalar(pc, state, src, imm, "referenced memory")?;
             Ok(*state)
         }
         _ => Err(non_stack_base_error(pc, base, "store")),
@@ -2293,6 +2352,8 @@ fn shift32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
         AluOp::Lsh => {
             if k >= 32 {
                 (0, 0)
+            } else if k == 0 {
+                (d.0, d.1)
             } else if d.1 < 1u32 << (32 - k) {
                 (d.0 << k, d.1 << k)
             } else {
@@ -2521,11 +2582,10 @@ fn shift64_range(op: AluOp, dmin: i64, dmax: i64, smin: i64, smax: i64) -> (i64,
         // some shift amount in [smin, smax] applies; only the extremes
         // that hold for every amount are usable
         AluOp::Lsh => {
-            if dmin >= 0 {
-                (0, i64::MAX)
-            } else {
-                (i64::MIN, i64::MAX)
-            }
+            // A variable shift can cross the sign bit even when the input
+            // is non-negative (e.g. 1 << [0, 63]); one signed interval
+            // must therefore cover both halves of the i64 domain.
+            (i64::MIN, i64::MAX)
         }
         AluOp::Rsh => {
             if dmin >= 0 {
@@ -3991,6 +4051,27 @@ mod tests {
             panic!("expected scalar");
         };
         assert_eq!(b.signed(), (1 << 62, (1 << 62) + 12));
+    }
+
+    #[test]
+    fn variable_alu64_lsh_preserves_sign_bit_result() {
+        let dst = ScalarBounds::constant(1);
+        let amount = ScalarBounds::from_signed(0, 63);
+        let result = apply_alu(AluOp::Lsh, AluWidth::W64, dst, amount);
+
+        assert!(result.umin <= (1u64 << 63) && (1u64 << 63) <= result.umax);
+    }
+
+    #[test]
+    fn alu32_lsh_zero_amount_does_not_panic() {
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::Scalar(ScalarBounds::unknown());
+
+        let next = step(0, &state, &BpfInsn::Lsh32Imm { dst: 1, imm: 0 }).unwrap();
+        let RegState::Scalar(result) = next.regs[1] else {
+            panic!("expected scalar");
+        };
+        assert_eq!((result.u32_min, result.u32_max), (0, u32::MAX));
     }
 
     #[test]
@@ -7019,6 +7100,92 @@ mod ref_tracking_tests {
     }
 
     #[test]
+    fn acquired_reference_ids_do_not_reuse_an_active_id() {
+        let (mut state, first_id) = reserve_state();
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 0,
+            value_size: 0,
+            map_type: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state = step(0, &state, &BpfInsn::Call { imm: 131 }).unwrap();
+        let second_id = match state.regs[0] {
+            RegState::PtrToMemOrNull { id, .. } => id,
+            ref other => panic!("expected second reference, got {other:?}"),
+        };
+
+        state.regs[1] = RegState::PtrToMem {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            id: first_id,
+            parent_id: 0,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        state = step(0, &state, &BpfInsn::Call { imm: 132 }).unwrap();
+        assert_eq!(state.refs_cnt, 1);
+        assert_eq!(state.refs[0], second_id);
+
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 0,
+            value_size: 0,
+            map_type: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state = step(0, &state, &BpfInsn::Call { imm: 131 }).unwrap();
+        let third_id = match state.regs[0] {
+            RegState::PtrToMemOrNull { id, .. } => id,
+            ref other => panic!("expected third reference, got {other:?}"),
+        };
+
+        assert_ne!(second_id, third_id);
+    }
+
+    #[test]
+    fn callee_reference_release_invalidates_saved_caller_aliases() {
+        let id = crate::state::REF_ID_BASE + 1;
+        let mut state = VerifierState::initial();
+        state.refs[0] = id;
+        state.refs_cnt = 1;
+        let alias = RegState::PtrToMem {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            id,
+            parent_id: 0,
+        };
+        state.regs[1] = alias;
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[6] = alias;
+        state.call_subprog(10).unwrap();
+
+        let mut returned = step(5, &state, &BpfInsn::Call { imm: 132 }).unwrap();
+        returned.return_from_subprog().unwrap();
+
+        assert!(matches!(returned.regs[6], RegState::Scalar(_)));
+    }
+
+    #[test]
+    fn map_store_rejects_uninitialized_source_register() {
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+
+        let result = stack_write(0, 1, &state, 0, crate::insn::MemSize::DW, Some(0), None);
+        assert!(
+            result.is_err(),
+            "uninitialized map store source was accepted"
+        );
+    }
+
+    #[test]
     fn null_check_releases_reference_on_null_side() {
         // if r0 == 0 goto +1 — the null branch drops the reference and
         // the pointer becomes the scalar 0; the valid branch refines it
@@ -7161,6 +7328,43 @@ mod dynptr_kfunc_tests {
         state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
         state.regs[4] = ptr_stack(-32);
         step(0, &state, &BpfInsn::Call { imm: 197 }).unwrap()
+    }
+
+    #[test]
+    fn dynptr_from_mem_out_of_frame_returns_error_without_panicking() {
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMapValue {
+            min_offset: 0,
+            max_offset: 0,
+            align_off: 0,
+            value_size: 8,
+            id: 1,
+        };
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[4] = ptr_stack(-528);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            step(0, &state, &BpfInsn::Call { imm: 197 })
+        }));
+        assert!(result.is_ok(), "invalid dynptr stack offset panicked");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn dynptr_read_out_of_frame_returns_error_without_panicking() {
+        let mut state = dynptr_setup();
+        state.regs[1] = ptr_stack(-520);
+        state.regs[2] = RegState::Scalar(ScalarBounds::constant(8));
+        state.regs[3] = ptr_stack(-32);
+        state.regs[4] = RegState::Scalar(ScalarBounds::constant(0));
+        state.regs[5] = RegState::Scalar(ScalarBounds::constant(0));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            step(0, &state, &BpfInsn::Call { imm: 201 })
+        }));
+        assert!(result.is_ok(), "invalid dynptr_read destination panicked");
+        assert!(result.unwrap().is_err());
     }
 
     #[test]

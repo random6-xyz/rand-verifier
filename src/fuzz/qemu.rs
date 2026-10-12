@@ -91,7 +91,7 @@ pub struct QemuBatch {
 pub type QemuJob = (
     String,
     Vec<u8>,
-    std::sync::mpsc::Sender<Result<(SideVerdict, Option<String>), String>>,
+    std::sync::mpsc::Sender<Result<(SideVerdict, Option<String>, Option<u32>), String>>,
 );
 
 impl QemuBatch {
@@ -116,7 +116,7 @@ impl QemuBatch {
         let (rtx, rrx) = std::sync::mpsc::channel();
         self.tx.send((name.to_string(), bytes.to_vec(), rtx))?;
         match rrx.recv()? {
-            Ok((v, m)) => Ok((v, m, None)),
+            Ok(verdict) => Ok(verdict),
             Err(e) => Ok((SideVerdict::Skipped, Some(e), None)),
         }
     }
@@ -156,7 +156,7 @@ fn qemu_worker(dir: PathBuf, strict: bool, rx: std::sync::mpsc::Receiver<QemuJob
             Ok((name, bytes, resp)) => {
                 if name == "__flush__" {
                     flush_batch(&dir, strict, &mut pending);
-                    let _ = resp.send(Ok((SideVerdict::Accept, None)));
+                    let _ = resp.send(Ok((SideVerdict::Accept, None, None)));
                 } else {
                     pending.push((name, bytes, resp));
                     if pending.len() >= QEMU_BATCH {
@@ -302,8 +302,8 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
             .unwrap_or_else(|| "<no file>".into());
         let _ = fs::remove_file(&p);
         match parsed {
-            Some((v, m)) => {
-                let _ = resp.send(Ok((v, m)));
+            Some((v, m, insn_idx)) => {
+                let _ = resp.send(Ok((v, m, insn_idx)));
             }
             None => {
                 eprintln!("qemu: parse failure for {name}: {first_line:?}");
@@ -344,17 +344,18 @@ fn fail_all(pending: &mut Vec<QemuJob>, why: &str) {
     }
 }
 
-/// Parse one agent output file: `ACCEPT` or `REJECT <reason> errno=<n>`.
+/// Parse one agent output file: `ACCEPT` or
+/// `REJECT <reason> insn_idx=<n> errno=<n>`.
 /// Infrastructure failures (the agent could not read the job file, the
 /// guest verifier hit the per-program timeout, or the load failed
 /// without a verifier-log line) return `None` — they are not kernel
 /// verdicts and must surface as `Skipped`, never as findings (a
 /// cannot-read race with the batch deadline clearing the job dir used
 /// to classify as REJECT(Other) → precision-candidate).
-pub fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> {
+pub fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>, Option<u32>)> {
     let first = text.lines().find(|l| !l.trim().is_empty())?;
     if first.trim() == "ACCEPT" {
-        return Some((SideVerdict::Accept, None));
+        return Some((SideVerdict::Accept, None, None));
     }
     let rest = first.trim();
     if rest.trim() == "AGENT-TIMEOUT" {
@@ -367,6 +368,7 @@ pub fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> 
         if reason.starts_with("cannot-read")
             || reason.starts_with("invalid-program")
             || reason.starts_with("no-error-line")
+            || reason.starts_with("not-privileged")
         {
             return None;
         }
@@ -375,8 +377,19 @@ pub fn parse_agent_verdict(text: &str) -> Option<(SideVerdict, Option<String>)> 
             .rsplit_once(" errno=")
             .map(|(r, _)| r)
             .unwrap_or(reason);
+        let (reason, insn_idx) = match reason.rsplit_once(" insn_idx=") {
+            Some((message, index)) => match index.parse::<u32>() {
+                Ok(index) => (message, Some(index)),
+                Err(_) => (reason, None),
+            },
+            None => (reason, None),
+        };
         let category = categorize_reason(reason);
-        return Some((SideVerdict::Reject { category }, Some(reason.to_string())));
+        return Some((
+            SideVerdict::Reject { category },
+            Some(reason.to_string()),
+            insn_idx,
+        ));
     }
     None
 }
@@ -389,12 +402,17 @@ mod tests {
     fn parse_verdicts() {
         assert_eq!(
             parse_agent_verdict("ACCEPT\n"),
-            Some((SideVerdict::Accept, None))
+            Some((SideVerdict::Accept, None, None))
         );
-        let (v, m) =
+        let (v, m, idx) =
             parse_agent_verdict("REJECT invalid stack off=-520 size=8 errno=13\n").unwrap();
         assert!(matches!(v, SideVerdict::Reject { .. }));
         assert!(m.unwrap().contains("invalid stack off"));
+        assert_eq!(idx, None);
+        let (_, m, idx) =
+            parse_agent_verdict("REJECT invalid mem access insn_idx=7 errno=13\n").unwrap();
+        assert_eq!(m.as_deref(), Some("invalid mem access"));
+        assert_eq!(idx, Some(7));
         assert!(parse_agent_verdict("").is_none());
         assert!(parse_agent_verdict("TIMEOUT\n").is_none());
     }
@@ -407,5 +425,6 @@ mod tests {
         assert!(parse_agent_verdict("REJECT cannot-read job file errno=2\n").is_none());
         assert!(parse_agent_verdict("REJECT invalid-program bytes errno=22\n").is_none());
         assert!(parse_agent_verdict("REJECT no-error-line errno=28\n").is_none());
+        assert!(parse_agent_verdict("REJECT not-privileged errno=1\n").is_none());
     }
 }

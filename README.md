@@ -96,7 +96,7 @@ cat fuzz-out/qemu-<seed>-<stamp>/summary.json
 tools/finding-report.sh fuzz-out/qemu-<seed>-<stamp>
 ```
 
-The guest protocol is implemented by `src/fuzz/qemu.rs` and the sample guest in `tools/qemu/initramfs/`: a `guest-ready` marker confirms boot, `strict`/`run.sh`/`batch-ready`/`batch-done` markers drive each batch, `AGENT-TIMEOUT` guards the 30-second per-program budget, and infrastructure failures are reported as `cannot-read`/`invalid-program`/`no-error-line` (never as kernel verdicts).
+The guest protocol is implemented by `src/fuzz/qemu.rs` and the sample guest in `tools/qemu/initramfs/`: a `guest-ready` marker confirms boot, `strict`/`run.sh`/`batch-ready`/`batch-done` markers drive each batch, and `AGENT-TIMEOUT` guards the 30-second per-program budget. Kernel rejection lines carry `insn_idx=<n>` for triage. Infrastructure failures—including `cannot-read`, `invalid-program`, `no-error-line`, and `not-privileged` (including strict capability-drop failure)—are surfaced as skipped results, not kernel verdicts.
 
 ## Verdict semantics
 

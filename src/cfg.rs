@@ -42,24 +42,9 @@ pub(crate) fn find_subprog_range(insn_idx: u32, subprogs: &[u32], insn_cnt: u32)
     (start, end)
 }
 
-/// The kernel's `check_max_stack_depth` (kernel/bpf/verifier.c): each
-/// subprogram's static stack usage (r10-based accesses, rounded up to
-/// 8 bytes) is summed along every call chain; a chain whose combined
-/// depth exceeds the 512-byte frame budget is rejected ("combined
-/// stack size of %d calls is %d. Too large"). Caller-frame stack
-/// pointers (frameno, #100) cannot smuggle unbounded stack use into a
-/// chain — the kernel checks the chain, not the current frame
-/// (mseed-202608161-10021 etc.: subprog chains with 300-byte frames
-/// per call, mini accepted, kernel rejects).
-pub fn check_combined_stack_depth(
-    insns: &[BpfInsn],
-    subprogs: &[u32],
-) -> Result<(), VerificationFailure> {
-    use crate::state::STACK_SIZE;
-
+/// Static stack usage per subprogram from direct R10-based accesses.
+fn direct_stack_depths(insns: &[BpfInsn], subprogs: &[u32]) -> Vec<usize> {
     let insn_cnt = insns.len() as u32;
-    let round_up_8 = |x: usize| x.div_ceil(8) * 8;
-    // static stack usage per subprogram: the deepest r10-based access
     let mut depth = vec![0usize; subprogs.len()];
     for (i, &start) in subprogs.iter().enumerate() {
         let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt);
@@ -86,11 +71,20 @@ pub fn check_combined_stack_depth(
                 _ => continue,
             };
             let use_bytes = (-off as i64 + size as i64).max(0) as usize;
-            depth[i] = depth[i].max(round_up_8(use_bytes));
+            depth[i] = depth[i].max(use_bytes.div_ceil(8) * 8);
         }
     }
-    // call chains: DFS from the main program; a recursive call is
-    // rejected by the other structural checks, so chains stay acyclic
+    depth
+}
+
+/// Check every static call chain against its per-subprogram stack budget.
+fn check_stack_call_chains(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+    depth: &[usize],
+) -> Result<(), VerificationFailure> {
+    use crate::state::STACK_SIZE;
+
     fn visit(
         idx: usize,
         insns: &[BpfInsn],
@@ -107,17 +101,12 @@ pub fn check_combined_stack_depth(
                     continue;
                 };
                 if chain.contains(&callee) {
-                    continue;
+                    return Err(VerificationFailure::new(
+                        pc,
+                        format!("recursive subprogram call to entry {}", subprogs[callee]),
+                    ));
                 }
                 chain.push(callee);
-                // the kernel's MAX_CALL_FRAMES check (verifier.c
-                // check_max_stack_depth / do_check_subprogs): the
-                // STATIC call chain depth is limited, independent of
-                // which branches actually execute ("the call stack of
-                // %d frames is too deep !", errno E2BIG). mini's path
-                // exploration alone never builds the full chain when a
-                // branch skips a call (mseed-202608161-1736: a 17-deep
-                // chain where the first call is statically skipped).
                 if chain.len() > crate::state::MAX_CALL_FRAMES {
                     return Err(VerificationFailure::new(
                         pc,
@@ -141,7 +130,98 @@ pub fn check_combined_stack_depth(
         }
         Ok(())
     }
-    visit(0, insns, subprogs, &depth, &mut vec![0usize])
+    visit(0, insns, subprogs, depth, &mut vec![0usize])
+}
+
+/// The kernel's `check_max_stack_depth` (kernel/bpf/verifier.c): each
+/// subprogram's static stack usage is summed along every call chain. The
+/// static pass accounts for direct R10 accesses and rejects recursive call
+/// graphs, including recursion on a branch that is infeasible at runtime.
+pub fn check_combined_stack_depth(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+) -> Result<(), VerificationFailure> {
+    let depth = direct_stack_depths(insns, subprogs);
+    check_stack_call_chains(insns, subprogs, &depth)
+}
+
+fn stack_access(insn: &BpfInsn) -> Option<(u8, i16, usize)> {
+    match insn {
+        BpfInsn::LdMem {
+            base, offset, size, ..
+        }
+        | BpfInsn::StMem {
+            base, offset, size, ..
+        }
+        | BpfInsn::StMemImm {
+            base, offset, size, ..
+        } => Some((*base, *offset, size.bytes())),
+        _ => None,
+    }
+}
+
+/// Resolve which subprogram owns a stack frame in an abstract state.
+fn frame_subprog_entry(
+    state: &crate::state::VerifierState,
+    frameno: u8,
+    insns: &[BpfInsn],
+) -> Option<u32> {
+    if frameno == 0 {
+        return Some(0);
+    }
+    if frameno > state.curframe {
+        return None;
+    }
+    let return_pc = if frameno == state.curframe {
+        state.ret_pc
+    } else {
+        state.saved.get(frameno as usize)?.as_ref()?.ret_pc
+    };
+    let call_pc = return_pc.checked_sub(1)?;
+    let BpfInsn::CallSub { offset } = insns.get(call_pc as usize)? else {
+        return None;
+    };
+    Some((call_pc as i64 + 1 + *offset as i64) as u32)
+}
+
+/// Add stack use through R10-derived aliases using the mini's per-PC
+/// abstract states, then apply the same static call-chain limit. The base
+/// register is live at each access, so liveness cleaning preserves its
+/// stack provenance in these states.
+pub(crate) fn check_combined_stack_depth_with_states(
+    insns: &[BpfInsn],
+    subprogs: &[u32],
+    states: &std::collections::HashMap<u32, Vec<crate::state::VerifierState>>,
+) -> Result<(), VerificationFailure> {
+    let mut depth = direct_stack_depths(insns, subprogs);
+    for (&pc, states_at_pc) in states {
+        let Some((base, offset, size)) = insns.get(pc as usize).and_then(stack_access) else {
+            continue;
+        };
+        for state in states_at_pc {
+            let crate::state::RegState::PtrToStack {
+                min_offset,
+                frameno,
+                ..
+            } = state.regs[base as usize]
+            else {
+                continue;
+            };
+            let entry = frame_subprog_entry(state, frameno, insns).ok_or_else(|| {
+                VerificationFailure::new(pc, "unable to resolve stack pointer's owning frame")
+            })?;
+            let idx = subprogs
+                .iter()
+                .position(|&start| start == entry)
+                .ok_or_else(|| {
+                    VerificationFailure::new(pc, "stack pointer frame is not a subprogram")
+                })?;
+            let effective = min_offset as i64 + offset as i64;
+            let use_bytes = (-effective + size as i64).max(0) as usize;
+            depth[idx] = depth[idx].max(use_bytes.div_ceil(8) * 8);
+        }
+    }
+    check_stack_call_chains(insns, subprogs, &depth)
 }
 
 /// DFS visit state: NotVisited → Discovering → Explored.
@@ -392,6 +472,31 @@ mod tests {
     }
 
     // ── find_subprog_range ───────────────────────────────────────────────────
+
+    #[test]
+    fn recursive_subprogram_call_is_rejected_even_on_dead_branch() {
+        let insns = vec![
+            BpfInsn::CallSub { offset: 1 },
+            BpfInsn::Exit,
+            BpfInsn::MovImm { dst: 1, imm: 0 },
+            BpfInsn::JeqImm {
+                dst: 1,
+                imm: 1,
+                offset: 1,
+            },
+            BpfInsn::Jmp { offset: 1 },
+            BpfInsn::CallSub { offset: -4 },
+            BpfInsn::Exit,
+        ];
+        let subprogs = add_subprog(&insns).unwrap();
+
+        assert!(
+            check_combined_stack_depth(&insns, &subprogs)
+                .unwrap_err()
+                .message
+                .contains("recursive")
+        );
+    }
 
     #[test]
     fn find_subprog_range_first() {
