@@ -1270,34 +1270,38 @@ fn check_map_buffer(
             ),
         ));
     }
-    // the covered bytes must be initialized (MISC/ZERO); spilled bytes
-    // are not readable as buffer bytes (kernel: "invalid indirect read
-    // from stack" — check_stack_range_initialized)
-    let lo = stack_byte_index(off + size);
-    let hi = stack_byte_index(off);
-    for i in lo..=hi {
-        match state.stack.bytes[i] {
-            StackByte::Invalid | StackByte::Dynptr => {
-                return Err(VerificationFailure::new(
-                    pc,
-                    format!(
-                        "stack slot at offset {} is uninitialized (write before read)",
-                        off
-                    ),
-                ));
-            }
-            StackByte::Misc | StackByte::Zero => {}
-            StackByte::Spill => {
-                // scalar spills are readable buffer bytes (kernel
-                // check_stack_range_initialized); pointers are not
-                if !matches!(state.stack.spilled[i / 8], Some(RegState::Scalar(_))) {
+    // The buffer covers [off, off + size); translate its inclusive
+    // byte range to stack indices. The end index uses the last byte
+    // (off + size - 1), not the exclusive end, which may be r10 itself.
+    // Spilled pointers are not readable as buffer bytes (kernel:
+    // "invalid indirect read from stack" — check_stack_range_initialized).
+    if size > 0 {
+        let lo = stack_byte_index(off + size - 1);
+        let hi = stack_byte_index(off);
+        for i in lo..=hi {
+            match state.stack.bytes[i] {
+                StackByte::Invalid | StackByte::Dynptr => {
                     return Err(VerificationFailure::new(
                         pc,
                         format!(
-                            "invalid indirect read from stack at r{}: spilled register at offset {}",
-                            reg, off
+                            "stack slot at offset {} is uninitialized (write before read)",
+                            off
                         ),
                     ));
+                }
+                StackByte::Misc | StackByte::Zero => {}
+                StackByte::Spill => {
+                    // scalar spills are readable buffer bytes (kernel
+                    // check_stack_range_initialized); pointers are not
+                    if !matches!(state.stack.spilled[i / 8], Some(RegState::Scalar(_))) {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            format!(
+                                "invalid indirect read from stack at r{}: spilled register at offset {}",
+                                reg, off
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -6677,14 +6681,14 @@ mod tests {
     fn step_call_map_lookup_ok() {
         // R1 = map pointer, R2 = key pointer → after the call R0 is the
         // nullable map value pointer (#27's producer) and the argument
-        // registers are clobbered (#29)
+        // registers are clobbered (#29). The initialized key ends at r10.
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
             value_size: 8,
             map_type: 0,
         };
-        state.regs[2] = ptr_stack(-8);
+        state.regs[2] = ptr_stack(-4);
         spill_full(&mut state, 0, RegState::Scalar(ScalarBounds::constant(0)));
         let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
         assert_eq!(
@@ -6742,7 +6746,24 @@ mod tests {
 
     #[test]
     fn step_call_map_lookup_key_buffer_uninit() {
-        // the key buffer slot must be initialized before the call
+        // The [r10-4, r10) key buffer is uninitialized and must be rejected.
+        let mut state = VerifierState::initial();
+        state.regs[1] = RegState::PtrToMap {
+            key_size: 4,
+            value_size: 8,
+            map_type: 0,
+        };
+        state.regs[2] = ptr_stack(-4);
+        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+        assert!(err.message.contains("uninitialized"), "{}", err.message);
+        // a spilled pointer is not readable as a key buffer
+        spill_full(&mut state, 0, RegState::PtrToCtx);
+        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
+        assert!(err.message.contains("indirect read"), "{}", err.message);
+    }
+
+    #[test]
+    fn step_call_map_lookup_key_buffer_checks_exact_range() {
         let mut state = VerifierState::initial();
         state.regs[1] = RegState::PtrToMap {
             key_size: 4,
@@ -6750,12 +6771,13 @@ mod tests {
             map_type: 0,
         };
         state.regs[2] = ptr_stack(-8);
-        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
-        assert!(err.message.contains("uninitialized"), "{}", err.message);
-        // a spilled pointer is not readable as a key buffer
-        spill_full(&mut state, 0, RegState::PtrToCtx);
-        let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
-        assert!(err.message.contains("indirect read"), "{}", err.message);
+        // Initialize exactly [r10-8, r10-4), leaving the adjacent byte at
+        // r10-4 uninitialized. It is outside the key buffer and must be ignored.
+        for byte in &mut state.stack.bytes[4..8] {
+            *byte = StackByte::Misc;
+        }
+        let next = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap();
+        assert!(matches!(next.regs[0], RegState::PtrToMapValueOrNull { .. }));
     }
 
     #[test]
