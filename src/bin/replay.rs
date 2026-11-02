@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use rand_verifier::diff::SideVerdict;
 use rand_verifier::env::{BpfVerifierEnv, MapInfo};
 use rand_verifier::error::Verdict;
-use rand_verifier::fuzz::oracle::classify_env;
+use rand_verifier::fuzz::oracle::{Finding, SurfaceGapKind, classify_env, surface_gap_kind};
 use rand_verifier::klog::ReasonCategory;
 use rand_verifier::krun::referenced_map_fds;
 
@@ -103,16 +103,27 @@ fn main() {
         entry.0 += 1;
 
         if let Some(kind) = unsupported_prog_type(row) {
-            *counts.entry("unsupported-prog-type").or_insert(0) += 1;
-            *surface.entry(kind.to_string()).or_insert(0) += 1;
+            *counts.entry(Finding::SurfaceGap.name()).or_insert(0) += 1;
+            *surface.entry(kind.name().to_string()).or_insert(0) += 1;
+            cases.push(serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+                "file": row.file,
+                "expected": row.expected,
+                "prog_type": row.prog_type,
+                "finding": Finding::SurfaceGap.name(),
+                "surface_gap": kind.name(),
+            }));
             continue;
         }
 
         let mut env = BpfVerifierEnv::new();
         register_default_maps(&mut env, &bytes);
         if let Err(err) = env.setup_prog_bytes(&bytes) {
-            *counts.entry("surface-gap").or_insert(0) += 1;
-            *surface.entry("decode".to_string()).or_insert(0) += 1;
+            let message = format!("{err:#}");
+            let kind = surface_gap_kind(&message).unwrap_or(SurfaceGapKind::Other);
+            *counts.entry(Finding::SurfaceGap.name()).or_insert(0) += 1;
+            *surface.entry(kind.name().to_string()).or_insert(0) += 1;
             cases.push(serde_json::json!({
                 "id": row.id,
                 "name": row.name,
@@ -121,9 +132,9 @@ fn main() {
                 "prog_type": row.prog_type,
                 "mini": "SKIPPED",
                 "spec": "SKIPPED",
-                "finding": "surface-gap",
-                "surface_gap": "decode",
-                "detail": format!("{err:#}"),
+                "finding": Finding::SurfaceGap.name(),
+                "surface_gap": kind.name(),
+                "detail": message,
             }));
             continue;
         }
@@ -396,12 +407,12 @@ fn side_name(side: &SideVerdict) -> &'static str {
 
 /// Prog types the models do not represent yet: the corpus case is a
 /// surface gap, not a model disagreement (#131).
-fn unsupported_prog_type(row: &Row) -> Option<&'static str> {
+fn unsupported_prog_type(row: &Row) -> Option<SurfaceGapKind> {
     match row.prog_type.as_deref() {
         None => None,
         Some("BPF_PROG_TYPE_SOCKET_FILTER") => None,
         // xdp/sched_cls land with #135
-        Some(_) => Some("unmodeled-prog-type"),
+        Some(_) => Some(SurfaceGapKind::UnmodeledProgType),
     }
 }
 

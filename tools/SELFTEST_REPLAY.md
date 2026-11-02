@@ -85,8 +85,9 @@ issue that owns the gap.
 | id | gap | owner |
 |---|---|---|
 | `jump__00{0..7}` | mini rejects a pointer/imm comparison the kernel accepts | #136 (JMP32/LD), #135 (ctx) |
-| `calls__038` | load through a non-stack pointer | #135 / #137 |
 | `dead_code__005` | subprogram boundary handling | #137 |
 
-240 of 478 cases have a modelled prog type; the remaining 238 are
-`unsupported-prog-type` surface gaps until #135 lands SCHED_CLS/XDP support.
+240 of 478 cases have a modelled prog type; the other 238 are
+`unmodeled-prog-type` surface gaps until #135 lands SCHED_CLS/XDP support.
+Surface gaps (398 total after #131: 238 prog types + 160 decode/load
+surfaces) are counted separately and never gate the replay.
