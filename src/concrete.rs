@@ -688,6 +688,79 @@ fn stack_ptr_offset_ok(offset: i64) -> bool {
 /// Mirrors the abstract `alu_imm`: shifts require an amount in 0..64 for
 /// both widths; a stack pointer accepts only ADD (which must stay in the
 /// frame); every other pointer rejects arithmetic (#20).
+/// HMUL concrete semantics: the unsigned/signed high 64 bits of the
+/// product, exact for the witness.
+fn concrete_hmul(a: u64, b: u64, high: crate::insn::MulHigh) -> u64 {
+    match high {
+        crate::insn::MulHigh::Low => a.wrapping_mul(b),
+        crate::insn::MulHigh::UnsignedHigh => ((u128::from(a) * u128::from(b)) >> 64) as u64,
+        crate::insn::MulHigh::SignedHigh => {
+            (((a as i64 as i128) * (b as i64 as i128)) >> 64) as u64
+        }
+    }
+}
+
+fn concrete_mul_high(
+    pc: u32,
+    state: &ConcreteState,
+    dst: u8,
+    imm: Option<i32>,
+    high: &crate::insn::MulHigh,
+) -> Result<ConcreteState, ConcreteFailure> {
+    let imm = imm.expect("immediate form");
+    let value = read_concrete_reg(pc, state, dst)?;
+    let ConcreteValue::Scalar(a) = value else {
+        return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = Some(ConcreteValue::Scalar(concrete_hmul(
+        a,
+        imm as i64 as u64,
+        *high,
+    )));
+    Ok(next)
+}
+
+fn concrete_mul_high_reg(
+    pc: u32,
+    state: &ConcreteState,
+    dst: u8,
+    src: u8,
+    high: crate::insn::MulHigh,
+) -> Result<ConcreteState, ConcreteFailure> {
+    if high == crate::insn::MulHigh::Low {
+        return concrete_alu_reg(pc, state, dst, src, AluOp::Mul, AluWidth::W64);
+    }
+    let a = read_concrete_reg(pc, state, dst)?;
+    let b = read_concrete_reg(pc, state, src)?;
+    let (ConcreteValue::Scalar(a), ConcreteValue::Scalar(b)) = (a, b) else {
+        return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = Some(ConcreteValue::Scalar(concrete_hmul(a, b, high)));
+    Ok(next)
+}
+
+/// BPF_NEG: exact wrapping negation of the witness.
+fn concrete_neg(
+    pc: u32,
+    state: &ConcreteState,
+    dst: u8,
+    width: AluWidth,
+) -> Result<ConcreteState, ConcreteFailure> {
+    let value = read_concrete_reg(pc, state, dst)?;
+    let ConcreteValue::Scalar(a) = value else {
+        return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
+    };
+    let result = match width {
+        AluWidth::W64 => alu_const64(AluOp::Neg, a, 0),
+        AluWidth::W32 => alu_const32(AluOp::Neg, a, 0),
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = Some(ConcreteValue::Scalar(result));
+    Ok(next)
+}
+
 fn concrete_alu_imm(
     pc: u32,
     state: &ConcreteState,
@@ -1012,6 +1085,41 @@ pub(crate) fn concrete_step(
         BpfInsn::Arsh32Reg { dst, src } => {
             concrete_alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
+        // ALU64 MUL with the HMUL selector (#132): exact high half
+        BpfInsn::MulImm { dst, imm, high } => concrete_mul_high(pc, state, *dst, Some(*imm), high),
+        BpfInsn::MulReg { dst, src, high } => concrete_mul_high_reg(pc, state, *dst, *src, *high),
+        BpfInsn::DivImm { dst, imm } => {
+            concrete_alu_imm(pc, state, *dst, *imm, AluOp::Div, AluWidth::W64)
+        }
+        BpfInsn::DivReg { dst, src } => {
+            concrete_alu_reg(pc, state, *dst, *src, AluOp::Div, AluWidth::W64)
+        }
+        BpfInsn::ModImm { dst, imm } => {
+            concrete_alu_imm(pc, state, *dst, *imm, AluOp::Mod, AluWidth::W64)
+        }
+        BpfInsn::ModReg { dst, src } => {
+            concrete_alu_reg(pc, state, *dst, *src, AluOp::Mod, AluWidth::W64)
+        }
+        BpfInsn::Neg { dst } => concrete_neg(pc, state, *dst, AluWidth::W64),
+        BpfInsn::Mul32Imm { dst, imm } => {
+            concrete_alu_imm(pc, state, *dst, *imm, AluOp::Mul, AluWidth::W32)
+        }
+        BpfInsn::Mul32Reg { dst, src } => {
+            concrete_alu_reg(pc, state, *dst, *src, AluOp::Mul, AluWidth::W32)
+        }
+        BpfInsn::Div32Imm { dst, imm } => {
+            concrete_alu_imm(pc, state, *dst, *imm, AluOp::Div, AluWidth::W32)
+        }
+        BpfInsn::Div32Reg { dst, src } => {
+            concrete_alu_reg(pc, state, *dst, *src, AluOp::Div, AluWidth::W32)
+        }
+        BpfInsn::Mod32Imm { dst, imm } => {
+            concrete_alu_imm(pc, state, *dst, *imm, AluOp::Mod, AluWidth::W32)
+        }
+        BpfInsn::Mod32Reg { dst, src } => {
+            concrete_alu_reg(pc, state, *dst, *src, AluOp::Mod, AluWidth::W32)
+        }
+        BpfInsn::Neg32 { dst } => concrete_neg(pc, state, *dst, AluWidth::W32),
         // ldimm64 (#89): a plain 64-bit constant
         BpfInsn::LdImm64 { dst, imm } => {
             check_concrete_reg(pc, *dst)?;

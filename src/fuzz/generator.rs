@@ -148,14 +148,22 @@ pub(crate) fn gen_body_insn(rng: &mut SplitMix64, pc: usize, body_len: usize) ->
 }
 
 /// A random ALU instruction: op, K/X form, operands from the pools.
+/// An immediate that is guaranteed non-zero — DIV/MOD by an immediate
+/// zero is a decode rejection, not a program to generate.
+fn nonzero_imm(rng: &mut SplitMix64) -> i32 {
+    let imm = *rng.pick(IMMEDIATES);
+    if imm == 0 { 1 } else { imm }
+}
+
 fn gen_alu(rng: &mut SplitMix64, alu32: bool) -> BpfInsn {
     // op index: 0 = mov, 1 = add, 2 = sub, 3 = and, 4 = or, 5 = xor,
-    // 6 = lsh, 7 = rsh, 8 = arsh. There is no MOV32 in the supported
-    // subset, so ALU32 draws from 1..=8 only.
+    // 6 = lsh, 7 = rsh, 8 = arsh, 9 = mul, 10 = div, 11 = mod,
+    // 12 = neg (#132). There is no MOV32 in the supported subset, so
+    // ALU32 draws from 1..=12 only.
     let op = if alu32 {
-        1 + rng.below(8) as usize
+        1 + rng.below(12) as usize
     } else {
-        rng.below(9) as usize
+        rng.below(13) as usize
     };
     let dst = *rng.pick(ALU_REGS);
     let k_form = rng.below(2) == 0;
@@ -194,6 +202,38 @@ fn gen_alu(rng: &mut SplitMix64, alu32: bool) -> BpfInsn {
         (true, false, 7) => insn_lib::rsh32_reg(dst, *rng.pick(ALU_REGS)),
         (true, true, 8) => insn_lib::arsh32_imm(dst, *rng.pick(IMMEDIATES)),
         (true, false, 8) => insn_lib::arsh32_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 9) => {
+            let high = if rng.below(5) == 0 {
+                if rng.below(2) == 0 {
+                    crate::insn::MulHigh::UnsignedHigh
+                } else {
+                    crate::insn::MulHigh::SignedHigh
+                }
+            } else {
+                crate::insn::MulHigh::Low
+            };
+            insn_lib::mul_imm(dst, *rng.pick(IMMEDIATES), high)
+        }
+        (false, false, 9) => {
+            let high = if rng.below(5) == 0 {
+                crate::insn::MulHigh::UnsignedHigh
+            } else {
+                crate::insn::MulHigh::Low
+            };
+            insn_lib::mul_reg(dst, *rng.pick(ALU_REGS), high)
+        }
+        (false, true, 10) => insn_lib::div_imm(dst, nonzero_imm(rng)),
+        (false, false, 10) => insn_lib::div_reg(dst, *rng.pick(ALU_REGS)),
+        (false, true, 11) => insn_lib::mod_imm(dst, nonzero_imm(rng)),
+        (false, false, 11) => insn_lib::mod_reg(dst, *rng.pick(ALU_REGS)),
+        (false, _, 12) => insn_lib::neg(dst),
+        (true, true, 9) => insn_lib::mul32_imm(dst, *rng.pick(IMMEDIATES)),
+        (true, false, 9) => insn_lib::mul32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 10) => insn_lib::div32_imm(dst, nonzero_imm(rng)),
+        (true, false, 10) => insn_lib::div32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, true, 11) => insn_lib::mod32_imm(dst, nonzero_imm(rng)),
+        (true, false, 11) => insn_lib::mod32_reg(dst, *rng.pick(ALU_REGS)),
+        (true, _, 12) => insn_lib::neg32(dst),
         // (true, _, 0) — no MOV32 in the supported subset
         _ => unreachable!("all op/alu32/k_form combinations are covered"),
     }
@@ -390,6 +430,28 @@ mod tests {
         assert_eq!(bytes.len(), insns.len() * 8);
         for (i, insn) in insns.iter().enumerate() {
             assert_eq!(&bytes[i * 8..(i + 1) * 8], &insn_lib::encode(insn));
+        }
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::fuzz::insn_lib::encode;
+
+    /// Every generated program must decode: the generator may only emit
+    /// instructions the decoder accepts (the campaign counts a decode
+    /// failure as a surface gap, which would hide a generator bug).
+    #[test]
+    fn generated_programs_always_decode() {
+        let cfg = GenConfig::default();
+        for seed in 0..2000u64 {
+            let mut generator = Generator::new(seed);
+            let insns = generator.gen_mixed_program(&cfg, 30);
+            let bytes: Vec<u8> = insns.iter().flat_map(encode).collect();
+            if let Err((idx, err)) = crate::insn::decode_program(&bytes) {
+                panic!("seed {seed}, insn {idx}: {err}\n{insns:?}");
+            }
         }
     }
 }

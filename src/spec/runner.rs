@@ -376,6 +376,100 @@ impl<'a> SpecRunner<'a> {
                     }
                     self.push(&mut worklist, pc + 1, state);
                 }
+                // ── MUL / DIV / MOD / NEG (#132) ─────────────────────
+                BpfInsn::MulImm { dst, imm, high } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Mul, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    if high != crate::insn::MulHigh::Low {
+                        // HMUL: constants fold exactly; a variable product
+                        // is unknown to the kernel, so the spec widens it
+                        // to the full scalar range
+                        state.set_reg(dst, SpecValue::unknown_scalar());
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::MulReg { dst, src, high } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Mul, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    if high != crate::insn::MulHigh::Low {
+                        state.set_reg(dst, SpecValue::unknown_scalar());
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::DivImm { dst, imm } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Div, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::DivReg { dst, src } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Div, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::ModImm { dst, imm } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Mod, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::ModReg { dst, src } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Mod, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Neg { dst } => {
+                    if let Err(v) = self.alu64(&mut state, pc, dst, Op::Neg, Rhs::Imm(0)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Mul32Imm { dst, imm } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Mul, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Mul32Reg { dst, src } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Mul, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Div32Imm { dst, imm } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Div, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Div32Reg { dst, src } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Div, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Mod32Imm { dst, imm } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Mod, Rhs::Imm(imm)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Mod32Reg { dst, src } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Mod, Rhs::Reg(src)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Neg32 { dst } => {
+                    if let Err(v) = self.alu32(&mut state, pc, dst, Op::Neg, Rhs::Imm(0)) {
+                        return v;
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
                 // ── memory ───────────────────────────────────────────
                 BpfInsn::LdMem {
                     dst,
@@ -2127,6 +2221,9 @@ fn alu_range(op: Op, d: Range2, s: Range2) -> Range2 {
             Op::Or => a | b,
             Op::Xor => a ^ b,
             Op::Mul => a.wrapping_mul(b),
+            Op::Div => a.checked_div(b).unwrap_or(0),
+            Op::Mod => a.checked_rem(b).unwrap_or(a),
+            Op::Neg => a.wrapping_neg(),
             Op::Lsh => {
                 if b >= 64 {
                     0
@@ -2183,6 +2280,19 @@ fn alu_range(op: Op, d: Range2, s: Range2) -> Range2 {
             }
         }
         Op::Mul => rng_mul(d, s),
+        // a divisor that may be zero has no bounded quotient
+        Op::Div => match d.1.checked_div(s.0) {
+            Some(hi) => (d.0 / s.1.max(1), hi),
+            None => (0, u64::MAX),
+        },
+        Op::Mod => {
+            if s.0 == 0 {
+                (0, u64::MAX)
+            } else {
+                (0, s.1 - 1)
+            }
+        }
+        Op::Neg => (0, u64::MAX),
     }
 }
 
@@ -2236,6 +2346,9 @@ enum Op {
     Arsh,
     #[allow(dead_code)] // exercised by issue #115 (SMT translation)
     Mul,
+    Div,
+    Mod,
+    Neg,
 }
 
 #[derive(Debug, Clone, Copy)]
