@@ -201,77 +201,99 @@ pub fn whitelisted(
     kernel: &SideVerdict,
     mini_reason: Option<&str>,
 ) -> Option<&'static str> {
-    match (mini, kernel) {
-        (SideVerdict::Reject { .. }, SideVerdict::Accept) => {
-            // mini's exploration budget (max_states 1024 / max_steps)
-            // vs the kernel's much larger limits — an intentional
-            // design limit; category-applied so fuzzer-generated
-            // complexity programs are whitelisted like the corpus
-            // fixture (the kernel accepts what mini rejects here)
-            if matches!(
-                mini,
-                SideVerdict::Reject {
-                    category: ReasonCategory::Complexity
-                }
-            ) {
-                return Some(
-                    "mini's exploration budget (max_states 1024 / max_steps) vs the kernel's much larger limits — intentional design limit (§6)",
-                );
-            }
-            // privileged loads allow uninit stack reads
-            // (allow_uninit_stack) and indirect reads over spilled
-            // pointers (allow_ptr_leaks) by design — the same family as
-            // stack_write_before_read, applied by category so it also
-            // covers fuzzer-generated programs
-            if privileged_stack_leniency(mini, mini_reason) {
-                return Some(
-                    "privileged load leniency: uninit stack reads (allow_uninit_stack) and indirect reads over spilled pointers (allow_ptr_leaks) are allowed for privileged loaders (CAP_SYS_ADMIN superset, kernel/bpf/token.c)",
-                );
-            }
-            // privileged loads allow pointer values in R0 at exit: the
-            // exit-time check ("R0 leaks addr as return value") is
-            // gated on is_pointer_value(), which returns false when
-            // allow_ptr_leaks is set (kernel/bpf/verifier.c) —
-            // returning a pointer from a program is allowed for
-            // privileged loaders by design; strict mode
-            // (unprivileged-equivalent) rejects it, which the mini
-            // mirrors ("r0 is not a scalar value at exit"). Same
-            // privileged-leniency family as the stack rule above;
-            // category-applied so fuzzer-generated programs are
-            // whitelisted like the corpus fixture (m5, PR #92).
-            if matches!(
-                mini,
-                SideVerdict::Reject {
-                    category: ReasonCategory::ExitR0
-                }
-            ) && mini_reason.is_some_and(|r| r.contains("at exit"))
-            {
-                return Some(
-                    "privileged load leniency: pointer return in R0 allowed for privileged loaders (allow_ptr_leaks gates the exit-time R0 check); strict mode rejects it",
-                );
-            }
-            match name {
-                // privileged load: allow_uninit_stack is
-                // bpf_token_capable(CAP_PERFMON), and bpf_ns_capable treats
-                // CAP_SYS_ADMIN as a superset of every BPF capability
-                // (kernel/bpf/token.c: ns_capable(ns, cap) || (cap !=
-                // CAP_SYS_ADMIN && ns_capable(ns, CAP_SYS_ADMIN))) — uninit
-                // stack reads are allowed for privileged loaders by design.
-                // The category rule above covers the same family for
-                // programs without a mini reason (fuzzer seeds); this name
-                // entry keeps the corpus fixture stable.
-                "stack_write_before_read" => Some(
-                    "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
-                ),
-                // the same family for the narrow-read fixture (#100)
-                "narrow_read_uninit" => Some(
-                    "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
-                ),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
+    suppressed_fingerprint(&FingerprintInput {
+        name,
+        mini,
+        kernel,
+        mini_reason,
+    })
+    .map(|fingerprint| fingerprint.evidence)
+}
+
+/// One whitelist entry: an id (for the campaign statistics), the
+/// evidence that justifies it, and the predicate. A fingerprint must
+/// name the exact design difference — a broad "loop" or "!root" rule
+/// would hide live false rejects like K-1b (#144).
+pub struct Fingerprint {
+    /// Stable id used in `summary.json`'s `suppressed` block.
+    pub id: &'static str,
+    /// Why this is design behaviour, with the kernel/selftest pointer.
+    pub evidence: &'static str,
+    /// The predicate. The caller passes every side verdict.
+    pub check: fn(&FingerprintInput<'_>) -> bool,
+}
+
+/// The sides a fingerprint may inspect.
+pub struct FingerprintInput<'a> {
+    pub name: &'a str,
+    pub mini: &'a SideVerdict,
+    pub kernel: &'a SideVerdict,
+    pub mini_reason: Option<&'a str>,
+}
+
+fn kernel_accepts(input: &FingerprintInput<'_>) -> bool {
+    matches!(input.kernel, SideVerdict::Accept)
+}
+
+fn mini_rejects(input: &FingerprintInput<'_>) -> bool {
+    matches!(input.mini, SideVerdict::Reject { .. })
+}
+
+fn mini_category(input: &FingerprintInput<'_>, category: ReasonCategory) -> bool {
+    matches!(
+        input.mini,
+        SideVerdict::Reject { category: c } if *c == category
+    )
+}
+
+fn fp_mini_complexity_budget(input: &FingerprintInput<'_>) -> bool {
+    kernel_accepts(input) && mini_rejects(input) && mini_category(input, ReasonCategory::Complexity)
+}
+
+fn fp_privileged_uninit_stack(input: &FingerprintInput<'_>) -> bool {
+    kernel_accepts(input) && privileged_stack_leniency(input.mini, input.mini_reason)
+}
+
+fn fp_privileged_r0_pointer_exit(input: &FingerprintInput<'_>) -> bool {
+    kernel_accepts(input)
+        && mini_category(input, ReasonCategory::ExitR0)
+        && input.mini_reason.is_some_and(|r| r.contains("at exit"))
+}
+
+fn fp_corpus_uninit_stack_fixture(input: &FingerprintInput<'_>) -> bool {
+    kernel_accepts(input) && matches!(input.name, "stack_write_before_read" | "narrow_read_uninit")
+}
+
+/// The whitelist. Every entry is a named design difference with its
+/// evidence; `tools/WHITELIST.md` documents the same table for review.
+pub static FINGERPRINTS: &[Fingerprint] = &[
+    Fingerprint {
+        id: "mini-complexity-budget",
+        evidence: "mini's exploration budget (max_states 1024 / max_steps) vs the kernel's much larger limits — intentional design limit (§6)",
+        check: fp_mini_complexity_budget,
+    },
+    Fingerprint {
+        id: "privileged-uninit-stack",
+        evidence: "privileged load leniency: uninit stack reads (allow_uninit_stack) and indirect reads over spilled pointers (allow_ptr_leaks) are allowed for privileged loaders (CAP_SYS_ADMIN superset, kernel/bpf/token.c)",
+        check: fp_privileged_uninit_stack,
+    },
+    Fingerprint {
+        id: "privileged-r0-pointer-exit",
+        evidence: "privileged load leniency: pointer return in R0 allowed for privileged loaders (allow_ptr_leaks gates the exit-time R0 check); strict mode rejects it",
+        check: fp_privileged_r0_pointer_exit,
+    },
+    Fingerprint {
+        id: "corpus-uninit-stack-fixture",
+        evidence: "privileged load: CAP_SYS_ADMIN implies allow_uninit_stack (bpf_ns_capable superset) — uninit stack reads allowed for privileged loaders by design",
+        check: fp_corpus_uninit_stack_fixture,
+    },
+];
+
+/// The fingerprint that suppressed this pair, if any.
+pub fn suppressed_fingerprint(input: &FingerprintInput<'_>) -> Option<&'static Fingerprint> {
+    FINGERPRINTS
+        .iter()
+        .find(|fingerprint| (fingerprint.check)(input))
 }
 
 /// Privileged-load stack leniency (#90): mini rejects uninitialized
@@ -302,6 +324,53 @@ mod tests {
 
     fn fail(message: &str) -> VerificationFailure {
         VerificationFailure::new(0, message.to_string())
+    }
+
+    /// #144: every whitelist entry is a named fingerprint with
+    /// evidence, and the K-1b shape (mini accepts, CAP_BPF kernel
+    /// rejects a bounded loop) is never suppressed.
+    #[test]
+    fn fingerprints_are_named_and_evidence_backed() {
+        for fingerprint in FINGERPRINTS {
+            assert!(!fingerprint.id.is_empty());
+            assert!(
+                fingerprint.evidence.len() > 20,
+                "{}: evidence too thin",
+                fingerprint.id
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_ids_and_loop4_regression() {
+        let mini = SideVerdict::Reject {
+            category: ReasonCategory::Complexity,
+        };
+        let kernel = SideVerdict::Accept;
+        let input = FingerprintInput {
+            name: "seed-1-3",
+            mini: &mini,
+            kernel: &kernel,
+            mini_reason: None,
+        };
+        assert_eq!(
+            suppressed_fingerprint(&input).map(|f| f.id),
+            Some("mini-complexity-budget")
+        );
+
+        // K-1b: a bounded loop that mini accepts while the CAP_BPF
+        // kernel rejects it must stay a finding, never whitelisted
+        let mini_accept = SideVerdict::Accept;
+        let kernel_loop_reject = SideVerdict::Reject {
+            category: ReasonCategory::Loop,
+        };
+        let input = FingerprintInput {
+            name: "loop4",
+            mini: &mini_accept,
+            kernel: &kernel_loop_reject,
+            mini_reason: None,
+        };
+        assert!(suppressed_fingerprint(&input).is_none());
     }
 
     #[test]
