@@ -107,6 +107,115 @@ pub(crate) fn step(
             next.regs[0] = RegState::Scalar(scalar_for_width(size.bytes() as u32, false));
             Ok(next)
         }
+        // STX|ATOMIC (#133): the target must be a stack slot or a map
+        // value, the access must be aligned, and a fetching form leaves
+        // the old value in r0. The memory becomes unknown.
+        BpfInsn::Atomic {
+            dst,
+            src,
+            offset,
+            size,
+            fetch,
+            op,
+        } => {
+            let base_state = read_reg(pc, state, *dst)?;
+            // the operand and (for cmpxchg) R0 must be scalars: a pointer
+            // would leak an address into memory (kernel check_atomic_rmw)
+            let _ = read_scalar(pc, state, *src)?;
+            if *op == crate::insn::AtomicOp::Cmpxchg {
+                let _ = read_scalar(pc, state, 0)?;
+            }
+            let bytes = size.bytes() as i64;
+            if *offset as i64 % bytes != 0 {
+                return Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "misaligned atomic access at r{}{:+} (size {})",
+                        dst, offset, bytes
+                    ),
+                ));
+            }
+            // the fetched old value lands in src_reg (fetch) or r0
+            // (cmpxchg), exactly like kernel bpf_atomic_load_reg
+            let store_old = |next: &mut VerifierState, old: RegState| {
+                if *op == crate::insn::AtomicOp::Cmpxchg {
+                    next.regs[0] = old;
+                } else if *fetch {
+                    next.regs[*src as usize] = old;
+                }
+            };
+            match base_state {
+                RegState::PtrToStack {
+                    min_offset,
+                    max_offset,
+                    align_off,
+                    frameno,
+                } => {
+                    if (align_off as i64 + *offset as i64).rem_euclid(bytes) != 0
+                        || (min_offset as i64 + *offset as i64).rem_euclid(bytes) != 0
+                    {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            format!(
+                                "misaligned atomic access at r{}{:+} (size {})",
+                                dst, offset, bytes
+                            ),
+                        ));
+                    }
+                    let lo = min_offset as i64 + *offset as i64;
+                    let hi = max_offset as i64 + *offset as i64 + bytes;
+                    if lo < -(STACK_SIZE as i64) || hi > 0 {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            format!("invalid atomic access at r{}{:+}", dst, offset),
+                        ));
+                    }
+                    // the old value goes through the kernel's read path
+                    // (initialization, spill-size and alignment rules)
+                    let old = if size.bytes() == 8 {
+                        stack_read(pc, *dst, state, *offset, *size, false)?
+                    } else {
+                        // a 32-bit atomic reads half a slot: the concrete
+                        // side keeps no exact half-slot value, so only
+                        // the width is known
+                        let _ = stack_read(pc, *dst, state, *offset, *size, false)?;
+                        RegState::Scalar(scalar_for_width(size.bytes() as u32, false))
+                    };
+                    let mut next = *state;
+                    if frameno != next.curframe {
+                        return Err(VerificationFailure::new(
+                            pc,
+                            "atomic access to a caller frame is not modelled",
+                        ));
+                    }
+                    let (first, last) = stack_byte_range(lo, hi);
+                    for i in first..=last {
+                        next.stack.bytes[i] = StackByte::Misc;
+                    }
+                    for slot in first / 8..=last / 8 {
+                        next.stack.spilled[slot] = None;
+                    }
+                    store_old(&mut next, old);
+                    Ok(next)
+                }
+                RegState::PtrToMapValue { .. } => {
+                    map_value_access_check(pc, *dst, base_state, *offset)?;
+                    let mut next = *state;
+                    store_old(
+                        &mut next,
+                        RegState::Scalar(scalar_for_width(size.bytes() as u32, false)),
+                    );
+                    Ok(next)
+                }
+                _ => Err(VerificationFailure::new(
+                    pc,
+                    format!(
+                        "BPF_ATOMIC stores into r{} ({:?}) is not allowed",
+                        dst, base_state
+                    ),
+                )),
+            }
+        }
         // rX = rY → copy the source's abstract state;
         // the source must have been written before it is read (#14)
         BpfInsn::MovReg { dst, src } => {
@@ -1921,7 +2030,9 @@ fn memory_store_scalar(
             imm.expect("an immediate store carries an imm") as i64,
         )),
     };
-    if matches!(value, RegState::Scalar(_)) {
+    // privileged loaders may store pointers into map values
+    // (allow_ptr_leaks, the default mode; unprivileged would reject)
+    if matches!(value, RegState::Scalar(_)) || memory_kind == "map value" {
         Ok(())
     } else {
         Err(VerificationFailure::new(

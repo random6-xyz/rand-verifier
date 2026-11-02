@@ -642,6 +642,75 @@ impl<'a> SpecRunner<'a> {
                 BpfInsn::Jmp { offset } => {
                     self.push(&mut worklist, branch_target(pc, offset), state);
                 }
+                // STX|ATOMIC (#133): stack slot or map value, aligned;
+                // the memory becomes unknown and a fetch leaves the old
+                // value in r0
+                BpfInsn::Atomic {
+                    dst,
+                    src,
+                    offset,
+                    size,
+                    fetch,
+                    op,
+                } => {
+                    let bytes = size_bytes(size) as i64;
+                    let offset = offset as i64;
+                    if offset % bytes != 0 {
+                        return self.failure(pc, "misaligned atomic access");
+                    }
+                    if state.reg(src) == SpecValue::Uninit {
+                        return self.failure(pc, "atomic operand is uninitialized");
+                    }
+                    let mut old = SpecValue::unknown_scalar();
+                    match state.reg(dst) {
+                        SpecValue::PtrToStack { lo, hi } => {
+                            let start = lo.saturating_add(offset);
+                            let end = hi.saturating_add(offset).saturating_add(bytes);
+                            if let Err(v) = self.check_stack_range(pc, start, end, bytes) {
+                                return v;
+                            }
+                            // a full-slot spill gives the old value (the
+                            // kernel propagates it, e.g. atomic_bounds)
+                            if bytes == 8
+                                && lo == hi
+                                && let Some(slot) = slot_of(SPEC_STACK_SIZE as i64 + start)
+                                && let Some(spill) = state.cur.stack.spill[slot]
+                            {
+                                old = match spill {
+                                    Spill::Scalar { lo, hi } => SpecValue::Scalar { lo, hi },
+                                    Spill::Ptr(p) => p,
+                                };
+                            }
+                            for idx in
+                                (SPEC_STACK_SIZE as i64 + start)..(SPEC_STACK_SIZE as i64 + end)
+                            {
+                                state.cur.stack.init[idx as usize] = true;
+                            }
+                            for slot in (SPEC_STACK_SIZE as i64 + start) / 8
+                                ..((SPEC_STACK_SIZE as i64 + end - 1) / 8 + 1)
+                            {
+                                state.cur.stack.spill[slot as usize] = None;
+                            }
+                        }
+                        SpecValue::PtrToMapValue { lo, hi, size: v } => {
+                            let start = lo.saturating_add(offset);
+                            let end = hi.saturating_add(offset).saturating_add(bytes);
+                            if let Err(v) = self.check_map_range(pc, start, end, v as i64, bytes) {
+                                return v;
+                            }
+                        }
+                        _ => {
+                            return self
+                                .failure(pc, "atomic access through a non-atomic-able pointer");
+                        }
+                    }
+                    if op == crate::insn::AtomicOp::Cmpxchg {
+                        state.set_reg(0, old);
+                    } else if fetch {
+                        state.set_reg(src, old);
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
                 // JSET / JMP32 (#136): a constant-only test is decided
                 // statically (the kernel's is_branch_taken), otherwise
                 // both successors stay reachable

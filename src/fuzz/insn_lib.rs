@@ -55,6 +55,24 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
                 _ => unreachable!("a JMP32 carries one operand"),
             }
         }
+        BpfInsn::Atomic {
+            dst,
+            src,
+            offset,
+            size,
+            op,
+            fetch,
+        } => (
+            if *size == crate::insn::MemSize::W {
+                opcode::ATOMIC_W
+            } else {
+                opcode::ATOMIC_DW
+            },
+            *dst,
+            *src,
+            *offset,
+            op.to_imm() | i32::from(*fetch),
+        ),
         BpfInsn::LdAbs { size, imm } => (
             match size {
                 crate::insn::MemSize::W => opcode::LD_ABS,
@@ -545,6 +563,7 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::LdImm64Second { .. } => "ldimm64",
         BpfInsn::Call { .. } => "helper",
         BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => "subcall",
+        BpfInsn::Atomic { .. } => "atomic",
         BpfInsn::LdAbs { .. } | BpfInsn::LdInd { .. } => "ldabs",
         BpfInsn::Jmp { .. } => "jmp",
         BpfInsn::Exit => "exit",

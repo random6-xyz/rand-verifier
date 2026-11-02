@@ -98,10 +98,16 @@ kernel behaviour:
 | `precise__000/001` | `ptr -= ptr` on map values: kernel accepts, mini/spec reject | pointer-difference arithmetic |
 | `ctx_skb__004` | the same insn sees two pointer types across loop iterations; the kernel rejects ("same insn cannot be used with different pointers"), mini accepts | state-pruning pointer identity |
 | `jset__006/007` | the spec has no tnum/bit refinement for JSET, so it explores a branch the kernel prunes | spec bit-level refinement |
+| `atomic_fetch__000` | an atomic fetch on a spilled map pointer: the concrete coverage check sees the pointer in the fetch result while the abstract side keeps a widened value | concrete atomic coverage |
 
 Recent closures:
 
 - `dead_code__005` — `check_cfg` accepts a trailing `JMP` like the kernel.
+- Atomics (`STX|ATOMIC` W/DW: add/or/and/xor/xchg/cmpxchg, fetch
+  forms) are decoded and modelled: the old value goes to src_reg for
+  fetch and R0 for cmpxchg (kernel `bpf_atomic_load_reg`), stack targets
+  go through the read path (initialization, spill size), the operand
+  must be a scalar, and the memory becomes unknown.
 - MOV32, JMP32, JSET and the legacy packet loads (`LD_ABS`/`LD_IND`,
   #136) are decoded and modelled: constant-only branches are decided
   statically, `jset imm` clears the tested bits on the fall-through, and

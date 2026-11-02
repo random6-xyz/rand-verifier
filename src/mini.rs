@@ -162,6 +162,15 @@ fn backtrack_insn(
 ) -> BacktrackOutcome {
     let dst_bit = |r: u8| 1u16 << r;
     match insn {
+        // a fetching atomic writes r0; the others leave the registers
+        // unchanged (#133)
+        BpfInsn::Atomic { src, fetch, op, .. } => {
+            if *op == crate::insn::AtomicOp::Cmpxchg {
+                bt.regs &= !dst_bit(0);
+            } else if *fetch {
+                bt.regs &= !dst_bit(*src);
+            }
+        }
         // packet loads write r0, so a requirement on r0 dies (#136)
         BpfInsn::LdAbs { .. } | BpfInsn::LdInd { .. } => {
             bt.regs &= !dst_bit(0);
