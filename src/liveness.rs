@@ -145,9 +145,16 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
     let mut ud = NO_USE_DEF;
     match insn {
         BpfInsn::MovImm { dst, .. } => ud.def_regs = reg_bit(*dst),
-        BpfInsn::MovReg { dst, src } => {
+        BpfInsn::Mov32Imm { dst, .. } => ud.def_regs = reg_bit(*dst),
+        BpfInsn::MovReg { dst, src } | BpfInsn::Mov32Reg { dst, src } => {
             ud.use_regs = reg_bit(*src);
             ud.def_regs = reg_bit(*dst);
+        }
+        // legacy packet loads define r0 and read the index (IND) (#136)
+        BpfInsn::LdAbs { .. } => ud.def_regs = reg_bit(0),
+        BpfInsn::LdInd { src, .. } => {
+            ud.use_regs = reg_bit(*src);
+            ud.def_regs = reg_bit(0);
         }
         // ALU64 and ALU32: `dst op= src/imm` reads `dst` (and `src`),
         // then writes `dst` (kernel compute_insn_live_regs: ALU/ALU64
@@ -245,6 +252,10 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
             ud.def_regs =
                 reg_bit(0) | reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);
         }
+        // BPF_JMP32 reads the register operands (#136)
+        BpfInsn::Jmp32 { dst, src, .. } => {
+            ud.use_regs = reg_bit(*dst) | src.map(reg_bit).unwrap_or(0);
+        }
         // exit reads R0 (kernel BPF_EXIT: `use = r0` — the return value
         // is conceptually read at exit)
         BpfInsn::Exit => ud.use_regs = reg_bit(0),
@@ -252,7 +263,8 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         BpfInsn::Jmp { .. } => {}
         // conditional jumps read both operands (kernel default JMP
         // case: `use = dst | src`)
-        BpfInsn::Jeq { dst, src, .. }
+        BpfInsn::Jset { dst, src, .. }
+        | BpfInsn::Jeq { dst, src, .. }
         | BpfInsn::Jne { dst, src, .. }
         | BpfInsn::Jgt { dst, src, .. }
         | BpfInsn::Jge { dst, src, .. }
@@ -264,7 +276,8 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
         | BpfInsn::Jsle { dst, src, .. } => {
             ud.use_regs = reg_bit(*dst) | reg_bit(*src);
         }
-        BpfInsn::JeqImm { dst, .. }
+        BpfInsn::JsetImm { dst, .. }
+        | BpfInsn::JeqImm { dst, .. }
         | BpfInsn::JneImm { dst, .. }
         | BpfInsn::JgtImm { dst, .. }
         | BpfInsn::JgeImm { dst, .. }
@@ -341,7 +354,10 @@ fn static_successors(i: usize, program: &[BpfInsn]) -> Vec<usize> {
                 | BpfInsn::JsgtImm { offset, .. }
                 | BpfInsn::JsgeImm { offset, .. }
                 | BpfInsn::JsltImm { offset, .. }
-                | BpfInsn::JsleImm { offset, .. } => *offset,
+                | BpfInsn::JsleImm { offset, .. }
+                | BpfInsn::Jset { offset, .. }
+                | BpfInsn::JsetImm { offset, .. }
+                | BpfInsn::Jmp32 { offset, .. } => *offset,
                 _ => unreachable!(),
             };
             let tgt = i as i64 + 1 + offset as i64;

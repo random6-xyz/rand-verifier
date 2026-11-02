@@ -129,7 +129,9 @@ fn imm_of(insn: &BpfInsn) -> Option<i32> {
         | BpfInsn::JsgtImm { imm, .. }
         | BpfInsn::JsgeImm { imm, .. }
         | BpfInsn::JsltImm { imm, .. }
-        | BpfInsn::JsleImm { imm, .. } => Some(*imm),
+        | BpfInsn::JsleImm { imm, .. }
+        | BpfInsn::JsetImm { imm, .. }
+        | BpfInsn::Jmp32 { imm: Some(imm), .. } => Some(*imm),
         _ => None,
     }
 }
@@ -260,6 +262,7 @@ fn lowering_pair(insns: &[BpfInsn]) -> Option<(u8, u8)> {
 fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
     match insn {
         BpfInsn::MovImm { dst, .. }
+        | BpfInsn::Mov32Imm { dst, .. }
         | BpfInsn::AddImm { dst, .. }
         | BpfInsn::SubImm { dst, .. }
         | BpfInsn::AndImm { dst, .. }
@@ -289,7 +292,14 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::LdMapFd { dst, .. }
         | BpfInsn::LdMapValue { dst, .. } => used[*dst as usize] = true,
         BpfInsn::LdImm64Second { .. } => {}
+        BpfInsn::LdAbs { .. } => used[0] = true,
+        BpfInsn::LdInd { src, .. } => {
+            used[0] = true;
+            used[*src as usize] = true;
+        }
         BpfInsn::MovReg { dst, src }
+        | BpfInsn::Mov32Reg { dst, src }
+        | BpfInsn::Jset { dst, src, .. }
         | BpfInsn::AddReg { dst, src }
         | BpfInsn::SubReg { dst, src }
         | BpfInsn::AndReg { dst, src }
@@ -339,7 +349,9 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::JsgtImm { dst, .. }
         | BpfInsn::JsgeImm { dst, .. }
         | BpfInsn::JsltImm { dst, .. }
-        | BpfInsn::JsleImm { dst, .. } => used[*dst as usize] = true,
+        | BpfInsn::JsleImm { dst, .. }
+        | BpfInsn::JsetImm { dst, .. }
+        | BpfInsn::Jmp32 { dst, .. } => used[*dst as usize] = true,
         BpfInsn::Jmp { .. }
         | BpfInsn::Call { .. }
         | BpfInsn::CallSub { .. }

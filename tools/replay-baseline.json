@@ -7,17 +7,19 @@
     "calls__068",
     "calls__070",
     "ctx_skb__004",
+    "jset__006",
+    "jset__007",
     "precise__000",
     "precise__001"
   ],
   "counts": {
-    "agree": 99,
+    "agree": 113,
     "inconclusive": 30,
     "kernel-overstrict-candidate": 1,
-    "kernel-unsound-candidate": 6,
+    "kernel-unsound-candidate": 8,
     "soundness-candidate": 2,
-    "surface-gap": 315,
-    "whitelisted": 25
+    "surface-gap": 294,
+    "whitelisted": 30
   },
   "kernel_source": "expected",
   "strict": false

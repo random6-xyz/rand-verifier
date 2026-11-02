@@ -987,6 +987,40 @@ pub(crate) fn concrete_step(
             next.regs[*dst as usize] = Some(ConcreteValue::Scalar(*imm as i64 as u64));
             Ok(next)
         }
+        // wX = imm / wX = wY (#136): ALU32 zero-extends into the
+        // 64-bit register
+        BpfInsn::Mov32Imm { dst, imm } => {
+            check_concrete_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::Scalar(*imm as u32 as u64));
+            Ok(next)
+        }
+        BpfInsn::Mov32Reg { dst, src } => {
+            check_concrete_reg(pc, *dst)?;
+            let value = read_concrete_reg(pc, state, *src)?;
+            let bits = match value {
+                ConcreteValue::Scalar(v) => v as u32 as u64,
+                // a pointer's low 32 bits are not a valid register value
+                _ => return Err(ConcreteFailure::InternalError { pc }),
+            };
+            let mut next = *state;
+            next.regs[*dst as usize] = Some(ConcreteValue::Scalar(bits));
+            Ok(next)
+        }
+        // legacy packet loads (#136): r0 gets the (bounds-checked at
+        // run time) packet bytes; the concrete model has no packet, so
+        // the value is the unknown representative 0
+        BpfInsn::LdAbs { .. } => {
+            let mut next = *state;
+            next.regs[0] = Some(ConcreteValue::Scalar(0));
+            Ok(next)
+        }
+        BpfInsn::LdInd { src, .. } => {
+            let _ = read_concrete_reg(pc, state, *src)?;
+            let mut next = *state;
+            next.regs[0] = Some(ConcreteValue::Scalar(0));
+            Ok(next)
+        }
         // rX = rY → copy the value and its pointer kind; the source must
         // have been written before it is read (#14)
         BpfInsn::MovReg { dst, src } => {
@@ -995,6 +1029,10 @@ pub(crate) fn concrete_step(
             let mut next = *state;
             next.regs[*dst as usize] = Some(value);
             Ok(next)
+        }
+        // branches are expanded by the path explorer (#51, #136)
+        BpfInsn::Jset { .. } | BpfInsn::JsetImm { .. } | BpfInsn::Jmp32 { .. } => {
+            Err(ConcreteFailure::InternalError { pc })
         }
         // terminal, control flow and helper calls are expanded by the
         // path explorer (#51); reaching them here is a driver bug
@@ -1591,6 +1629,80 @@ fn concrete_successors(
         }
         BpfInsn::JsleImm { dst, imm, offset } => {
             concrete_cond_imm(pc, *dst, *imm, *offset, CondOp::Sle, state)
+        }
+        // JSET / BPF_JMP32 (#136): exact on concrete values
+        BpfInsn::Jset { dst, src, offset } => {
+            let d = read_concrete_reg(pc, state, *dst)?;
+            let s = read_concrete_reg(pc, state, *src)?;
+            let (ConcreteValue::Scalar(d), ConcreteValue::Scalar(s)) = (d, s) else {
+                return Err(ConcreteFailure::InvalidComparison {
+                    pc,
+                    dst: *dst,
+                    src: *src,
+                });
+            };
+            Ok(vec![if (d & s) != 0 {
+                (branch_target(pc, *offset), *state)
+            } else {
+                (pc + 1, *state)
+            }])
+        }
+        BpfInsn::JsetImm { dst, imm, offset } => {
+            let d = read_concrete_reg(pc, state, *dst)?;
+            let ConcreteValue::Scalar(d) = d else {
+                return Err(ConcreteFailure::InvalidComparisonImm { pc, dst: *dst });
+            };
+            Ok(vec![if (d & (*imm as i64 as u64)) != 0 {
+                (branch_target(pc, *offset), *state)
+            } else {
+                (pc + 1, *state)
+            }])
+        }
+        BpfInsn::Jmp32 {
+            dst,
+            src,
+            imm,
+            offset,
+            op,
+        } => {
+            let d = read_concrete_reg(pc, state, *dst)?;
+            let ConcreteValue::Scalar(d) = d else {
+                return Err(ConcreteFailure::InvalidComparisonImm { pc, dst: *dst });
+            };
+            let s = match (src, imm) {
+                (Some(src), _) => {
+                    let v = read_concrete_reg(pc, state, *src)?;
+                    let ConcreteValue::Scalar(v) = v else {
+                        return Err(ConcreteFailure::InvalidComparison {
+                            pc,
+                            dst: *dst,
+                            src: *src,
+                        });
+                    };
+                    v as u32
+                }
+                (_, Some(imm)) => *imm as u32,
+                _ => unreachable!("a JMP32 carries one operand"),
+            };
+            let d = d as u32;
+            use crate::insn::Jmp32Op;
+            let taken = match op {
+                Jmp32Op::Eq => d == s,
+                Jmp32Op::Ne => d != s,
+                Jmp32Op::Gt => d > s,
+                Jmp32Op::Ge => d >= s,
+                Jmp32Op::Lt => d < s,
+                Jmp32Op::Le => d <= s,
+                Jmp32Op::Sgt => (d as i32) > (s as i32),
+                Jmp32Op::Sge => (d as i32) >= (s as i32),
+                Jmp32Op::Slt => (d as i32) < (s as i32),
+                Jmp32Op::Sle => (d as i32) <= (s as i32),
+            };
+            Ok(vec![if taken {
+                (branch_target(pc, *offset), *state)
+            } else {
+                (pc + 1, *state)
+            }])
         }
         BpfInsn::Call { imm } => {
             if matches!(*imm, 1 | 2) {

@@ -76,6 +76,14 @@ impl Default for SpecLimits {
     }
 }
 
+/// The exact value of a spec scalar, when its interval is a point.
+fn spec_const(v: SpecValue) -> Option<u64> {
+    match v {
+        SpecValue::Scalar { lo, hi } if lo == hi => Some(lo),
+        _ => None,
+    }
+}
+
 /// The kernel's arithmetic-time sanity bound (check_reg_sane_offset_*).
 const BPF_MAX_VAR_OFF: i64 = 1 << 29;
 
@@ -192,6 +200,75 @@ impl<'a> SpecRunner<'a> {
                         );
                     }
                     state.set_reg(dst, v);
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                // ALU32 MOV (#136): zero-extended 32-bit value
+                BpfInsn::Mov32Imm { dst, imm } => {
+                    state.set_reg(dst, SpecValue::const_scalar(imm as u32 as u64));
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::Mov32Reg { dst, src } => {
+                    let v = state.reg(src);
+                    match v {
+                        SpecValue::Uninit => {
+                            return self.failure(
+                                pc,
+                                format!("register r{src} is uninitialized (read by mov)"),
+                            );
+                        }
+                        SpecValue::Scalar { lo, hi } => {
+                            state.set_reg(
+                                dst,
+                                SpecValue::Scalar {
+                                    lo: lo & 0xffff_ffff,
+                                    hi: hi.min(0xffff_ffff),
+                                },
+                            );
+                        }
+                        other => {
+                            return self
+                                .failure(pc, format!("32-bit mov from a non-scalar {other:?}"));
+                        }
+                    }
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                // legacy packet loads (#136): r0 = scalar of the width
+                BpfInsn::LdAbs { .. } => {
+                    if self.prog_type.ctx_model().is_none()
+                        || !matches!(
+                            self.prog_type,
+                            crate::prog_type::ProgType::SocketFilter
+                                | crate::prog_type::ProgType::SchedCls
+                                | crate::prog_type::ProgType::SchedAct
+                                | crate::prog_type::ProgType::CgroupSkb
+                        )
+                    {
+                        return self
+                            .failure(pc, "BPF_LD ABS/IND is not allowed for this program type");
+                    }
+                    state.set_reg(0, SpecValue::unknown_scalar());
+                    self.push(&mut worklist, pc + 1, state);
+                }
+                BpfInsn::LdInd { src, .. } => {
+                    if self.prog_type.ctx_model().is_none()
+                        || !matches!(
+                            self.prog_type,
+                            crate::prog_type::ProgType::SocketFilter
+                                | crate::prog_type::ProgType::SchedCls
+                                | crate::prog_type::ProgType::SchedAct
+                                | crate::prog_type::ProgType::CgroupSkb
+                        )
+                    {
+                        return self
+                            .failure(pc, "BPF_LD ABS/IND is not allowed for this program type");
+                    }
+                    if state.reg(src) == SpecValue::Uninit {
+                        return self.failure(
+                            pc,
+                            format!("register r{src} is uninitialized (read by ldind)"),
+                        );
+                    }
+                    state.set_reg(0, SpecValue::unknown_scalar());
                     self.push(&mut worklist, pc + 1, state);
                 }
 
@@ -564,6 +641,95 @@ impl<'a> SpecRunner<'a> {
                 // ── control flow ─────────────────────────────────────
                 BpfInsn::Jmp { offset } => {
                     self.push(&mut worklist, branch_target(pc, offset), state);
+                }
+                // JSET / JMP32 (#136): a constant-only test is decided
+                // statically (the kernel's is_branch_taken), otherwise
+                // both successors stay reachable
+                BpfInsn::Jset { dst, src, offset } => {
+                    let d = state.reg(dst);
+                    let s = state.reg(src);
+                    if d == SpecValue::Uninit || s == SpecValue::Uninit {
+                        return self.failure(pc, "uninitialized register read by jset");
+                    }
+                    match (spec_const(d), spec_const(s)) {
+                        (Some(d), Some(s)) => {
+                            let target = if (d & s) != 0 {
+                                branch_target(pc, offset)
+                            } else {
+                                pc + 1
+                            };
+                            self.push(&mut worklist, target, state);
+                        }
+                        _ => {
+                            self.push(&mut worklist, branch_target(pc, offset), state);
+                            self.push(&mut worklist, pc + 1, state);
+                        }
+                    }
+                }
+                BpfInsn::JsetImm { dst, imm, offset } => {
+                    let d = state.reg(dst);
+                    if d == SpecValue::Uninit {
+                        return self.failure(pc, "uninitialized register read by jset");
+                    }
+                    match spec_const(d) {
+                        Some(d) => {
+                            let target = if (d & (imm as i64 as u64)) != 0 {
+                                branch_target(pc, offset)
+                            } else {
+                                pc + 1
+                            };
+                            self.push(&mut worklist, target, state);
+                        }
+                        None => {
+                            self.push(&mut worklist, branch_target(pc, offset), state);
+                            self.push(&mut worklist, pc + 1, state);
+                        }
+                    }
+                }
+                BpfInsn::Jmp32 {
+                    dst,
+                    src,
+                    imm,
+                    offset,
+                    op,
+                } => {
+                    let d = state.reg(dst);
+                    let s = match (src, imm) {
+                        (Some(src), _) => state.reg(src),
+                        (_, Some(imm)) => SpecValue::const_scalar(imm as u32 as u64),
+                        _ => SpecValue::Uninit,
+                    };
+                    if d == SpecValue::Uninit || s == SpecValue::Uninit {
+                        return self.failure(pc, "uninitialized register read by a 32-bit jump");
+                    }
+                    match (spec_const(d), spec_const(s)) {
+                        (Some(d), Some(s)) => {
+                            let (d, s) = (d as u32, s as u32);
+                            use crate::insn::Jmp32Op;
+                            let taken = match op {
+                                Jmp32Op::Eq => d == s,
+                                Jmp32Op::Ne => d != s,
+                                Jmp32Op::Gt => d > s,
+                                Jmp32Op::Ge => d >= s,
+                                Jmp32Op::Lt => d < s,
+                                Jmp32Op::Le => d <= s,
+                                Jmp32Op::Sgt => (d as i32) > (s as i32),
+                                Jmp32Op::Sge => (d as i32) >= (s as i32),
+                                Jmp32Op::Slt => (d as i32) < (s as i32),
+                                Jmp32Op::Sle => (d as i32) <= (s as i32),
+                            };
+                            let target = if taken {
+                                branch_target(pc, offset)
+                            } else {
+                                pc + 1
+                            };
+                            self.push(&mut worklist, target, state);
+                        }
+                        _ => {
+                            self.push(&mut worklist, branch_target(pc, offset), state);
+                            self.push(&mut worklist, pc + 1, state);
+                        }
+                    }
                 }
                 BpfInsn::Jeq { dst, src, offset } => {
                     let _verdict = self.branch(

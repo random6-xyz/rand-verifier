@@ -62,6 +62,51 @@ pub(crate) fn step(
             next.regs[*dst as usize] = RegState::Scalar(ScalarBounds::constant(*imm as i64));
             Ok(next)
         }
+        // ALU32 MOV (#136): the low 32 bits move, the upper half is
+        // cleared (kernel: `wDST = IMM` / `wDST = wSRC`)
+        BpfInsn::Mov32Imm { dst, imm } => {
+            check_reg(pc, *dst)?;
+            let mut next = *state;
+            next.regs[*dst as usize] =
+                RegState::Scalar(ScalarBounds::from_signed(0, *imm as u32 as i64));
+            Ok(next)
+        }
+        BpfInsn::Mov32Reg { dst, src } => {
+            check_reg(pc, *dst)?;
+            let s = read_scalar(pc, state, *src)?;
+            let bounds = if s.is_constant() {
+                ScalarBounds::from_signed(0, (s.umax & 0xffff_ffff) as i64)
+            } else {
+                ScalarBounds::from_signed(0, u32::MAX as i64)
+            };
+            let mut next = *state;
+            next.regs[*dst as usize] = RegState::Scalar(bounds);
+            Ok(next)
+        }
+        // legacy packet loads (#136): the kernel bounds-checks at run
+        // time and yields 0 out of bounds, so the value is a scalar of
+        // the access width; only packet-capable program types may use it
+        BpfInsn::LdAbs { size, .. } => {
+            check_legacy_packet_load(pc, state)?;
+            let mut next = *state;
+            // the kernel's check_ld_abs clears the caller-saved
+            // registers (the runtime helper may clobber them)
+            for r in 1..=5 {
+                next.regs[r] = RegState::Uninit;
+            }
+            next.regs[0] = RegState::Scalar(scalar_for_width(size.bytes() as u32, false));
+            Ok(next)
+        }
+        BpfInsn::LdInd { src, size, .. } => {
+            check_legacy_packet_load(pc, state)?;
+            let _ = read_scalar(pc, state, *src)?;
+            let mut next = *state;
+            for r in 1..=5 {
+                next.regs[r] = RegState::Uninit;
+            }
+            next.regs[0] = RegState::Scalar(scalar_for_width(size.bytes() as u32, false));
+            Ok(next)
+        }
         // rX = rY → copy the source's abstract state;
         // the source must have been written before it is read (#14)
         BpfInsn::MovReg { dst, src } => {
@@ -272,6 +317,10 @@ pub(crate) fn step(
             next.regs[*dst as usize] = loaded;
             Ok(next)
         }
+        // branches are expanded by successors(), never stepped (#136)
+        BpfInsn::Jset { .. } | BpfInsn::JsetImm { .. } | BpfInsn::Jmp32 { .. } => Err(
+            VerificationFailure::new(pc, "internal error: branch instruction reached step()"),
+        ),
         // helper call: validate R1..R5 against the helper prototype, then
         // apply the eBPF calling convention (#28/#29): R1..R5 are
         // clobbered by the call (kernel's check_helper_call resets them
@@ -1309,6 +1358,34 @@ fn ctx_read(
             format!("invalid bpf_context access off={off} size={bytes}"),
         )),
     }
+}
+
+/// The kernel's `check_ld_abs` preconditions (#136): the type must allow
+/// packet access, R6 must hold the context pointer, and R1..R5 must be
+/// initialized (the runtime helper clobbers them).
+fn check_legacy_packet_load(pc: u32, state: &VerifierState) -> Result<(), VerificationFailure> {
+    if !packet_access_allowed(state.prog_type) {
+        return Err(VerificationFailure::new(
+            pc,
+            "BPF_LD_[ABS|IND] instructions not allowed for this program type",
+        ));
+    }
+    if !matches!(state.regs[6], RegState::PtrToCtx { .. }) {
+        return Err(VerificationFailure::new(
+            pc,
+            "at the time of BPF_LD_ABS|IND R6 != pointer to skb",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the program type may use the legacy packet loads (#136).
+fn packet_access_allowed(prog_type: crate::prog_type::ProgType) -> bool {
+    use crate::prog_type::ProgType;
+    matches!(
+        prog_type,
+        ProgType::SocketFilter | ProgType::SchedCls | ProgType::SchedAct | ProgType::CgroupSkb
+    )
 }
 
 /// The scalar range a `size`-byte load produces: zero-extended for
@@ -3430,6 +3507,41 @@ pub(crate) fn successors(
         BpfInsn::JsleImm { dst, imm, offset } => {
             cond_branch_imm(pc, *dst, *imm, *offset, CondOp::Sle, state)
         }
+        // JSET and BPF_JMP32 (#136): a constant-only comparison is
+        // decided statically (the kernel's is_branch_taken), otherwise
+        // both successors stay reachable without refinement.
+        BpfInsn::Jset { dst, src, offset } => {
+            let d = read_scalar(pc, state, *dst)?;
+            let s = read_scalar(pc, state, *src)?;
+            branch_or_both(pc, *offset, jset_verdict(d, s), state)
+        }
+        BpfInsn::JsetImm { dst, imm, offset } => {
+            let d = read_scalar(pc, state, *dst)?;
+            match jset_verdict(d, ScalarBounds::constant(*imm as i64)) {
+                Some(true) => Ok(vec![(branch_target(pc, *offset), *state)]),
+                Some(false) => Ok(vec![(pc + 1, *state)]),
+                None => {
+                    // the not-taken side clears the tested bits
+                    let fall = jset_not_taken(*dst, *imm, state);
+                    Ok(vec![(branch_target(pc, *offset), *state), (pc + 1, fall)])
+                }
+            }
+        }
+        BpfInsn::Jmp32 {
+            dst,
+            src,
+            imm,
+            offset,
+            op,
+        } => {
+            let d = read_scalar(pc, state, *dst)?;
+            let s = match (src, imm) {
+                (Some(src), _) => read_scalar(pc, state, *src)?,
+                (_, Some(imm)) => ScalarBounds::constant(*imm as i64),
+                _ => unreachable!("a JMP32 carries one operand"),
+            };
+            branch_or_both(pc, *offset, jmp32_verdict(d, s, *op), state)
+        }
         // everything else falls through via step() (this includes
         // helper calls, which step() validates — #28)
         _ => {
@@ -3437,6 +3549,84 @@ pub(crate) fn successors(
             Ok(vec![(pc + 1, next)])
         }
     }
+}
+
+/// Emit the taken/fall-through successors, or only the statically
+/// decidable one (#136: the kernel's `is_branch_taken`).
+fn branch_or_both(
+    pc: u32,
+    offset: i16,
+    taken: Option<bool>,
+    state: &VerifierState,
+) -> Result<Vec<(u32, VerifierState)>, VerificationFailure> {
+    Ok(match taken {
+        Some(true) => vec![(branch_target(pc, offset), *state)],
+        Some(false) => vec![(pc + 1, *state)],
+        None => vec![(branch_target(pc, offset), *state), (pc + 1, *state)],
+    })
+}
+
+/// `if (dst & src) != 0`, decided from the scalar bounds and tnum.
+///
+/// - constant / constant: exact
+/// - a bit known 1 on both sides: taken (the kernel's tnum case)
+/// - no bit can be set on both sides: not taken
+fn jset_verdict(dst: ScalarBounds, src: ScalarBounds) -> Option<bool> {
+    if dst.is_constant() && src.is_constant() {
+        return Some((dst.umin & src.umin) != 0);
+    }
+    // known-1 bits: value & !mask
+    let d1 = dst.tnum.value & !dst.tnum.mask;
+    let s1 = src.tnum.value & !src.tnum.mask;
+    if (d1 & s1) != 0 {
+        return Some(true);
+    }
+    // possible bits: value | mask; if they cannot overlap, the AND is 0
+    let dp = dst.tnum.value | dst.tnum.mask;
+    let sp = src.tnum.value | src.tnum.mask;
+    if (dp & sp) == 0 {
+        return Some(false);
+    }
+    None
+}
+
+/// The fall-through refinement of `jset dst, IMM` (the test is false, so
+/// every bit of `imm` is clear): `dst &= ~imm` (kernel reg_set_min_max).
+fn jset_not_taken(dst: u8, imm: i32, state: &VerifierState) -> VerifierState {
+    let mut fall = *state;
+    if let RegState::Scalar(bounds) = fall.regs[dst as usize] {
+        let cleared = apply_alu(
+            AluOp::And,
+            AluWidth::W64,
+            bounds,
+            ScalarBounds::constant(!imm as i64),
+        );
+        fall.regs[dst as usize] = RegState::Scalar(cleared);
+    }
+    fall
+}
+
+/// The `BPF_JMP32` comparison over the low 32 bits when both sides are
+/// constants (#136).
+fn jmp32_verdict(dst: ScalarBounds, src: ScalarBounds, op: crate::insn::Jmp32Op) -> Option<bool> {
+    use crate::insn::Jmp32Op;
+    if !dst.is_constant() || !src.is_constant() {
+        return None;
+    }
+    let d = dst.umin as u32;
+    let s = src.umin as u32;
+    Some(match op {
+        Jmp32Op::Eq => d == s,
+        Jmp32Op::Ne => d != s,
+        Jmp32Op::Gt => d > s,
+        Jmp32Op::Ge => d >= s,
+        Jmp32Op::Lt => d < s,
+        Jmp32Op::Le => d <= s,
+        Jmp32Op::Sgt => (d as i32) > (s as i32),
+        Jmp32Op::Sge => (d as i32) >= (s as i32),
+        Jmp32Op::Slt => (d as i32) < (s as i32),
+        Jmp32Op::Sle => (d as i32) <= (s as i32),
+    })
 }
 
 /// Fork a conditional branch into taken and fall-through successors.

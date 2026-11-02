@@ -26,6 +26,59 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         // ALU64
         BpfInsn::MovImm { dst, imm } => (opcode::MOV_IMM, *dst, 0, 0, *imm),
         BpfInsn::MovReg { dst, src } => (opcode::MOV_REG, *dst, *src, 0, 0),
+        BpfInsn::Mov32Imm { dst, imm } => (opcode::MOV32_IMM, *dst, 0, 0, *imm),
+        BpfInsn::Mov32Reg { dst, src } => (opcode::MOV32_REG, *dst, *src, 0, 0),
+        BpfInsn::Jset { dst, src, offset } => (opcode::JSET, *dst, *src, *offset, 0),
+        BpfInsn::JsetImm { dst, imm, offset } => (opcode::JSET_IMM, *dst, 0, *offset, *imm),
+        BpfInsn::Jmp32 {
+            dst,
+            src,
+            imm,
+            offset,
+            op,
+        } => {
+            let o = match op {
+                crate::insn::Jmp32Op::Eq => (opcode::JMP32_JEQ, opcode::JMP32_JEQ_IMM),
+                crate::insn::Jmp32Op::Ne => (opcode::JMP32_JNE, opcode::JMP32_JNE_IMM),
+                crate::insn::Jmp32Op::Gt => (opcode::JMP32_JGT, opcode::JMP32_JGT_IMM),
+                crate::insn::Jmp32Op::Ge => (opcode::JMP32_JGE, opcode::JMP32_JGE_IMM),
+                crate::insn::Jmp32Op::Lt => (opcode::JMP32_JLT, opcode::JMP32_JLT_IMM),
+                crate::insn::Jmp32Op::Le => (opcode::JMP32_JLE, opcode::JMP32_JLE_IMM),
+                crate::insn::Jmp32Op::Sgt => (opcode::JMP32_JSGT, opcode::JMP32_JSGT_IMM),
+                crate::insn::Jmp32Op::Sge => (opcode::JMP32_JSGE, opcode::JMP32_JSGE_IMM),
+                crate::insn::Jmp32Op::Slt => (opcode::JMP32_JSLT, opcode::JMP32_JSLT_IMM),
+                crate::insn::Jmp32Op::Sle => (opcode::JMP32_JSLE, opcode::JMP32_JSLE_IMM),
+            };
+            match (src, imm) {
+                (Some(s), _) => (o.0, *dst, *s, *offset, 0),
+                (_, Some(i)) => (o.1, *dst, 0, *offset, *i),
+                _ => unreachable!("a JMP32 carries one operand"),
+            }
+        }
+        BpfInsn::LdAbs { size, imm } => (
+            match size {
+                crate::insn::MemSize::W => opcode::LD_ABS,
+                crate::insn::MemSize::H => opcode::LD_ABS_H,
+                crate::insn::MemSize::B => opcode::LD_ABS_B,
+                crate::insn::MemSize::DW => opcode::LD_ABS_DW,
+            },
+            0,
+            0,
+            0,
+            *imm,
+        ),
+        BpfInsn::LdInd { src, size, imm } => (
+            match size {
+                crate::insn::MemSize::W => opcode::LD_IND,
+                crate::insn::MemSize::H => opcode::LD_IND_H,
+                crate::insn::MemSize::B => opcode::LD_IND_B,
+                crate::insn::MemSize::DW => opcode::LD_IND_DW,
+            },
+            0,
+            *src,
+            0,
+            *imm,
+        ),
         BpfInsn::AddImm { dst, imm } => (opcode::ADD_IMM, *dst, 0, 0, *imm),
         BpfInsn::AddReg { dst, src } => (opcode::ADD_REG, *dst, *src, 0, 0),
         BpfInsn::SubImm { dst, imm } => (opcode::SUB_IMM, *dst, 0, 0, *imm),
@@ -437,7 +490,9 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::ModImm { .. }
         | BpfInsn::ModReg { .. }
         | BpfInsn::Neg { .. } => "alu64",
-        BpfInsn::Add32Imm { .. }
+        BpfInsn::Mov32Imm { .. }
+        | BpfInsn::Mov32Reg { .. }
+        | BpfInsn::Add32Imm { .. }
         | BpfInsn::Add32Reg { .. }
         | BpfInsn::Sub32Imm { .. }
         | BpfInsn::Sub32Reg { .. }
@@ -460,7 +515,10 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::Mod32Imm { .. }
         | BpfInsn::Mod32Reg { .. }
         | BpfInsn::Neg32 { .. } => "alu32",
-        BpfInsn::Jeq { .. }
+        BpfInsn::Jset { .. }
+        | BpfInsn::JsetImm { .. }
+        | BpfInsn::Jmp32 { .. }
+        | BpfInsn::Jeq { .. }
         | BpfInsn::JeqImm { .. }
         | BpfInsn::Jne { .. }
         | BpfInsn::JneImm { .. } => "cmp_eq",
@@ -487,6 +545,7 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::LdImm64Second { .. } => "ldimm64",
         BpfInsn::Call { .. } => "helper",
         BpfInsn::CallSub { .. } | BpfInsn::CallKfunc { .. } => "subcall",
+        BpfInsn::LdAbs { .. } | BpfInsn::LdInd { .. } => "ldabs",
         BpfInsn::Jmp { .. } => "jmp",
         BpfInsn::Exit => "exit",
     }
