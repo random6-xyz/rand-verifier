@@ -68,3 +68,22 @@ Next measurements worth trying:
    feature distribution is dominated by observed verifier responses.
 3. Tune the energy exponent (`1/(1+uses)^k`) and the feature buckets —
    both are one-line changes in `src/fuzz/novelty.rs`.
+
+## Result (20k x 3 seeds, #140)
+
+Model-only mutation campaigns, same seeds and corpus, `--mode mutation`:
+
+| seed | arm | unique features | duplicate ratio |
+|---|---|---|---|
+| 7 | baseline | 7273 | 2.75 |
+| 7 | novelty | **10612** | **1.89** |
+| 31 | baseline | 7494 | 2.67 |
+| 31 | novelty | **10692** | **1.87** |
+| 97 | baseline | 7338 | 2.73 |
+| 97 | novelty | **10642** | **1.88** |
+
+Novelty selection is **on by default** since this result (`--no-novelty`
+opts out). The mechanism needed one fix to bite: the energy decayed on
+*promotion* only, and promotion saturates after the first new signature,
+so every weight stayed 1.0 and the two arms were bit-identical. Counting
+picks (`NoveltyMap::note_pick`) makes the energy meaningful.

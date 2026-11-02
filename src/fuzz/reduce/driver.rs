@@ -239,6 +239,13 @@ fn write_artifacts(
 
     fs::write(target.join("prog.bin"), reduced)
         .map_err(|e| ReduceError::Pipeline(e.to_string()))?;
+    // the map sidecar from the finding travels with the reduced program
+    // (#134): without it the reduced replay cannot recreate the maps
+    let maps = dir.join("prog.maps");
+    if maps.is_file() {
+        fs::copy(&maps, target.join("prog.maps"))
+            .map_err(|e| ReduceError::Pipeline(e.to_string()))?;
+    }
 
     let mut dump = String::new();
     for (idx, chunk) in reduced.as_chunks::<8>().0.iter().enumerate() {

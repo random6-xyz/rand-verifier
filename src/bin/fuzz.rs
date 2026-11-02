@@ -101,7 +101,10 @@ fn parse_args() -> Args {
         save_corpus: None,
         qemu_dir: None,
         // opt-in until the A/B shows a win (tools/NOVELTY.md)
-        novelty: false,
+        // #140: the 20k x 3-seed A/B shows +45% unique features and
+        // a 1.45x lower duplicate ratio, so novelty scheduling is the
+        // default (--no-novelty opts out)
+        novelty: true,
         novelty_corpus: PathBuf::from("fuzz-out/corpus"),
     };
     let mut it = env::args().skip(1);
@@ -364,6 +367,9 @@ fn run_mutation_campaign(
                 vec![1.0; pool.len()]
             };
             let seed_index = mutator.pick_weighted(&weights);
+            // decay the picked seed's energy (#140): without this the
+            // weights stay equal and novelty selection is inert
+            novelty.note_pick(&pool[seed_index].3);
             let other_index = mutator.pick_weighted(&weights);
             let (_, seed_insns, seed_v, _) = &pool[seed_index];
             let other_seed = &pool[other_index];
@@ -509,7 +515,8 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<Seed>> {
                 continue;
             };
             let mut env = BpfVerifierEnv::new();
-            env.setup_prog_bytes(&bytes)?;
+            // setup_prog loads the sibling `<name>.maps` sidecar (#134)
+            env.setup_prog(path.to_string_lossy().into_owned())?;
             let verdict =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
                     Ok(Ok(v)) => v,
@@ -870,6 +877,29 @@ struct ProgramResult<'a> {
 fn save_finding(dir: &Path, env: &BpfVerifierEnv, result: &ProgramResult) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
     fs::write(dir.join("prog.bin"), result.bytes)?;
+    // map metadata travels with the finding (#134): the fd -> MapInfo
+    // table is what a replay needs to recreate the kernel maps
+    if !env.maps().is_empty() {
+        let mut sidecar = String::from("{\n");
+        let mut entries: Vec<_> = env.maps().iter().collect();
+        entries.sort_by_key(|(fd, _)| **fd);
+        for (i, (fd, info)) in entries.iter().enumerate() {
+            sidecar.push_str(&format!(
+                "  \"{}\": {{\"map_type\": \"{}\", \"key_size\": {}, \"value_size\": {}, \"max_entries\": {}}}{}\n",
+                fd,
+                match info.map_type {
+                    rand_verifier::env::MapType::Array => "array",
+                    rand_verifier::env::MapType::Ringbuf => "ringbuf",
+                },
+                info.key_size,
+                info.value_size,
+                info.max_entries,
+                if i + 1 == entries.len() { "" } else { "," }
+            ));
+        }
+        sidecar.push_str("}\n");
+        fs::write(dir.join("prog.maps"), sidecar)?;
+    }
 
     let mut dump = String::new();
     match rand_verifier::insn::decode_program(result.bytes) {
