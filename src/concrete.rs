@@ -1637,8 +1637,27 @@ fn concrete_cond(
             CondOp::Ne => true,
             _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
         },
-        // mixed pointer/scalar types are never comparable
-        _ => return Err(ConcreteFailure::InvalidComparison { pc, dst, src }),
+        // a pointer compared with a scalar (or two different pointer
+        // kinds) is a privileged comparison — the kernel allows it for
+        // loaders with allow_ptr_leaks and rejects it unprivileged with
+        // "R%d pointer comparison prohibited" (verifier/jump.c). The
+        // witness execution compares the model addresses (bits), which
+        // keeps the branch deterministic; it is evidence, not a proof.
+        (d, s) => {
+            let (a, b) = (d.bits(), s.bits());
+            match op {
+                CondOp::Eq => a == b,
+                CondOp::Ne => a != b,
+                CondOp::Ugt => a > b,
+                CondOp::Uge => a >= b,
+                CondOp::Ult => a < b,
+                CondOp::Ule => a <= b,
+                CondOp::Sgt => (a as i64) > (b as i64),
+                CondOp::Sge => (a as i64) >= (b as i64),
+                CondOp::Slt => (a as i64) < (b as i64),
+                CondOp::Sle => (a as i64) <= (b as i64),
+            }
+        }
     };
     let next_pc = if taken {
         branch_target(pc, offset)
@@ -3587,24 +3606,20 @@ mod tests {
                 src: 10
             }
         );
-        // mixed pointer/scalar comparison
+        // mixed pointer/scalar comparison is a privileged comparison
+        // (allow_ptr_leaks): the concrete model compares the addresses
+        // and runs the program; the unprivileged kernel rejects it
         let program = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
             BpfInsn::MovImm { dst: 2, imm: 5 },
             BpfInsn::Jgt {
                 dst: 10,
                 src: 2,
-                offset: 1,
+                offset: 0, // both outcomes land on the exit
             },
+            BpfInsn::Exit,
         ];
-        let err = run_concrete(&program, &[]).unwrap_err();
-        assert_eq!(
-            err,
-            ConcreteFailure::InvalidComparison {
-                pc: 1,
-                dst: 10,
-                src: 2
-            }
-        );
+        assert!(run_concrete(&program, &[]).is_ok());
     }
 
     #[test]

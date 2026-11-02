@@ -15,6 +15,9 @@ const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 /// programs overflow libbpf's 1 MiB default (errno=28 loses the verdict).
 pub const LOG_BUF_SIZE: usize = 1 << 22;
 
+/// CAP_PERFMON (linux/capability.h): gates `allow_uninit_stack`,
+/// `allow_ptr_leaks` and the speculative bypass (#143).
+const CAP_PERFMON: u32 = 38;
 /// `_LINUX_CAPABILITY_VERSION_3` (linux/capability.h).
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 /// CAP_BPF (linux/capability.h): enough for BPF_PROG_LOAD —
@@ -242,8 +245,66 @@ fn log_text(log_buf: &[u8]) -> String {
     String::from_utf8_lossy(&log_buf[..end]).into_owned()
 }
 
-/// Drop every capability except CAP_BPF and CAP_NET_ADMIN so the kernel
-/// verifier applies its strict rules.
+/// The capability axis of a kernel load (#143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapMode {
+    /// Keep every capability (privileged load: allow_uninit_stack,
+    /// allow_ptr_leaks, speculative bypass enabled).
+    Priv,
+    /// CAP_BPF + CAP_NET_ADMIN only — the old `--strict` behaviour
+    /// (no CAP_PERFMON, so the privileged leniencies are off).
+    CapBpf,
+    /// CAP_BPF + CAP_NET_ADMIN + CAP_PERFMON: loads still work and
+    /// CAP_PERFMON-gated rules are enabled while CAP_SYS_ADMIN is gone.
+    CapBpfPerfmon,
+    /// Drop every capability; requires a kernel built with
+    /// `unprivileged_bpf_disabled=0` (see tools/kernel/unpriv.config).
+    Unpriv,
+}
+
+impl CapMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "priv" | "privileged" => Some(CapMode::Priv),
+            "cap-bpf" | "strict" => Some(CapMode::CapBpf),
+            "cap-bpf-perfmon" => Some(CapMode::CapBpfPerfmon),
+            "unpriv" | "unprivileged" => Some(CapMode::Unpriv),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CapMode::Priv => "priv",
+            CapMode::CapBpf => "cap-bpf",
+            CapMode::CapBpfPerfmon => "cap-bpf-perfmon",
+            CapMode::Unpriv => "unpriv",
+        }
+    }
+}
+
+/// Drop capabilities according to `mode` (see [`CapMode`]).
+///
+/// The privileged leniencies are gated by `bpf_token_capable(token,
+/// CAP_PERFMON)` (`allow_uninit_stack`, `allow_ptr_leaks`, spec-bypass
+/// — include/linux/bpf.h), and `bpf_ns_capable` treats **CAP_SYS_ADMIN
+/// as a superset of every BPF capability** (kernel/bpf/token.c), so
+/// dropping CAP_PERFMON alone is not enough — CAP_SYS_ADMIN must go
+/// too. CAP_BPF is kept in the `cap-*` modes so `bpf_cap` still passes
+/// the `unprivileged_bpf_disabled` gate and loads keep working.
+///
+/// Returns a diagnostic message, or an error when the capabilities
+/// could not be dropped.
+pub fn drop_caps(mode: CapMode) -> Result<String, String> {
+    if mode == CapMode::Priv {
+        return Ok("capabilities unchanged (privileged)".to_string());
+    }
+    drop_caps_inner(mode)
+}
+
+/// Drop every capability except the mode's mask so the kernel verifier
+/// applies its strict rules (backwards-compatible alias for
+/// [`CapMode::CapBpf`]).
 ///
 /// The privileged leniencies are gated by `bpf_token_capable(token,
 /// CAP_PERFMON)` (`allow_uninit_stack`, `allow_ptr_leaks`, spec-bypass
@@ -256,6 +317,10 @@ fn log_text(log_buf: &[u8]) -> String {
 /// Returns a diagnostic message, or an error when the capabilities
 /// could not be dropped.
 pub fn drop_privileged_caps() -> Result<String, String> {
+    drop_caps(CapMode::CapBpf)
+}
+
+fn drop_caps_inner(mode: CapMode) -> Result<String, String> {
     #[repr(C)]
     #[derive(Default)]
     struct CapHeader {
@@ -287,15 +352,21 @@ pub fn drop_privileged_caps() -> Result<String, String> {
             std::io::Error::last_os_error()
         ));
     }
-    // keep only CAP_NET_ADMIN (cap 12 → first u32) and CAP_BPF
-    // (cap 39 → second u32, bit 7)
+    // capability words: caps 0..31 in data[0], 32..63 in data[1]
     let cap_net_admin_bit = 1u32 << CAP_NET_ADMIN;
     let cap_bpf_bit = 1u32 << (CAP_BPF % 32);
-    data[0].effective = cap_net_admin_bit;
-    data[0].permitted = cap_net_admin_bit;
+    let cap_perfmon_bit = 1u32 << (CAP_PERFMON % 32);
+    let (keep0, keep1) = match mode {
+        CapMode::Priv => unreachable!("handled above"),
+        CapMode::CapBpf => (cap_net_admin_bit, cap_bpf_bit),
+        CapMode::CapBpfPerfmon => (cap_net_admin_bit, cap_bpf_bit | cap_perfmon_bit),
+        CapMode::Unpriv => (0, 0),
+    };
+    data[0].effective = keep0;
+    data[0].permitted = keep0;
     data[0].inheritable = 0;
-    data[1].effective = cap_bpf_bit;
-    data[1].permitted = cap_bpf_bit;
+    data[1].effective = keep1;
+    data[1].permitted = keep1;
     data[1].inheritable = 0;
     let ret = unsafe {
         libc::syscall(
@@ -319,10 +390,16 @@ pub fn drop_privileged_caps() -> Result<String, String> {
             after.as_mut_ptr() as *mut libc::c_void,
         )
     };
-    if ret != 0 || after[0].effective != cap_net_admin_bit || after[1].effective != cap_bpf_bit {
-        Err("capset did not take effect (CAP_SYS_ADMIN/CAP_PERFMON still present)".to_string())
+    if ret != 0 || after[0].effective != keep0 || after[1].effective != keep1 {
+        Err(format!(
+            "capset did not take effect for mode {} (CAP_SYS_ADMIN/CAP_PERFMON still present?)",
+            mode.name()
+        ))
     } else {
-        Ok("only CAP_BPF+CAP_NET_ADMIN kept — privileged verifier rules disabled".to_string())
+        Ok(format!(
+            "capability mode {} applied — privileged verifier rules disabled",
+            mode.name()
+        ))
     }
 }
 
@@ -380,6 +457,26 @@ fn load_with_level(insns: &[u8], log_level: u32) -> (KernelOutcome, String) {
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod cap_mode_tests {
+    use super::*;
+
+    #[test]
+    fn cap_mode_names_and_aliases() {
+        assert_eq!(CapMode::parse("strict"), Some(CapMode::CapBpf));
+        assert_eq!(CapMode::parse("cap-bpf"), Some(CapMode::CapBpf));
+        assert_eq!(CapMode::parse("unpriv"), Some(CapMode::Unpriv));
+        assert_eq!(
+            CapMode::parse("cap-bpf-perfmon"),
+            Some(CapMode::CapBpfPerfmon)
+        );
+        assert_eq!(CapMode::parse("priv"), Some(CapMode::Priv));
+        assert_eq!(CapMode::parse("nope"), None);
+        assert_eq!(CapMode::CapBpf.name(), "cap-bpf");
+        assert_eq!(CapMode::Unpriv.name(), "unpriv");
+    }
+}
 
 #[cfg(test)]
 mod tests {
