@@ -3819,6 +3819,30 @@ fn cond_branch_impl(
                 }
             }
         }
+        // Privileged loaders may compare a pointer with a scalar
+        // (allow_ptr_leaks): the unprivileged kernel rejects it with
+        // "R%d pointer comparison prohibited", the privileged one allows
+        // it without refinement (the comparison is not statically
+        // decidable). Selftest: verifier/jump.c
+        // `.result = ACCEPT` / `.result_unpriv = REJECT`.
+        (
+            RegState::PtrToStack { .. }
+            | RegState::PtrToCtx
+            | RegState::PtrToMap { .. }
+            | RegState::PtrToMapValue { .. }
+            | RegState::PtrToMapValueOrNull { .. }
+            | RegState::PtrToMem { .. },
+            RegState::Scalar(_),
+        )
+        | (
+            RegState::Scalar(_),
+            RegState::PtrToStack { .. }
+            | RegState::PtrToCtx
+            | RegState::PtrToMap { .. }
+            | RegState::PtrToMapValue { .. }
+            | RegState::PtrToMapValueOrNull { .. }
+            | RegState::PtrToMem { .. },
+        ) => vec![(taken_pc, *state), (fall_pc, *state)],
         // read_reg rejects uninitialized registers before we get here
         (RegState::Uninit, _) | (_, RegState::Uninit) => {
             unreachable!("read_reg rejects uninitialized registers")
@@ -6776,11 +6800,13 @@ mod tests {
     }
 
     #[test]
-    fn successors_imm_pointer_compare_rejected() {
-        // a pointer compared to an immediate is rejected like the
-        // reg-form mixed-type comparison (r1 = PtrToCtx at entry)
+    fn successors_imm_pointer_compare_allowed() {
+        // privileged loaders may compare a pointer with an immediate
+        // (allow_ptr_leaks; the unprivileged kernel rejects with
+        // "R%d pointer comparison prohibited" — verifier/jump.c). The
+        // model follows the privileged rules, so both branches stay.
         let state = VerifierState::initial();
-        let err = successors(
+        let nexts = successors(
             0,
             &BpfInsn::JeqImm {
                 dst: 1,
@@ -6789,8 +6815,8 @@ mod tests {
             },
             &state,
         )
-        .unwrap_err();
-        assert!(err.message.contains("different types"), "{}", err.message);
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
     }
 
     #[test]
@@ -6871,16 +6897,17 @@ mod tests {
     }
 
     #[test]
-    fn successors_null_check_nonzero_scalar_rejected() {
-        // only the constant 0 enables a NULL check; other scalars keep the
-        // different-types rejection
+    fn successors_null_check_nonzero_scalar_allowed() {
+        // comparing a nullable map-value pointer with a non-zero scalar is
+        // a privileged pointer comparison: allowed without refinement
+        // (only the constant 0 refines the pointer state)
         let mut state = VerifierState::initial();
         state.regs[0] = RegState::PtrToMapValueOrNull {
             value_size: 8,
             id: 1,
         };
         state.regs[1] = RegState::Scalar(ScalarBounds::constant(8));
-        let err = successors(
+        let nexts = successors(
             0,
             &BpfInsn::Jeq {
                 dst: 0,
@@ -6889,8 +6916,13 @@ mod tests {
             },
             &state,
         )
-        .unwrap_err();
-        assert!(err.message.contains("different types"));
+        .unwrap();
+        assert_eq!(nexts.len(), 2);
+        // the pointer is not refined by a non-zero comparison
+        assert!(matches!(
+            nexts[0].1.regs[0],
+            RegState::PtrToMapValueOrNull { .. }
+        ));
     }
 
     #[test]

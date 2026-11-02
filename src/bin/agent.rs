@@ -27,7 +27,7 @@ use std::process;
 
 use rand_verifier::env::{MapInfo, MapType};
 use rand_verifier::krun::{
-    KernelOutcome, drop_privileged_caps, load_with_kernel_maps_level, referenced_map_fds,
+    CapMode, KernelOutcome, drop_caps, load_with_kernel_maps_level, referenced_map_fds,
 };
 
 /// Synthetic map registry: every referenced fd maps to the ARRAY
@@ -59,12 +59,6 @@ fn format_kernel_verdict(outcome: &KernelOutcome) -> String {
         KernelOutcome::NoErrorLine { errno } => format!("REJECT no-error-line errno={errno}"),
         KernelOutcome::InvalidProgram => "REJECT invalid-program errno=0".to_string(),
     }
-}
-
-fn drop_caps_for_strict_mode(
-    drop_caps: impl FnOnce() -> Result<String, String>,
-) -> Result<String, String> {
-    drop_caps()
 }
 
 fn run_program_bytes(data: &[u8]) {
@@ -115,11 +109,42 @@ fn main() {
     // redirects stderr into the same out file, and the host parser
     // (src/fuzz/qemu.rs::parse_agent_verdict) keys off the first line,
     // which must be exactly `ACCEPT` or `REJECT ...`.
-    let strict = rest.contains(&"--strict");
+    // capability axis (#143): --caps <priv|cap-bpf|cap-bpf-perfmon|unpriv>;
+    // --strict stays as the cap-bpf alias
+    let mut caps = if rest.contains(&"--strict") {
+        CapMode::CapBpf
+    } else {
+        CapMode::Priv
+    };
+    let mut skip_next = false;
+    for (i, arg) in rest.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if *arg == "--caps" {
+            let Some(value) = rest.get(i + 1) else {
+                eprintln!("--caps needs a value");
+                process::exit(2);
+            };
+            match CapMode::parse(value) {
+                Some(mode) => caps = mode,
+                None => {
+                    eprintln!("unknown --caps value {value}");
+                    process::exit(2);
+                }
+            }
+            skip_next = true;
+        }
+    }
     let files: Vec<&str> = rest
         .iter()
         .copied()
-        .filter(|a| *a != "--strict" && *a != "--")
+        .enumerate()
+        .filter(|(i, a)| {
+            *a != "--strict" && *a != "--" && *a != "--caps" && !(*i > 0 && rest[i - 1] == "--caps")
+        })
+        .map(|(_, a)| a)
         .collect();
     if files.is_empty() {
         eprintln!("usage: agent [--strict] <program-file>...");
@@ -143,7 +168,7 @@ fn main() {
             }
         }
     }
-    if strict && drop_caps_for_strict_mode(drop_privileged_caps).is_err() {
+    if caps != CapMode::Priv && drop_caps(caps).is_err() {
         // A failed capability drop must never fall back to a privileged
         // kernel verdict. The host classifies this as infrastructure skip.
         for _ in &payloads {
@@ -175,8 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn strict_capability_drop_failure_is_propagated() {
-        let result = drop_caps_for_strict_mode(|| Err("capset failed".into()));
-        assert_eq!(result, Err("capset failed".into()));
+    fn capability_mode_parsing_rejects_unknown_values() {
+        assert_eq!(CapMode::parse("--strict"), None);
+        assert_eq!(CapMode::parse("cap-bpf"), Some(CapMode::CapBpf));
+        assert_eq!(CapMode::parse("unpriv"), Some(CapMode::Unpriv));
     }
 }

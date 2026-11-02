@@ -2,15 +2,14 @@
   "allowed_findings": [
     "jump__000",
     "jump__001",
-    "jump__002",
     "jump__003",
     "jump__004"
   ],
   "counts": {
-    "agree": 46,
+    "agree": 44,
     "inconclusive": 28,
-    "soundness-candidate": 5,
-    "surface-gap": 396,
+    "rv-soundness-bug": 4,
+    "surface-gap": 399,
     "whitelisted": 3
   },
   "kernel_source": "expected",
