@@ -15,7 +15,7 @@ use crate::concrete::{ConcreteFailure, ConcreteReport, ConcreteVerdict};
 use crate::diff::{SideVerdict, whitelisted};
 use crate::env::BpfVerifierEnv;
 use crate::klog::ReasonCategory;
-use crate::spec::{SpecVerdict, verify_spec};
+use crate::spec::{SpecVerdict, verify_spec_with};
 
 /// The spec side of one program — the fourth verdict axis (issue
 /// #113): the independent safety spec (src/spec) either accepts,
@@ -475,8 +475,16 @@ pub fn classify_env_with_gap(
         surface_gap = mini_reason.and_then(surface_gap_kind);
     }
     // the spec axis (#113): run the independent safety spec on the
-    // decoded program
-    let spec = spec_side(&verify_spec(env.program_insns(), &env.maps));
+    // decoded program. A spec rejection whose message names an
+    // unmodelled surface is a gap, not evidence about the kernel
+    // (#131/#135: e.g. `xdp_md.data` has no pointer model yet).
+    let spec_verdict = verify_spec_with(env.program_insns(), &env.maps, env.prog_type());
+    let spec = spec_side(&spec_verdict);
+    if surface_gap.is_none()
+        && let crate::spec::SpecVerdict::Reject(failure) = &spec_verdict
+    {
+        surface_gap = surface_gap_kind(&failure.message);
+    }
     let finding = classify(&OracleInput {
         name,
         mini,

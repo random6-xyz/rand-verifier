@@ -27,4 +27,4 @@ pub(crate) mod value;
 /// #115-#117): sound wrapping-u64 interval operators.
 pub use value::{rng_add, rng_and, rng_mul, rng_or, rng_sub, rng_xor};
 
-pub use runner::{SpecFailure, SpecVerdict, verify_spec};
+pub use runner::{SpecFailure, SpecVerdict, verify_spec, verify_spec_with};

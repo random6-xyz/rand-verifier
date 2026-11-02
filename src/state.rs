@@ -227,7 +227,8 @@ impl ScalarBounds {
 /// - `Uninit` — the register has never been written
 /// - `Scalar` — a scalar with signed and unsigned ranges ([#40])
 /// - `PtrToStack` — pointer into the stack frame, offset relative to R10
-/// - `PtrToCtx` — pointer to the program context
+/// - `PtrToCtx` — pointer to the program context, with the fixed
+///   offset accumulated by `ctx += k` (the kernel's `reg->off`)
 /// - `PtrToMap` — a fixed map pointer (kernel's CONST_PTR_TO_MAP)
 /// - `PtrToMapValue` — pointer to a map value (non-null)
 /// - `PtrToMapValueOrNull` — nullable map value pointer; must pass a
@@ -254,7 +255,11 @@ pub(crate) enum RegState {
         /// The absolute depth of the owning frame.
         frameno: u8,
     },
-    PtrToCtx,
+    PtrToCtx {
+        /// The fixed byte offset added to the context pointer (kernel
+        /// `reg->off`): `r1 += 4` makes it 4.
+        off: i32,
+    },
     /// A fixed map pointer (kernel's CONST_PTR_TO_MAP) carrying the
     /// map metadata resolved at load time (#89).
     PtrToMap {
@@ -361,7 +366,8 @@ impl std::fmt::Display for RegState {
                     write!(f, "PTR_STACK({}..{})", min_offset, max_offset)
                 }
             }
-            RegState::PtrToCtx => write!(f, "PTR_CTX"),
+            RegState::PtrToCtx { off: 0 } => write!(f, "PTR_CTX"),
+            RegState::PtrToCtx { off } => write!(f, "PTR_CTX({off})"),
             RegState::PtrToMap {
                 key_size,
                 value_size,
@@ -420,7 +426,7 @@ impl std::fmt::Display for RegState {
 /// frame pointer, all other registers start uninitialized.
 pub(crate) fn initial_reg_state() -> [RegState; NUM_REGS] {
     let mut regs = [RegState::Uninit; NUM_REGS];
-    regs[1] = RegState::PtrToCtx;
+    regs[1] = RegState::PtrToCtx { off: 0 };
     regs[10] = RegState::PtrToStack {
         min_offset: 0,
         max_offset: 0,
@@ -547,12 +553,21 @@ pub(crate) struct VerifierState {
     /// #101): every id must be released before the exit.
     pub(crate) refs: [u32; MAX_REFS],
     pub(crate) refs_cnt: u8,
+    /// The program type (#135): selects the context-access model.
+    pub(crate) prog_type: crate::prog_type::ProgType,
 }
 
 impl VerifierState {
     /// Initial state at program entry: R1 = PtrToCtx, R10 = PtrToStack(0),
     /// all other registers uninitialized, stack frame fully uninitialized.
     pub(crate) fn initial() -> Self {
+        Self::initial_with(crate::prog_type::ProgType::SocketFilter)
+    }
+
+    /// [`Self::initial`] for a specific program type (#135): the type
+    /// selects the context-access model the executor uses for
+    /// `ldx [r1 + off]`.
+    pub(crate) fn initial_with(prog_type: crate::prog_type::ProgType) -> Self {
         Self {
             regs: initial_reg_state(),
             stack: StackState::new(),
@@ -561,6 +576,7 @@ impl VerifierState {
             ret_pc: 0,
             refs: [0; MAX_REFS],
             refs_cnt: 0,
+            prog_type,
         }
     }
 
@@ -677,7 +693,7 @@ pub(crate) fn read_scalar(
     match read_reg(pc, state, reg)? {
         RegState::Scalar(bounds) => Ok(bounds),
         RegState::PtrToStack { .. }
-        | RegState::PtrToCtx
+        | RegState::PtrToCtx { .. }
         | RegState::PtrToMap { .. }
         | RegState::PtrToMapValue { .. }
         | RegState::PtrToMapValueOrNull { .. }
@@ -712,7 +728,7 @@ mod tests {
         assert_eq!(regs[0], RegState::Uninit);
 
         // R1 = PtrToCtx
-        assert_eq!(regs[1], RegState::PtrToCtx);
+        assert_eq!(regs[1], RegState::PtrToCtx { off: 0 });
 
         // R2..R9 = Uninit
         for reg in &regs[2..=9] {
@@ -743,7 +759,7 @@ mod tests {
             "SCALAR(s:-1..-1,u:0xffffffffffffffff..0xffffffffffffffff,t:0xffffffffffffffff/0x0)"
         );
         assert_eq!(ptr_stack(-8).to_string(), "PTR_STACK(-8)");
-        assert_eq!(RegState::PtrToCtx.to_string(), "PTR_CTX");
+        assert_eq!(RegState::PtrToCtx { off: 0 }.to_string(), "PTR_CTX");
         assert_eq!(
             RegState::PtrToMap {
                 key_size: 4,
@@ -795,7 +811,7 @@ mod tests {
         assert_eq!(state.regs[0], RegState::Uninit);
 
         // R1 = PtrToCtx
-        assert_eq!(state.regs[1], RegState::PtrToCtx);
+        assert_eq!(state.regs[1], RegState::PtrToCtx { off: 0 });
 
         // R2..R9 = Uninit
         for reg in &state.regs[2..=9] {
@@ -1003,7 +1019,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.stack.bytes[0], StackByte::Spill);
-        assert_eq!(next.stack.spilled[0], Some(RegState::PtrToCtx));
+        assert_eq!(next.stack.spilled[0], Some(RegState::PtrToCtx { off: 0 }));
     }
 
     #[test]
@@ -1033,7 +1049,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(next.regs[5], RegState::PtrToCtx);
+        assert_eq!(next.regs[5], RegState::PtrToCtx { off: 0 });
     }
 
     #[test]
@@ -1277,7 +1293,10 @@ mod tests {
     fn read_reg_initialized_regs() {
         let state = VerifierState::initial();
         // R1 (PtrToCtx) and R10 (PtrToStack) are readable at entry
-        assert_eq!(read_reg(0, &state, 1).unwrap(), RegState::PtrToCtx);
+        assert_eq!(
+            read_reg(0, &state, 1).unwrap(),
+            RegState::PtrToCtx { off: 0 }
+        );
         assert_eq!(read_reg(0, &state, 10).unwrap(), ptr_stack(0));
     }
 

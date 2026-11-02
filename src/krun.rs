@@ -182,6 +182,18 @@ pub fn load_with_kernel_maps_level(
     maps: &HashMap<u32, MapInfo>,
     log_level: u32,
 ) -> (KernelOutcome, String) {
+    load_with_kernel_maps_typed(insns, maps, log_level, BPF_PROG_TYPE_SOCKET_FILTER)
+}
+
+/// [`load_with_kernel_maps_level`] with an explicit `prog_type` ABI
+/// number (#135): the context-access rules the verifier applies depend
+/// on it.
+pub fn load_with_kernel_maps_typed(
+    insns: &[u8],
+    maps: &HashMap<u32, MapInfo>,
+    log_level: u32,
+    prog_type: u32,
+) -> (KernelOutcome, String) {
     // create the referenced maps first
     let mut live: HashMap<u32, i32> = HashMap::new();
     for fd in referenced_map_fds(insns) {
@@ -202,7 +214,7 @@ pub fn load_with_kernel_maps_level(
         }
     }
     let patched = patch_map_fds(insns, &live);
-    let (outcome, log) = load_with_level(&patched, log_level);
+    let (outcome, log) = load_with_level_typed(&patched, log_level, prog_type);
     for real in live.values() {
         unsafe { libc::close(*real) };
     }
@@ -211,9 +223,14 @@ pub fn load_with_kernel_maps_level(
 
 /// Raw `bpf(BPF_PROG_LOAD, ...)` syscall. `log_buf` receives the
 /// verifier log. Returns the program fd, or the errno.
-fn bpf_prog_load(insns: &[u8], log_buf: &mut [u8], log_level: u32) -> Result<i32, i32> {
+fn bpf_prog_load(
+    insns: &[u8],
+    log_buf: &mut [u8],
+    log_level: u32,
+    prog_type: u32,
+) -> Result<i32, i32> {
     let mut attr = BpfProgLoadAttr {
-        prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
+        prog_type,
         insn_cnt: (insns.len() / 8) as u32,
         insns: insns.as_ptr() as u64,
         license: c"GPL".as_ptr() as u64,
@@ -427,11 +444,16 @@ pub fn load_with_kernel_debug(insns: &[u8]) -> (KernelOutcome, String) {
 }
 
 fn load_with_level(insns: &[u8], log_level: u32) -> (KernelOutcome, String) {
+    load_with_level_typed(insns, log_level, BPF_PROG_TYPE_SOCKET_FILTER)
+}
+
+/// [`load_with_level`] with an explicit program type (#135).
+fn load_with_level_typed(insns: &[u8], log_level: u32, prog_type: u32) -> (KernelOutcome, String) {
     if insns.is_empty() || !insns.len().is_multiple_of(8) {
         return (KernelOutcome::InvalidProgram, String::new());
     }
     let mut log_buf = vec![0u8; LOG_BUF_SIZE];
-    let outcome = match bpf_prog_load(insns, &mut log_buf, log_level) {
+    let outcome = match bpf_prog_load(insns, &mut log_buf, log_level, prog_type) {
         Ok(fd) => {
             // the fd is only a proof of acceptance — nothing to attach
             unsafe { libc::close(fd) };

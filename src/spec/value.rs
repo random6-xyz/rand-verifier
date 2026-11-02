@@ -21,8 +21,9 @@ pub(crate) enum SpecValue {
     /// Stack pointer, offset interval relative to R10 (valid access
     /// range `[-512, 0)`).
     PtrToStack { lo: i64, hi: i64 },
-    /// Context pointer.
-    PtrToCtx,
+    /// Context pointer, with the fixed offset accumulated by
+    /// `ctx += k` (kernel `reg->off`, #135).
+    PtrToCtx { off: i64 },
     /// A fixed map pointer (CONST_PTR_TO_MAP).
     PtrToMap {
         key_size: u32,
@@ -79,7 +80,7 @@ impl SpecValue {
         matches!(
             self,
             SpecValue::PtrToStack { .. }
-                | SpecValue::PtrToCtx
+                | SpecValue::PtrToCtx { .. }
                 | SpecValue::PtrToMap { .. }
                 | SpecValue::PtrToMapValue { .. }
                 | SpecValue::PtrToMapValueOrNull { .. }

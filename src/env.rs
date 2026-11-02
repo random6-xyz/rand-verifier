@@ -101,6 +101,9 @@ pub struct BpfVerifierEnv {
     /// instructions (#89; kernel: check_ld_imm64 resolves the fd
     /// against the loader's table).
     pub(crate) maps: HashMap<u32, MapInfo>,
+    /// The program type (#135): selects the context model for every
+    /// axis (mini, spec, concrete) and the kernel load.
+    prog_type: crate::prog_type::ProgType,
 }
 
 impl BpfVerifierEnv {
@@ -255,6 +258,17 @@ impl BpfVerifierEnv {
         &self.prog.insns
     }
 
+    /// The program type of the environment (#135).
+    pub fn prog_type(&self) -> crate::prog_type::ProgType {
+        self.prog_type
+    }
+
+    /// Set the program type (#135). Affects the context model of the
+    /// next `verify()` and the kernel load.
+    pub fn set_prog_type(&mut self, prog_type: crate::prog_type::ProgType) {
+        self.prog_type = prog_type;
+    }
+
     pub fn verify(&mut self) -> Result<Verdict> {
         self.concrete_report = None;
         // a decode failure is a rejection: the program could not even be
@@ -280,7 +294,11 @@ impl BpfVerifierEnv {
             Err(failure) => return self.reject_with_cross_check(failure, &[]),
         };
         // path exploration (mini), collecting the per-pc abstract states
-        match verify_mini_with_states(&self.prog.insns, &loop_heads, &VerifierLimits::default()) {
+        let limits = VerifierLimits {
+            prog_type: self.prog_type,
+            ..VerifierLimits::default()
+        };
+        match verify_mini_with_states(&self.prog.insns, &loop_heads, &limits) {
             Err(failure) => self.reject_with_cross_check(failure, &loop_heads),
             Ok((_, abstract_states)) => {
                 if let Err(failure) = check_combined_stack_depth_with_states(
@@ -294,10 +312,14 @@ impl BpfVerifierEnv {
                 // soundness question (every concrete visited state must
                 // be covered by an abstract state at the same pc)
                 let mut report = ConcreteReport::default();
+                let concrete_limits = ConcreteLimits {
+                    prog_type: self.prog_type,
+                    ..ConcreteLimits::default()
+                };
                 match run_concrete_with_maps(
                     &self.prog.insns,
                     &loop_heads,
-                    &ConcreteLimits::default(),
+                    &concrete_limits,
                     &self.maps,
                 ) {
                     Err(failure) => {
@@ -337,12 +359,11 @@ impl BpfVerifierEnv {
         loop_heads: &[u32],
     ) -> Result<Verdict> {
         let mut report = ConcreteReport::default();
-        match run_concrete_with_maps(
-            &self.prog.insns,
-            loop_heads,
-            &ConcreteLimits::default(),
-            &self.maps,
-        ) {
+        let concrete_limits = ConcreteLimits {
+            prog_type: self.prog_type,
+            ..ConcreteLimits::default()
+        };
+        match run_concrete_with_maps(&self.prog.insns, loop_heads, &concrete_limits, &self.maps) {
             Err(concrete_failure) => {
                 report.reject_note = Some(format!(
                     "concrete cross-check: also fails {}",

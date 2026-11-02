@@ -25,6 +25,9 @@ pub struct VerifierLimits {
     /// deliberately smaller than `max_states` so the loop budget fires
     /// before the state budget for non-converging loops.
     pub(crate) max_loop_iterations: usize,
+    /// The program type of the run (#135): selects the context model
+    /// the executor uses for `ldx [r1 + off]`.
+    pub(crate) prog_type: crate::prog_type::ProgType,
 }
 
 impl Default for VerifierLimits {
@@ -35,6 +38,7 @@ impl Default for VerifierLimits {
             // each loop iteration consumes ~2 analyzed states, so the
             // loop budget must stay below max_states / 2 to fire first
             max_loop_iterations: 256,
+            prog_type: crate::prog_type::ProgType::SocketFilter,
         }
     }
 }
@@ -628,7 +632,7 @@ fn verify_mini_core(
     let prune_points = compute_prune_points(program);
     let mut worklist = vec![WorkItem {
         pc: 0,
-        state: VerifierState::initial(),
+        state: VerifierState::initial_with(limits.prog_type),
         last_cp: None,
         history: Vec::new(),
     }];
@@ -1385,6 +1389,7 @@ mod tests {
             max_states: 1024,
             max_steps: 100_000,
             max_loop_iterations: 10,
+            ..VerifierLimits::default()
         };
         // (the default also works: 512 < max_states 1024 fires first)
         let err = verify_mini_with_limits(&program, &[3], &tight).unwrap_err();
@@ -2059,6 +2064,7 @@ mod tests {
             max_states: 4,
             max_steps: 100_000,
             max_loop_iterations: 4096,
+            ..VerifierLimits::default()
         };
         let err = verify_mini_with_limits(&program, &[3], &tight).unwrap_err();
         assert!(
@@ -2072,6 +2078,7 @@ mod tests {
             max_states: 1024,
             max_steps: 100_000,
             max_loop_iterations: 4096,
+            ..VerifierLimits::default()
         };
         assert!(verify_mini_with_limits(&program, &[3], &roomy).is_ok());
     }
@@ -2083,6 +2090,7 @@ mod tests {
             max_states: 100,
             max_steps: 1,
             max_loop_iterations: 4096,
+            ..VerifierLimits::default()
         };
         let err = verify_mini_with_limits(&program, &[], &limits).unwrap_err();
         assert!(

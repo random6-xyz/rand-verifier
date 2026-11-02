@@ -82,9 +82,21 @@ issue that owns the gap.
 
 ## Current baseline (bpf-next `a30c772627b2`)
 
-**The baseline is empty.** Every corpus case now classifies as `agree`
-(or a surface gap), i.e. mini, the spec, the concrete side and the
-kernel expectation agree.
+**Baseline: 9 documented deviations, 315 surface gaps (#135).**
+The context model (`ProgType` + `src/ctx.rs`) moved 84 cases out of the
+`unmodeled-prog-type` bucket (238 → 80): sched_cls/sched_act/cgroup_skb
+and socket_filter `__sk_buff` fields, `xdp_md` scalars and the
+tracepoint window are modelled; `data`/`data_end`/`data_meta`/`sk` stay
+gaps (no packet-pointer register type yet).
+
+The 9 allowed findings are known model gaps this exposed, not new
+kernel behaviour:
+
+| cases | disagreement | follow-up |
+|---|---|---|
+| `calls__057/058/061/062/068/070` | spec rejects (stack read / R0 at exit) on programs the kernel accepts after BPF-to-BPF calls | spec call-frame model |
+| `precise__000/001` | `ptr -= ptr` on map values: kernel accepts, mini/spec reject | pointer-difference arithmetic |
+| `ctx_skb__004` | the same insn sees two pointer types across loop iterations; the kernel rejects ("same insn cannot be used with different pointers"), mini accepts | state-pruning pointer identity |
 
 Recent closures:
 

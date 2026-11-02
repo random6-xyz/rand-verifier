@@ -144,7 +144,7 @@ pub(crate) fn regs_exact(old: &RegState, new: &RegState) -> bool {
                 frameno: b_frame,
             },
         ) => a_min == b_min && a_max == b_max && a_align == b_align && a_frame == b_frame,
-        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (RegState::PtrToCtx { off: a }, RegState::PtrToCtx { off: b }) => a == b,
         (
             RegState::PtrToMap {
                 key_size: a_key,
@@ -242,7 +242,7 @@ pub(crate) fn regsafe(
         // offset (kernel PTR_TO_STACK: `regs_exact` — fp-8 in one
         // frame is not fp-8 in another)
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. }) => old == new,
-        (RegState::PtrToCtx, RegState::PtrToCtx) => true,
+        (RegState::PtrToCtx { off: a }, RegState::PtrToCtx { off: b }) => a == b,
         // a fixed map pointer is an exact constant (kernel
         // CONST_PTR_TO_MAP: default → regs_exact)
         (RegState::PtrToMap { .. }, RegState::PtrToMap { .. }) => old == new,
@@ -766,7 +766,7 @@ mod tests {
         // have used this")
         let old = VerifierState::initial();
         let mut new = VerifierState::initial();
-        new.regs[5] = RegState::PtrToCtx;
+        new.regs[5] = RegState::PtrToCtx { off: 0 };
         new.regs[6] = RegState::Scalar(ScalarBounds::constant(7));
         assert!(regsafe(
             &old.regs[5],
@@ -794,7 +794,7 @@ mod tests {
     fn regsafe_types_must_match_exactly() {
         // different types are never comparable
         let mut ctx = VerifierState::initial();
-        ctx.regs[1] = RegState::PtrToCtx;
+        ctx.regs[1] = RegState::PtrToCtx { off: 0 };
         let mut scalar = VerifierState::initial();
         scalar.regs[1] = RegState::Scalar(ScalarBounds::constant(1));
         assert!(!regsafe(
@@ -1005,7 +1005,7 @@ mod tests {
             &mut IdMap::default()
         ));
         // spilled pointers must match types
-        spill_slot(&mut old, 1, RegState::PtrToCtx);
+        spill_slot(&mut old, 1, RegState::PtrToCtx { off: 0 });
         spill_slot(&mut new, 1, RegState::Scalar(ScalarBounds::constant(1)));
         assert!(!stacksafe(
             &old.stack,
@@ -1056,7 +1056,7 @@ mod tests {
             &mut IdMap::default()
         ));
         let mut ptr = VerifierState::initial();
-        spill_slot(&mut ptr, 0, RegState::PtrToCtx);
+        spill_slot(&mut ptr, 0, RegState::PtrToCtx { off: 0 });
         assert!(!stacksafe(
             &old.stack,
             &ptr.stack,
