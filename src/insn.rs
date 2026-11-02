@@ -66,6 +66,8 @@ pub(crate) mod opcode {
     pub const MOD32_IMM: u8 = 0x94;
     pub const MOD32_REG: u8 = 0x9c;
     pub const NEG32: u8 = 0x84;
+    pub const MOV32_IMM: u8 = 0xb4; // BPF_ALU | BPF_MOV | BPF_K
+    pub const MOV32_REG: u8 = 0xbc; // BPF_ALU | BPF_MOV | BPF_X
 
     // loads/stores — 8-byte (DW) accesses with the frame pointer as
     // the base register (#100 adds the partial widths); the decode
@@ -98,8 +100,42 @@ pub(crate) mod opcode {
     pub const JSLT_IMM: u8 = 0xc5; // BPF_JMP | BPF_JSLT | BPF_K (signed)
     pub const JSLE: u8 = 0xdd; // BPF_JMP | BPF_JSLE | BPF_X (signed)
     pub const JSLE_IMM: u8 = 0xd5; // BPF_JMP | BPF_JSLE | BPF_K (signed)
+    pub const JSET: u8 = 0x4d; // BPF_JMP | BPF_JSET | BPF_X
+    pub const JSET_IMM: u8 = 0x45; // BPF_JMP | BPF_JSET | BPF_K
     pub const CALL: u8 = 0x85; // BPF_JMP | BPF_CALL — imm is the helper id
     pub const EXIT: u8 = 0x95; // BPF_JMP | BPF_EXIT
+
+    // jumps (class 0x06, BPF_JMP32): compare the low 32 bits (#136)
+    pub const JMP32_JEQ_IMM: u8 = 0x16;
+    pub const JMP32_JEQ: u8 = 0x1e;
+    pub const JMP32_JGT_IMM: u8 = 0x26;
+    pub const JMP32_JGT: u8 = 0x2e;
+    pub const JMP32_JGE_IMM: u8 = 0x36;
+    pub const JMP32_JGE: u8 = 0x3e;
+    pub const JMP32_JNE_IMM: u8 = 0x56;
+    pub const JMP32_JNE: u8 = 0x5e;
+    pub const JMP32_JSGT_IMM: u8 = 0x66;
+    pub const JMP32_JSGT: u8 = 0x6e;
+    pub const JMP32_JSGE_IMM: u8 = 0x76;
+    pub const JMP32_JSGE: u8 = 0x7e;
+    pub const JMP32_JLT_IMM: u8 = 0xa6;
+    pub const JMP32_JLT: u8 = 0xae;
+    pub const JMP32_JLE_IMM: u8 = 0xb6;
+    pub const JMP32_JLE: u8 = 0xbe;
+    pub const JMP32_JSLT_IMM: u8 = 0xc6;
+    pub const JMP32_JSLT: u8 = 0xce;
+    pub const JMP32_JSLE_IMM: u8 = 0xd6;
+    pub const JMP32_JSLE: u8 = 0xde;
+
+    // legacy packet access (#136): BPF_LD|BPF_ABS/BPF_IND
+    pub const LD_ABS: u8 = 0x20; // | BPF_W
+    pub const LD_ABS_H: u8 = 0x28;
+    pub const LD_ABS_B: u8 = 0x30;
+    pub const LD_ABS_DW: u8 = 0x38;
+    pub const LD_IND: u8 = 0x40; // | BPF_W
+    pub const LD_IND_H: u8 = 0x48;
+    pub const LD_IND_B: u8 = 0x50;
+    pub const LD_IND_DW: u8 = 0x58;
 }
 
 /// The memory access width of a load/store (kernel BPF_SIZE).
@@ -154,6 +190,21 @@ impl MulHigh {
     }
 }
 
+/// The comparison of a `BPF_JMP32` instruction (#136).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jmp32Op {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Sgt,
+    Sge,
+    Slt,
+    Sle,
+}
+
 /// The supported eBPF subset, decoded from the kernel encoding (see
 /// [`opcode`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +215,17 @@ pub enum BpfInsn {
         imm: i32,
     },
     MovReg {
+        dst: u8,
+        src: u8,
+    },
+    /// `BPF_ALU | BPF_MOV | BPF_K` (#136): `wDST = IMM`, zero-extended
+    /// into the 64-bit register like every ALU32 op.
+    Mov32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    /// `BPF_ALU | BPF_MOV | BPF_X` (#136): `wDST = wSRC`, zero-extended.
+    Mov32Reg {
         dst: u8,
         src: u8,
     },
@@ -525,6 +587,40 @@ pub enum BpfInsn {
     Jmp {
         offset: i16,
     },
+    /// `BPF_JMP | BPF_JSET` (#136): `if (DST & SRC) != 0 goto off`.
+    Jset {
+        dst: u8,
+        src: u8,
+        offset: i16,
+    },
+    JsetImm {
+        dst: u8,
+        imm: i32,
+        offset: i16,
+    },
+    /// `BPF_JMP32` (#136): the comparison uses the low 32 bits of both
+    /// operands; the model keeps both successors (no refinement), which
+    /// is sound and matches the kernel's zero-extending compare.
+    Jmp32 {
+        dst: u8,
+        /// The register operand of the BPF_X form.
+        src: Option<u8>,
+        /// The immediate operand of the BPF_K form.
+        imm: Option<i32>,
+        offset: i16,
+        op: Jmp32Op,
+    },
+    /// `BPF_LD | BPF_ABS` (#136): `r0 = *(size *)(packet + imm)`.
+    LdAbs {
+        size: MemSize,
+        imm: i32,
+    },
+    /// `BPF_LD | BPF_IND` (#136): `r0 = *(size *)(packet + rSRC + imm)`.
+    LdInd {
+        src: u8,
+        size: MemSize,
+        imm: i32,
+    },
     Call {
         imm: i32,
     },
@@ -573,6 +669,9 @@ impl BpfInsn {
                 | BpfInsn::JsgeImm { .. }
                 | BpfInsn::JsltImm { .. }
                 | BpfInsn::JsleImm { .. }
+                | BpfInsn::Jset { .. }
+                | BpfInsn::JsetImm { .. }
+                | BpfInsn::Jmp32 { .. }
         )
     }
 
@@ -636,6 +735,8 @@ fn is_supported_alu(op: u8) -> bool {
         op,
         opcode::MOV_IMM
             | opcode::MOV_REG
+            | opcode::MOV32_IMM
+            | opcode::MOV32_REG
             | opcode::ADD_IMM
             | opcode::ADD_REG
             | opcode::SUB_IMM
@@ -786,6 +887,8 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
             Ok(match op {
                 opcode::MOV_IMM => BpfInsn::MovImm { dst, imm },
                 opcode::MOV_REG => BpfInsn::MovReg { dst, src },
+                opcode::MOV32_IMM => BpfInsn::Mov32Imm { dst, imm },
+                opcode::MOV32_REG => BpfInsn::Mov32Reg { dst, src },
                 opcode::ADD_IMM => BpfInsn::AddImm { dst, imm },
                 opcode::ADD_REG => BpfInsn::AddReg { dst, src },
                 opcode::SUB_IMM => BpfInsn::SubImm { dst, imm },
@@ -886,6 +989,100 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 opcode::JSLE_IMM => BpfInsn::JsleImm { dst, imm, offset },
                 _ => unreachable!("compare opcode matched above"),
             })
+        }
+        // BPF_JMP|BPF_JSET (#136): register and immediate forms
+        opcode::JSET | opcode::JSET_IMM => {
+            let is_x = op & 0x08 != 0;
+            if (is_x && imm != 0) || (!is_x && src != 0) {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_JMP uses reserved fields",
+                });
+            }
+            Ok(if is_x {
+                BpfInsn::Jset { dst, src, offset }
+            } else {
+                BpfInsn::JsetImm { dst, imm, offset }
+            })
+        }
+        // BPF_JMP32 (#136): the 32-bit compare forms. JSET32 stays
+        // unsupported (no corpus case, no rules to mirror yet).
+        opcode::JMP32_JEQ
+        | opcode::JMP32_JNE
+        | opcode::JMP32_JGT
+        | opcode::JMP32_JGE
+        | opcode::JMP32_JLT
+        | opcode::JMP32_JLE
+        | opcode::JMP32_JSGT
+        | opcode::JMP32_JSGE
+        | opcode::JMP32_JSLT
+        | opcode::JMP32_JSLE
+        | opcode::JMP32_JEQ_IMM
+        | opcode::JMP32_JNE_IMM
+        | opcode::JMP32_JGT_IMM
+        | opcode::JMP32_JGE_IMM
+        | opcode::JMP32_JLT_IMM
+        | opcode::JMP32_JLE_IMM
+        | opcode::JMP32_JSGT_IMM
+        | opcode::JMP32_JSGE_IMM
+        | opcode::JMP32_JSLT_IMM
+        | opcode::JMP32_JSLE_IMM => {
+            let is_x = op & 0x08 != 0;
+            if (is_x && imm != 0) || (!is_x && src != 0) {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_JMP32 uses reserved fields",
+                });
+            }
+            let jop = match op & 0xf0 {
+                0x10 => Jmp32Op::Eq,
+                0x20 => Jmp32Op::Gt,
+                0x30 => Jmp32Op::Ge,
+                0x50 => Jmp32Op::Ne,
+                0x60 => Jmp32Op::Sgt,
+                0x70 => Jmp32Op::Sge,
+                0xa0 => Jmp32Op::Lt,
+                0xb0 => Jmp32Op::Le,
+                0xc0 => Jmp32Op::Slt,
+                0xd0 => Jmp32Op::Sle,
+                _ => unreachable!("the JMP32 opcode list covers these"),
+            };
+            Ok(BpfInsn::Jmp32 {
+                dst,
+                src: is_x.then_some(src),
+                imm: (!is_x).then_some(imm),
+                offset,
+                op: jop,
+            })
+        }
+        // BPF_LD|BPF_ABS / BPF_IND (#136): the legacy packet loads.
+        // dst_reg must be R0; ABS reserves src_reg, IND uses it as the
+        // index register.
+        op @ (opcode::LD_ABS
+        | opcode::LD_ABS_H
+        | opcode::LD_ABS_B
+        | opcode::LD_IND
+        | opcode::LD_IND_H
+        | opcode::LD_IND_B) => {
+            if dst != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_LD ABS/IND uses reserved fields",
+                });
+            }
+            let size = match (op >> 3) & 0x3 {
+                0x0 => MemSize::W,
+                0x1 => MemSize::H,
+                0x2 => MemSize::B,
+                _ => MemSize::DW,
+            };
+            if op < 0x40 {
+                if src != 0 {
+                    return Err(DecodeError::ReservedFields {
+                        message: "BPF_LD ABS uses reserved fields",
+                    });
+                }
+                Ok(BpfInsn::LdAbs { size, imm })
+            } else {
+                Ok(BpfInsn::LdInd { src, size, imm })
+            }
         }
         // BPF_JA: src_reg, dst_reg and imm are reserved (check_jmp_fields)
         opcode::JMP => {
@@ -1102,6 +1299,32 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         } => format!("r{} = map_value_fd({})+{}", dst, fd, offset),
         BpfInsn::LdImm64Second { imm_hi } => format!("(second slot of ldimm64, imm_hi={})", imm_hi),
         BpfInsn::MovReg { dst, src } => format!("r{} = r{}", dst, src),
+        BpfInsn::Mov32Imm { dst, imm } => format!("w{} = {}", dst, imm),
+        BpfInsn::Mov32Reg { dst, src } => format!("w{} = r{}", dst, src),
+        BpfInsn::Jset { dst, src, offset } => {
+            format!("if r{} & r{} goto {:+}", dst, src, offset)
+        }
+        BpfInsn::JsetImm { dst, imm, offset } => {
+            format!("if r{} & {} goto {:+}", dst, imm, offset)
+        }
+        BpfInsn::Jmp32 {
+            dst,
+            src,
+            imm,
+            offset,
+            op,
+        } => {
+            let cmp = format!("{op:?}").to_lowercase();
+            match (src, imm) {
+                (Some(s), _) => format!("if w{dst} {cmp} w{s} goto {offset:+}"),
+                (_, Some(i)) => format!("if w{dst} {cmp} {i} goto {offset:+}"),
+                _ => unreachable!("a JMP32 carries one operand"),
+            }
+        }
+        BpfInsn::LdAbs { size, imm } => format!("r0 = *(packet+{imm}) ({size:?})"),
+        BpfInsn::LdInd { src, size, imm } => {
+            format!("r0 = *(packet+r{src}+{imm}) ({size:?})")
+        }
         BpfInsn::AddImm { dst, imm } => format!("r{} += {}", dst, imm),
         BpfInsn::AddReg { dst, src } => format!("r{} += r{}", dst, src),
         BpfInsn::SubImm { dst, imm } => format!("r{} -= {}", dst, imm),
@@ -1840,15 +2063,11 @@ mod tests {
         let unsupported = [
             // BPF_ST|BPF_XADD (store-immediate atomic, unmapped)
             (0xc2, "BPF_ST"),
-            // BPF_JMP32|BPF_JA
+            // BPF_JMP32|BPF_JA (no compare, no semantics)
             (0x06, "BPF_JMP32"),
             // BPF_ALU64|BPF_END
             (0xd7, "BPF_END"),
-            // BPF_ALU|BPF_MOV|BPF_K (32-bit MOV)
-            (0xb4, "MOV"),
-            // BPF_JMP|BPF_JSET|BPF_K
-            (0x45, "BPF_JSET"),
-            // BPF_LD|BPF_ABS (the legacy absolute load)
+            // BPF_LD|BPF_IMM (the 32-bit immediate load)
             (0x60, "BPF_LD"),
             // BPF_STX|BPF_ATOMIC|BPF_DW
             (0xdb, "stores"),

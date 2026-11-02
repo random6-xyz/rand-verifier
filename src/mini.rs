@@ -162,10 +162,14 @@ fn backtrack_insn(
 ) -> BacktrackOutcome {
     let dst_bit = |r: u8| 1u16 << r;
     match insn {
+        // packet loads write r0, so a requirement on r0 dies (#136)
+        BpfInsn::LdAbs { .. } | BpfInsn::LdInd { .. } => {
+            bt.regs &= !dst_bit(0);
+        }
         // `dreg = K` — a constant resolves the requirement
-        BpfInsn::MovImm { dst, .. } => bt.regs &= !dst_bit(*dst),
+        BpfInsn::MovImm { dst, .. } | BpfInsn::Mov32Imm { dst, .. } => bt.regs &= !dst_bit(*dst),
         // `dreg = sreg` — the requirement moves to the source
-        BpfInsn::MovReg { dst, src } => {
+        BpfInsn::MovReg { dst, src } | BpfInsn::Mov32Reg { dst, src } => {
             if bt.regs & dst_bit(*dst) != 0 {
                 bt.regs &= !dst_bit(*dst);
                 if *src != 10 {
@@ -318,7 +322,10 @@ fn backtrack_insn(
         | BpfInsn::JsgtImm { dst, .. }
         | BpfInsn::JsgeImm { dst, .. }
         | BpfInsn::JsltImm { dst, .. }
-        | BpfInsn::JsleImm { dst, .. } => {
+        | BpfInsn::JsleImm { dst, .. }
+        | BpfInsn::Jset { dst, .. }
+        | BpfInsn::JsetImm { dst, .. }
+        | BpfInsn::Jmp32 { dst, .. } => {
             let _ = dst;
         }
     }
@@ -521,6 +528,8 @@ fn insn_dst(insn: &BpfInsn) -> u8 {
     match insn {
         BpfInsn::MovImm { dst, .. }
         | BpfInsn::MovReg { dst, .. }
+        | BpfInsn::Mov32Imm { dst, .. }
+        | BpfInsn::Mov32Reg { dst, .. }
         | BpfInsn::AddImm { dst, .. }
         | BpfInsn::AddReg { dst, .. }
         | BpfInsn::SubImm { dst, .. }
@@ -576,7 +585,10 @@ fn insn_dst(insn: &BpfInsn) -> u8 {
         | BpfInsn::JsgtImm { dst, .. }
         | BpfInsn::JsgeImm { dst, .. }
         | BpfInsn::JsltImm { dst, .. }
-        | BpfInsn::JsleImm { dst, .. } => *dst,
+        | BpfInsn::JsleImm { dst, .. }
+        | BpfInsn::Jset { dst, .. }
+        | BpfInsn::JsetImm { dst, .. }
+        | BpfInsn::Jmp32 { dst, .. } => *dst,
         _ => 0,
     }
 }

@@ -97,10 +97,16 @@ kernel behaviour:
 | `calls__057/058/061/062/068/070` | spec rejects (stack read / R0 at exit) on programs the kernel accepts after BPF-to-BPF calls | spec call-frame model |
 | `precise__000/001` | `ptr -= ptr` on map values: kernel accepts, mini/spec reject | pointer-difference arithmetic |
 | `ctx_skb__004` | the same insn sees two pointer types across loop iterations; the kernel rejects ("same insn cannot be used with different pointers"), mini accepts | state-pruning pointer identity |
+| `jset__006/007` | the spec has no tnum/bit refinement for JSET, so it explores a branch the kernel prunes | spec bit-level refinement |
 
 Recent closures:
 
 - `dead_code__005` — `check_cfg` accepts a trailing `JMP` like the kernel.
+- MOV32, JMP32, JSET and the legacy packet loads (`LD_ABS`/`LD_IND`,
+  #136) are decoded and modelled: constant-only branches are decided
+  statically, `jset imm` clears the tested bits on the fall-through, and
+  the packet loads mirror `check_ld_abs` (R6 must be the context, R1-R5
+  are caller-saved).
 - `jump__000..004` — privileged pointer comparisons (`allow_ptr_leaks`):
   mini keeps both branches, the concrete side compares model addresses,
   the spec pushes both successors, and a spill of an uninitialized
