@@ -156,6 +156,13 @@ impl NoveltyMap {
         1.0 / (1.0 + self.uses.get(signature).copied().unwrap_or(0) as f64)
     }
 
+    /// Count a seed pick, so [`Self::energy`] decays the seeds a
+    /// campaign keeps choosing (the promotion counter alone saturates
+    /// after the first promotion and makes every weight equal).
+    pub fn note_pick(&mut self, signature: &str) {
+        *self.uses.entry(signature.to_string()).or_insert(0) += 1;
+    }
+
     pub fn uses(&self, signature: &str) -> u64 {
         self.uses.get(signature).copied().unwrap_or(0)
     }
