@@ -61,8 +61,18 @@ fn format_kernel_verdict(outcome: &KernelOutcome) -> String {
     }
 }
 
-fn run_program_bytes(data: &[u8], prog_type: u32) {
-    let maps = default_maps(data);
+fn run_program_bytes(data: &[u8], prog_type: u32, maps_path: Option<&str>) {
+    // a `<job>.maps` sidecar carries the loader's map table (#134); the
+    // synthetic registry is the fallback for programs generated without
+    // metadata
+    let sidecar_maps = maps_path
+        .map(rand_verifier::env::parse_maps_sidecar)
+        .unwrap_or_default();
+    let maps = if sidecar_maps.is_empty() {
+        default_maps(data)
+    } else {
+        sidecar_maps
+    };
     // Full verifier log (level 2) is the default since #142: level 1
     // drops the first error line on errno=28 programs (K-2), which made
     // a plain bounded loop look like "no-error-line errno=28".
@@ -182,7 +192,7 @@ fn main() {
     // privileges: the 9p share can surface host-owned files that the
     // (dropped-privilege) agent cannot open afterwards. Dropping caps
     // is only safe once the bytes are in memory.
-    let mut payloads: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut payloads: Vec<(Vec<u8>, u32, Option<String>)> = Vec::new();
     for f in &files {
         // a `<file>.progtype` sidecar carries the program type of this
         // job (#135); it wins over the global setting
@@ -191,8 +201,12 @@ fn main() {
             .and_then(|v| rand_verifier::prog_type::ProgType::parse(v.trim()))
             .map(|t| t.id())
             .unwrap_or(prog_type);
+        let maps_candidate = format!("{f}.maps");
+        let maps_path = std::path::Path::new(&maps_candidate)
+            .is_file()
+            .then_some(maps_candidate);
         match fs::read(f) {
-            Ok(d) => payloads.push((d, job_type)),
+            Ok(d) => payloads.push((d, job_type, maps_path)),
             Err(e) => {
                 eprintln!(
                     "cannot-read detail: path={f} errno={}",
@@ -211,8 +225,8 @@ fn main() {
         }
         return;
     }
-    for (data, job_type) in payloads {
-        run_program_bytes(&data, job_type);
+    for (data, job_type, maps_path) in payloads {
+        run_program_bytes(&data, job_type, maps_path.as_deref());
     }
 }
 
