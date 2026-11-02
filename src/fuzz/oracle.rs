@@ -41,6 +41,70 @@ pub fn spec_side(verdict: &SpecVerdict) -> SpecSide {
     }
 }
 
+/// Why the models could not judge a program (#131): the instruction or
+/// surrounding surface is simply not modelled yet. A surface gap is not a
+/// finding — counting it as one is what made the 2026-10 campaign look like
+/// 391 findings when 179 of the disagreements were "the model cannot parse
+/// this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SurfaceGapKind {
+    /// A kernel instruction this verifier does not decode yet
+    /// ("unsupported instruction 0xdb: ...").
+    DecodeUnsupported,
+    /// A pseudo map fd that was not registered at load time
+    /// ("unknown map fd N").
+    UnknownMapFd,
+    /// A helper the mini/concrete side does not implement.
+    UnknownHelper,
+    /// A kfunc without BTF support.
+    UnknownKfunc,
+    /// Context access for a program type without a modelled ctx layout.
+    UnmodeledCtx,
+    /// A program type the loader/models do not represent.
+    UnmodeledProgType,
+    /// Any other "model cannot judge this" reason.
+    Other,
+}
+
+impl SurfaceGapKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SurfaceGapKind::DecodeUnsupported => "decode-unsupported",
+            SurfaceGapKind::UnknownMapFd => "unknown-map-fd",
+            SurfaceGapKind::UnknownHelper => "unknown-helper",
+            SurfaceGapKind::UnknownKfunc => "unknown-kfunc",
+            SurfaceGapKind::UnmodeledCtx => "unmodeled-ctx",
+            SurfaceGapKind::UnmodeledProgType => "unmodeled-prog-type",
+            SurfaceGapKind::Other => "other",
+        }
+    }
+}
+
+/// Classify a "the model does not support this" message. The messages are
+/// the ones decode/exec/spec already produce, so the oracle does not need
+/// a second taxonomy.
+pub fn surface_gap_kind(message: &str) -> Option<SurfaceGapKind> {
+    if message.contains("unsupported instruction") {
+        return Some(SurfaceGapKind::DecodeUnsupported);
+    }
+    if message.contains("unknown map fd") {
+        return Some(SurfaceGapKind::UnknownMapFd);
+    }
+    if message.contains("unknown kfunc") || message.contains("not a vmlinux function") {
+        return Some(SurfaceGapKind::UnknownKfunc);
+    }
+    if message.contains("unknown helper") {
+        return Some(SurfaceGapKind::UnknownHelper);
+    }
+    if message.contains("invalid bpf_context access") || message.contains("ctx load") {
+        return Some(SurfaceGapKind::UnmodeledCtx);
+    }
+    if message.contains("not supported") {
+        return Some(SurfaceGapKind::Other);
+    }
+    None
+}
+
 /// The concrete side of one program — the oracle's witness axis (a
 /// concrete failure is a real unsafe witness; a clean run is bounded
 /// evidence, not a proof).
@@ -102,6 +166,10 @@ pub enum Finding {
     /// A known design difference (diff whitelist, same-reason reject,
     /// strict-mode `!root` rules) — discard with a note.
     Whitelisted,
+    /// The models do not cover this surface (unsupported instruction,
+    /// unknown map fd/helper/kfunc, unmodelled ctx or prog type) — a
+    /// non-finding (#131).
+    SurfaceGap,
     /// Concrete inconclusive (loop budget) — non-finding.
     Inconclusive,
     /// The kernel side could not produce a verdict (privilege).
@@ -120,6 +188,7 @@ impl Finding {
             Finding::RvPanic => "rv-panic",
             Finding::Agree => "agree",
             Finding::Whitelisted => "whitelisted",
+            Finding::SurfaceGap => "surface-gap",
             Finding::Inconclusive => "inconclusive",
             Finding::Skipped => "skipped",
         }
@@ -171,6 +240,10 @@ pub struct OracleInput<'a> {
     /// (v0.6 `--strict`), so `!root` rejections (R10 pointer comparison
     /// prohibited, insn limits) are design behaviour, not findings.
     pub strict: bool,
+    /// The surface the models cannot judge, when there is one (#131).
+    /// Takes precedence over every finding: "cannot parse" is never
+    /// "the kernel is wrong".
+    pub surface_gap: Option<SurfaceGapKind>,
 }
 
 /// Classify one program into exactly one [`Finding`]. The rules are
@@ -186,7 +259,14 @@ pub fn classify(input: &OracleInput) -> Finding {
         kernel_reason,
         strict,
         spec,
+        surface_gap,
     } = input;
+    // "the model cannot parse this" outranks every verdict: it is not
+    // evidence about the kernel, so it must never reach a finding bucket
+    // (#131).
+    if surface_gap.is_some() {
+        return Finding::SurfaceGap;
+    }
     // the spec axis (issue #113) augments the three-axis matrix:
     // spec REJECT + kernel ACCEPT = kernel-unsound candidate, spec
     // ACCEPT + kernel REJECT = kernel-overstrict candidate. The spec
@@ -348,6 +428,20 @@ pub fn classify_env(
     kernel_reason: Option<&str>,
     strict: bool,
 ) -> Finding {
+    classify_env_with_gap(env, name, mini, mini_reason, kernel, kernel_reason, strict).0
+}
+
+/// [`classify_env`] plus the surface-gap kind it detected (for the
+/// campaign summary breakdown, #131).
+pub fn classify_env_with_gap(
+    env: &BpfVerifierEnv,
+    name: &str,
+    mini: &SideVerdict,
+    mini_reason: Option<&str>,
+    kernel: &SideVerdict,
+    kernel_reason: Option<&str>,
+    strict: bool,
+) -> (Finding, Option<SurfaceGapKind>) {
     let concrete = env
         .concrete_report
         .as_ref()
@@ -355,30 +449,35 @@ pub fn classify_env(
         .unwrap_or(ConcreteSide::Inconclusive);
     // Model-unsupported failures: the concrete interpreter could not
     // even run the program (unknown helper id, unsupported memory
-    // access, prototype mismatch). That is a rand-verifier support
-    // gap, not evidence that a kernel-accepted program is unsafe —
-    // exclude these from soundness candidates.
-    if let Some(report) = env.concrete_report.as_ref() {
-        let unsupported = report.unexpected_failure.as_ref().is_some_and(|f| {
-            matches!(
-                f,
-                ConcreteFailure::UnknownHelper { .. }
-                    | ConcreteFailure::UnsupportedHelperReturn { .. }
-                    | ConcreteFailure::NonStackBase { .. }
-                    | ConcreteFailure::HelperArgMismatch { .. }
-            )
-        }) || report
-            .reject_note
+    // access, prototype mismatch). That is a rand-verifier support gap,
+    // not evidence that a kernel-accepted program is unsafe — classify
+    // it as a surface gap, never as a finding (#131).
+    let mut surface_gap = env
+        .concrete_report
+        .as_ref()
+        .and_then(|report| report.unexpected_failure.as_ref())
+        .and_then(|failure| match failure {
+            ConcreteFailure::UnknownHelper { .. } => Some(SurfaceGapKind::UnknownHelper),
+            ConcreteFailure::UnsupportedHelperReturn { .. }
+            | ConcreteFailure::NonStackBase { .. }
+            | ConcreteFailure::HelperArgMismatch { .. } => Some(SurfaceGapKind::Other),
+            _ => None,
+        });
+    if surface_gap.is_none()
+        && let Some(note) = env
+            .concrete_report
             .as_ref()
-            .is_some_and(|n| n.contains("unknown helper") || n.contains("not supported"));
-        if unsupported && matches!(concrete, ConcreteSide::Unsafe) {
-            return Finding::Whitelisted;
-        }
+            .and_then(|report| report.reject_note.as_deref())
+    {
+        surface_gap = surface_gap_kind(note);
+    }
+    if surface_gap.is_none() {
+        surface_gap = mini_reason.and_then(surface_gap_kind);
     }
     // the spec axis (#113): run the independent safety spec on the
     // decoded program
     let spec = spec_side(&verify_spec(env.program_insns(), &env.maps));
-    classify(&OracleInput {
+    let finding = classify(&OracleInput {
         name,
         mini,
         mini_reason,
@@ -387,7 +486,9 @@ pub fn classify_env(
         kernel_reason,
         strict,
         spec,
-    })
+        surface_gap,
+    });
+    (finding, surface_gap)
 }
 
 /// The first coverage-violation pc of the last verification, if any —
@@ -445,6 +546,7 @@ mod tests {
             kernel_reason: None,
             strict,
             spec,
+            surface_gap: None,
         })
     }
 
@@ -466,6 +568,7 @@ mod tests {
             kernel_reason,
             strict,
             spec: SpecSide::Inconclusive,
+            surface_gap: None,
         })
     }
 
@@ -474,6 +577,52 @@ mod tests {
     /// variable stack access prohibited for !root" is StackBounds
     /// category, not PointerArith) — whitelisted by message. Genuine
     /// StackBounds rejections stay precision candidates.
+    /// #131: a surface gap outranks every finding bucket — "cannot
+    /// parse" is never "the kernel is wrong" — and is not a finding.
+    #[test]
+    fn surface_gap_outranks_findings() {
+        let mut input = OracleInput {
+            name: "p",
+            mini: &SideVerdict::Accept,
+            mini_reason: None,
+            concrete: ConcreteSide::Safe,
+            kernel: &SideVerdict::Accept,
+            kernel_reason: None,
+            strict: false,
+            spec: SpecSide::Reject,
+            surface_gap: Some(SurfaceGapKind::UnknownMapFd),
+        };
+        // without the gap this pair is a kernel-unsound candidate
+        input.surface_gap = None;
+        assert_eq!(classify(&input), Finding::KernelUnsoundCandidate);
+        input.surface_gap = Some(SurfaceGapKind::UnknownMapFd);
+        assert_eq!(classify(&input), Finding::SurfaceGap);
+        assert!(!Finding::SurfaceGap.is_finding());
+    }
+
+    /// The message matcher mirrors the strings decode/exec already
+    /// produce, so the oracle does not need a second taxonomy.
+    #[test]
+    fn surface_gap_messages() {
+        assert_eq!(
+            surface_gap_kind("unsupported instruction 0xdb: ..."),
+            Some(SurfaceGapKind::DecodeUnsupported)
+        );
+        assert_eq!(
+            surface_gap_kind("unknown map fd 0"),
+            Some(SurfaceGapKind::UnknownMapFd)
+        );
+        assert_eq!(
+            surface_gap_kind("unknown kfunc (no BTF support)"),
+            Some(SurfaceGapKind::UnknownKfunc)
+        );
+        assert_eq!(
+            surface_gap_kind("at insn 3: unknown helper 17"),
+            Some(SurfaceGapKind::UnknownHelper)
+        );
+        assert_eq!(surface_gap_kind("invalid read from stack"), None);
+    }
+
     #[test]
     fn strict_whitelist_for_root_message() {
         let s = ReasonCategory::StackBounds;
@@ -911,6 +1060,7 @@ mod tests {
                     kernel_reason: None,
                     strict: false,
                     spec: SpecSide::Inconclusive,
+                    surface_gap: None,
                 });
                 match dir {
                     "tests/programs/accept" => assert_eq!(finding, Finding::Agree, "{name}"),

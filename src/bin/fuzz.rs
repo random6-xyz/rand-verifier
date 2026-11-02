@@ -32,7 +32,9 @@ use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::generator::{GenConfig, Generator};
 use rand_verifier::fuzz::insn_lib::{self, opcode_family};
 use rand_verifier::fuzz::mutator::Mutator;
-use rand_verifier::fuzz::oracle::{Finding, classify_env, first_violation_pc};
+use rand_verifier::fuzz::oracle::{
+    Finding, SurfaceGapKind, classify_env_with_gap, first_violation_pc, surface_gap_kind,
+};
 use rand_verifier::fuzz::prng::mix_seed;
 use rand_verifier::fuzz::qemu::QemuBatch;
 use rand_verifier::fuzz::triage::{Candidate, Divergence, Group, group};
@@ -155,6 +157,7 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&findings_dir)?;
 
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut surface_gaps: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut coverage: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut findings: Vec<(String, String)> = Vec::new(); // (name, dir)
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -171,6 +174,7 @@ fn main() -> anyhow::Result<()> {
             &cfg,
             &findings_dir,
             &mut counts,
+            &mut surface_gaps,
             &mut coverage,
             &mut findings,
             &mut candidates,
@@ -197,6 +201,7 @@ fn main() -> anyhow::Result<()> {
             let out = run_program(&args, &name, &insns, qemu.as_mut())?;
             handle_outcome(
                 &mut counts,
+                &mut surface_gaps,
                 &mut coverage,
                 &mut findings,
                 &mut candidates,
@@ -232,6 +237,7 @@ fn main() -> anyhow::Result<()> {
     write_summary(
         &args,
         &counts,
+        &surface_gaps,
         &coverage,
         &findings,
         &groups,
@@ -289,6 +295,7 @@ fn run_mutation_campaign(
     cfg: &GenConfig,
     findings_dir: &Path,
     counts: &mut BTreeMap<&'static str, usize>,
+    surface_gaps: &mut BTreeMap<&'static str, usize>,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
     candidates: &mut Vec<Candidate>,
@@ -331,11 +338,13 @@ fn run_mutation_campaign(
         // verifier's reasoning — persisted separately from findings
         if let Some(before) = seed_verdict {
             let after = out.mini.name();
-            if before != after {
+            if before != after
+                && let Some(env) = &out.env
+            {
                 let dir = findings_dir.join(format!("verdict-flip-{}", name));
                 save_finding(
                     &dir,
-                    &out.env,
+                    env,
                     &ProgramResult {
                         label: "verdict-flip",
                         name: &out.name,
@@ -359,7 +368,15 @@ fn run_mutation_campaign(
             pool.drain(corpus_len..pool.len() - POOL_CAP);
         }
 
-        handle_outcome(counts, coverage, findings, candidates, findings_dir, out)?;
+        handle_outcome(
+            counts,
+            surface_gaps,
+            coverage,
+            findings,
+            candidates,
+            findings_dir,
+            out,
+        )?;
 
         let done = i + 1;
         let pct = done * 100 / args.iters.max(1);
@@ -473,7 +490,9 @@ struct Outcome {
     name: String,
     bytes: Vec<u8>,
     insns: Vec<BpfInsn>,
-    env: BpfVerifierEnv,
+    /// `None` when the program could not even be loaded (decode error or
+    /// an unregistered map fd): a surface gap, not a finding (#131).
+    env: Option<BpfVerifierEnv>,
     mini: SideVerdict,
     mini_reason: Option<String>,
     mini_insn: Option<u32>,
@@ -481,6 +500,7 @@ struct Outcome {
     kernel_message: Option<String>,
     kernel_insn: Option<u32>,
     finding: Finding,
+    surface_gap: Option<SurfaceGapKind>,
 }
 
 /// One program through the whole pipeline: verify (mini + concrete),
@@ -499,7 +519,26 @@ fn run_program(
 
     // rand-verifier side (mini + concrete)
     let mut env = BpfVerifierEnv::new();
-    env.setup_prog_bytes(&bytes)?;
+    if let Err(err) = env.setup_prog_bytes(&bytes) {
+        // decode errors and unregistered map fds mean "the model cannot
+        // judge this program", never "the kernel is wrong" (#131)
+        let message = format!("{err:#}");
+        let kind = surface_gap_kind(&message).unwrap_or(SurfaceGapKind::Other);
+        return Ok(Outcome {
+            name: name.to_string(),
+            bytes,
+            insns: insns.to_vec(),
+            env: None,
+            mini: SideVerdict::Skipped,
+            mini_reason: Some(message),
+            mini_insn: None,
+            kernel: SideVerdict::Skipped,
+            kernel_message: None,
+            kernel_insn: None,
+            finding: Finding::SurfaceGap,
+            surface_gap: Some(kind),
+        });
+    }
     let (mini, mini_reason, mini_insn, panic_msg) =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.verify())) {
             Ok(Ok(Verdict::Safe)) => (SideVerdict::Accept, None, None, None),
@@ -539,10 +578,10 @@ fn run_program(
         (SideVerdict::Skipped, None, None)
     };
 
-    let finding = if panic_msg.is_some() {
-        Finding::RvPanic
+    let (finding, surface_gap) = if panic_msg.is_some() {
+        (Finding::RvPanic, None)
     } else {
-        classify_env(
+        classify_env_with_gap(
             &env,
             name,
             &mini,
@@ -556,7 +595,7 @@ fn run_program(
         name: name.to_string(),
         bytes,
         insns: insns.to_vec(),
-        env,
+        env: Some(env),
         mini,
         mini_reason,
         mini_insn,
@@ -564,6 +603,7 @@ fn run_program(
         kernel_message,
         kernel_insn,
         finding,
+        surface_gap,
     })
 }
 
@@ -572,6 +612,7 @@ fn run_program(
 #[allow(clippy::too_many_arguments)]
 fn handle_outcome(
     counts: &mut BTreeMap<&'static str, usize>,
+    surface_gaps: &mut BTreeMap<&'static str, usize>,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
     candidates: &mut Vec<Candidate>,
@@ -582,11 +623,15 @@ fn handle_outcome(
         *coverage.entry(opcode_family(insn)).or_insert(0) += 1;
     }
     *counts.entry(out.finding.name()).or_insert(0) += 1;
+    if let Some(gap) = out.surface_gap {
+        *surface_gaps.entry(gap.name()).or_insert(0) += 1;
+    }
     if out.finding.is_finding() {
         let dir = findings_dir.join(format!("{}-{}", out.finding.name(), out.name));
+        let env = out.env.as_ref().expect("finding outcomes carry an env");
         save_finding(
             &dir,
-            &out.env,
+            env,
             &ProgramResult {
                 label: out.finding.name(),
                 name: &out.name,
@@ -608,7 +653,7 @@ fn handle_outcome(
             divergence: Divergence {
                 mini_insn: out.mini_insn,
                 kernel_insn: out.kernel_insn,
-                concrete_pc: first_violation_pc(&out.env),
+                concrete_pc: out.env.as_ref().and_then(first_violation_pc),
             },
         });
     }
@@ -832,6 +877,7 @@ fn opt_u32(v: Option<u32>) -> String {
 fn write_summary(
     args: &Args,
     counts: &BTreeMap<&'static str, usize>,
+    surface_gaps: &BTreeMap<&'static str, usize>,
     coverage: &BTreeMap<&'static str, usize>,
     findings: &[(String, String)],
     groups: &[Group],
@@ -845,6 +891,8 @@ fn write_summary(
     s.push_str(&format!("  \"iters\": {},\n", args.iters));
     s.push_str("  \"counts\": {\n");
     push_map(&mut s, counts, "    ");
+    s.push_str("  },\n  \"surface_gaps\": {\n");
+    push_map(&mut s, surface_gaps, "    ");
     s.push_str("  },\n  \"opcode_coverage\": {\n");
     push_map(&mut s, coverage, "    ");
     s.push_str("  },\n  \"findings\": [\n");
