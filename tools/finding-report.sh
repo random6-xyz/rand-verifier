@@ -149,6 +149,24 @@ if summary:
             lines.append(f"- {fin.get('name', '?')} -> `{fin.get('dir', '?')}`")
         lines.append("")
 
+kpi = summary.get("kpi")
+if kpi:
+    lines.append("## KPI")
+    lines.append("")
+    lines.append("| metric | value |")
+    lines.append("|--------|-------|")
+    for key in (
+        "findings_total",
+        "unique_clusters",
+        "duplicate_ratio",
+        "unique_clusters_per_10k",
+        "surface_gap_rate",
+        "time_to_first_new_cluster_ms",
+    ):
+        value = kpi.get(key)
+        lines.append(f"| {key} | {value if value is not None else '-'} |")
+    lines.append("")
+
 lines.append("## findings (by priority)")
 lines.append("")
 if findings:

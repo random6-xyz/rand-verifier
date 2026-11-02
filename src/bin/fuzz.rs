@@ -20,11 +20,12 @@
 //! (`--tolerate-findings` forces 0). The kernel side needs root /
 //! CAP_BPF (run with sudo on hosts with unprivileged BPF disabled).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Instant;
 
 use rand_verifier::diff::{SideVerdict, categorize_mini_reason};
 use rand_verifier::env::BpfVerifierEnv;
@@ -158,6 +159,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut surface_gaps: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut kpi = Kpi::new();
     let mut coverage: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut findings: Vec<(String, String)> = Vec::new(); // (name, dir)
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -175,6 +177,7 @@ fn main() -> anyhow::Result<()> {
             &findings_dir,
             &mut counts,
             &mut surface_gaps,
+            &mut kpi,
             &mut coverage,
             &mut findings,
             &mut candidates,
@@ -202,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             handle_outcome(
                 &mut counts,
                 &mut surface_gaps,
+                &mut kpi,
                 &mut coverage,
                 &mut findings,
                 &mut candidates,
@@ -238,6 +242,7 @@ fn main() -> anyhow::Result<()> {
         &args,
         &counts,
         &surface_gaps,
+        &kpi,
         &coverage,
         &findings,
         &groups,
@@ -296,6 +301,7 @@ fn run_mutation_campaign(
     findings_dir: &Path,
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
+    kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
     candidates: &mut Vec<Candidate>,
@@ -371,6 +377,7 @@ fn run_mutation_campaign(
         handle_outcome(
             counts,
             surface_gaps,
+            kpi,
             coverage,
             findings,
             candidates,
@@ -465,6 +472,105 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &
         }
     }
     Ok(seeds)
+}
+
+/// Campaign KPI (#141): the numbers that expose saturation, as opposed to
+/// the label count. A cluster is one root cause: the finding class plus the
+/// normalized verifier messages plus a structural hash of the program.
+struct Kpi {
+    started: Instant,
+    clusters: BTreeSet<String>,
+    first_new_cluster_ms: Option<u128>,
+}
+
+impl Kpi {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            clusters: BTreeSet::new(),
+            first_new_cluster_ms: None,
+        }
+    }
+
+    fn observe(&mut self, out: &Outcome) {
+        if !out.finding.is_finding() {
+            return;
+        }
+        let is_new = self.clusters.insert(cluster_key(out));
+        if is_new && self.first_new_cluster_ms.is_none() {
+            self.first_new_cluster_ms = Some(self.started.elapsed().as_millis());
+        }
+    }
+}
+
+/// Normalize a verifier message into a clusterable form: embedded hex and
+/// decimal literals become `#` (they vary per program, the rule does not),
+/// while register names (`R6`) keep their number.
+fn normalize_message(message: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    for token in message.split_whitespace() {
+        let mut norm = String::new();
+        let mut chars = token.chars().peekable();
+        let mut prev: Option<char> = None;
+        while let Some(c) = chars.next() {
+            let starts_number =
+                c.is_ascii_digit() && prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_');
+            if starts_number {
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_hexdigit() || d == 'x' || d == 'X' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if norm.ends_with('-') || norm.ends_with('+') {
+                    norm.pop();
+                }
+                norm.push('#');
+                prev = Some('#');
+            } else {
+                norm.push(c);
+                prev = Some(c);
+            }
+        }
+        let norm = norm.trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
+        if norm.is_empty() {
+            continue;
+        }
+        if prev_space {
+            out.push(' ');
+        }
+        out.push_str(norm);
+        prev_space = true;
+    }
+    out.truncate(120);
+    out
+}
+
+/// FNV-1a over the opcode-family sequence: deterministic across processes
+/// (std's DefaultHasher is randomly keyed).
+fn shape_hash(insns: &[BpfInsn]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for insn in insns {
+        for byte in opcode_family(insn).bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn cluster_key(out: &Outcome) -> String {
+    format!(
+        "{}|{}|{}|{:016x}",
+        out.finding.name(),
+        normalize_message(out.mini_reason.as_deref().unwrap_or("")),
+        normalize_message(out.kernel_message.as_deref().unwrap_or("")),
+        shape_hash(&out.insns),
+    )
 }
 
 /// Mutation statistics for the summary.
@@ -613,6 +719,7 @@ fn run_program(
 fn handle_outcome(
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
+    kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
     candidates: &mut Vec<Candidate>,
@@ -623,6 +730,7 @@ fn handle_outcome(
         *coverage.entry(opcode_family(insn)).or_insert(0) += 1;
     }
     *counts.entry(out.finding.name()).or_insert(0) += 1;
+    kpi.observe(&out);
     if let Some(gap) = out.surface_gap {
         *surface_gaps.entry(gap.name()).or_insert(0) += 1;
     }
@@ -878,6 +986,7 @@ fn write_summary(
     args: &Args,
     counts: &BTreeMap<&'static str, usize>,
     surface_gaps: &BTreeMap<&'static str, usize>,
+    kpi: &Kpi,
     coverage: &BTreeMap<&'static str, usize>,
     findings: &[(String, String)],
     groups: &[Group],
@@ -893,6 +1002,34 @@ fn write_summary(
     push_map(&mut s, counts, "    ");
     s.push_str("  },\n  \"surface_gaps\": {\n");
     push_map(&mut s, surface_gaps, "    ");
+    let findings_total = findings.len();
+    let unique_clusters = kpi.clusters.len();
+    let duplicate_ratio = if unique_clusters == 0 {
+        0.0
+    } else {
+        findings_total as f64 / unique_clusters as f64
+    };
+    let per_10k = if args.iters == 0 {
+        0.0
+    } else {
+        unique_clusters as f64 * 10_000.0 / args.iters as f64
+    };
+    let surface_total: usize = surface_gaps.values().sum();
+    let surface_rate = if args.iters == 0 {
+        0.0
+    } else {
+        surface_total as f64 / args.iters as f64
+    };
+    s.push_str("  },\n  \"kpi\": {\n");
+    s.push_str(&format!("    \"findings_total\": {findings_total},\n"));
+    s.push_str(&format!("    \"unique_clusters\": {unique_clusters},\n"));
+    s.push_str(&format!("    \"duplicate_ratio\": {duplicate_ratio:.3},\n"));
+    s.push_str(&format!("    \"unique_clusters_per_10k\": {per_10k:.3},\n"));
+    s.push_str(&format!("    \"surface_gap_rate\": {surface_rate:.3},\n"));
+    match kpi.first_new_cluster_ms {
+        Some(ms) => s.push_str(&format!("    \"time_to_first_new_cluster_ms\": {ms}\n")),
+        None => s.push_str("    \"time_to_first_new_cluster_ms\": null\n"),
+    }
     s.push_str("  },\n  \"opcode_coverage\": {\n");
     push_map(&mut s, coverage, "    ");
     s.push_str("  },\n  \"findings\": [\n");
@@ -962,4 +1099,35 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod kpi_tests {
+    use super::*;
+    use rand_verifier::insn::decode_program;
+
+    #[test]
+    fn normalize_collapses_literals_and_keeps_registers() {
+        assert_eq!(
+            normalize_message("invalid stack off=-8 size=8"),
+            "invalid stack off=# size=#"
+        );
+        assert_eq!(
+            normalize_message("R6 invalid mem access 'scalar'"),
+            "R6 invalid mem access 'scalar'"
+        );
+        assert_eq!(normalize_message("ptr 0xffffffff"), "ptr #");
+        assert_eq!(normalize_message(""), "");
+    }
+
+    #[test]
+    fn shape_hash_is_deterministic_and_program_specific() {
+        let a = decode_program(&[0xb7, 0, 0, 0, 42, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let b = decode_program(&[0xb7, 0, 0, 0, 42, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let c = decode_program(&[0xb7, 0, 0, 0, 7, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        // same opcode families -> same structural hash (the value differs)
+        assert_eq!(shape_hash(&a), shape_hash(&b));
+        assert_eq!(shape_hash(&a), shape_hash(&c));
+        assert_ne!(shape_hash(&a), shape_hash(&a[..1]));
+    }
 }
