@@ -35,6 +35,39 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  corpus:
+    name: Selftest corpus extraction
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit-test the extractor
+        run: python3 -m unittest discover -s tools/tests -v
+
+      - name: Sparse-checkout the pinned bpf-next selftests
+        # tools/selftest-corpus.lock pins the commit and the expected
+        # program count/catalog hash (#138).  The extractor only needs
+        # tools/include, tools/lib and the verifier fragments (~5 MB),
+        # so a blobless sparse clone keeps the job fast.
+        run: |
+          git init -q /tmp/bpf-next
+          cd /tmp/bpf-next
+          git remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git
+          git fetch -q --depth 1 --filter=blob:none origin a30c772627b2ef4bc715332b1b04938a914556cd
+          git sparse-checkout init --cone
+          git sparse-checkout set tools/include tools/lib tools/testing/selftests/bpf/verifier
+          git checkout -q FETCH_HEAD
+
+      - name: Extract and verify the corpus lock
+        run: python3 tools/selftest_corpus.py --tree /tmp/bpf-next --out /tmp/selftest-corpus --check-lock
+
+      - name: Upload the corpus artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-corpus
+          path: /tmp/selftest-corpus/
+          if-no-files-found: error
+
   diff:
     name: Kernel differential check
     # hosted runners have passwordless sudo and run directly in a VM, so
