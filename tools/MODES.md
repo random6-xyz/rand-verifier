@@ -63,3 +63,40 @@ cargo run --release --bin replay -- --manifest <corpus>/manifest.jsonl \
 The model already follows the privileged rules (pointer comparisons,
 uninit stack reads); the unpriv kernel column is the remaining evidence
 for the second axis.
+
+## Measured evidence (2026-11-02, bpf-next `a30c772627b2`)
+
+A guest kernel built with `tools/kernel/unpriv.config`
+(`CONFIG_BPF_UNPRIV_DEFAULT_OFF` unset, `CONFIG_BPF_SYSCALL=y`) and the
+`agent-musl` binary running with `--caps unpriv` loads socket-filter
+programs with **no capabilities at all**. Corpus programs through the
+guest:
+
+| case | privileged expectation | unpriv result |
+|---|---|---|
+| `jump__000..004` | ACCEPT | `REJECT R1 pointer comparison prohibited` |
+| `ctx_skb__004` | REJECT (ptr comparison) | `REJECT R1 pointer comparison prohibited` |
+| `basic_instr__000/001`, `ctx_skb__000`, `atomic_fetch_add__000` | ACCEPT | `ACCEPT` |
+
+This matches the corpus `.result_unpriv` column (REJECT for the five
+`jump__*` cases, whose `.errstr_unpriv` is "R1 pointer comparison"), and
+shows the unprivileged axis is not a blanket rejection: ordinary
+socket-filter programs still load.
+
+Reproduce:
+
+```sh
+# one-time: build the guest kernel with the fragment merged, then
+#   tools/qemu-assets.sh --sample-initramfs
+# (the agent must be rebuilt first: cargo build --release
+#  --no-default-features --features agent-musl \
+#  --target x86_64-unknown-linux-musl --bin agent)
+QEMU_ASSETS=$PWD/fuzz-out/kernel-a30c772627b2-unpriv \
+  tools/qemu-share.sh --fresh && QEMU_ASSETS=$PWD/fuzz-out/kernel-a30c772627b2-unpriv \
+  tools/qemu-boot.sh
+# submit job/<case>.bin with a run.sh that calls
+#   /sbin/agent --caps unpriv job/<case>.bin
+```
+
+The unprivileged half of the pointer-comparison rule is therefore
+confirmed on the same kernel the model is measured against.
