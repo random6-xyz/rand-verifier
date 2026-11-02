@@ -26,31 +26,9 @@ use std::fs;
 use std::process;
 
 use rand_verifier::env::{MapInfo, MapType};
-use rand_verifier::krun::{KernelOutcome, drop_privileged_caps, load_with_kernel_maps_level};
-
-/// Collect the map fds referenced by ldimm64 pseudo instructions from
-/// raw program bytes (mirror of the private `krun::referenced_map_fds`).
-fn referenced_map_fds(insns: &[u8]) -> Vec<u32> {
-    let mut fds = Vec::new();
-    let mut i = 0usize;
-    while i + 16 <= insns.len() {
-        if insns[i] == 0x18 {
-            let pseudo = (insns[i + 1] >> 4) & 0x0F;
-            if pseudo == 1 || pseudo == 2 {
-                // BPF_PSEUDO_MAP_FD / BPF_PSEUDO_MAP_VALUE
-                let fd =
-                    u32::from_le_bytes([insns[i + 4], insns[i + 5], insns[i + 6], insns[i + 7]]);
-                if !fds.contains(&fd) {
-                    fds.push(fd);
-                }
-            }
-            i += 16;
-        } else {
-            i += 8;
-        }
-    }
-    fds
-}
+use rand_verifier::krun::{
+    KernelOutcome, drop_privileged_caps, load_with_kernel_maps_level, referenced_map_fds,
+};
 
 /// Synthetic map registry: every referenced fd maps to the ARRAY
 /// default (key 4, value 8, max_entries 1) — the same shape the

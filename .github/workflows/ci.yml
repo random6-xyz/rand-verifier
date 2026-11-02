@@ -68,6 +68,42 @@ jobs:
           path: /tmp/selftest-corpus/
           if-no-files-found: error
 
+  replay:
+    name: Selftest corpus replay
+    needs: corpus
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download the pinned corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: selftest-corpus
+          path: /tmp/selftest-corpus
+
+      - name: Build the replay tool
+        run: cargo build --release --bin replay
+
+      - name: Replay the corpus against the committed baseline
+        # Fails only when a finding appears that is not in
+        # tools/replay-baseline.json; a shrinking set is allowed (#139).
+        run: |
+          ./target/release/replay \
+            --manifest /tmp/selftest-corpus/manifest.jsonl \
+            --programs /tmp/selftest-corpus/programs \
+            --baseline tools/replay-baseline.json \
+            --json /tmp/replay-report.json \
+            --gate
+
+      - name: Upload the replay report
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-report
+          path: /tmp/replay-report.json
+          if-no-files-found: error
+
   diff:
     name: Kernel differential check
     # hosted runners have passwordless sudo and run directly in a VM, so
