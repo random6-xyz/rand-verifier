@@ -82,13 +82,19 @@ issue that owns the gap.
 
 ## Current baseline (bpf-next `a30c772627b2`)
 
-| id | gap | owner |
-|---|---|---|
-| `jump__00{0..4}` | mini rejects a `PTR_TO_CTX` vs immediate comparison; the kernel allows it for privileged loaders and rejects it unprivileged (`errstr_unpriv = "R1 pointer comparison"`) | #143 (capability axis) |
+**The baseline is empty.** Every corpus case now classifies as `agree`
+(or a surface gap), i.e. mini, the spec, the concrete side and the
+kernel expectation agree.
 
-`dead_code__005` (a subprogram ending in an unconditional jump) moved to
-agree: `check_cfg` now accepts a trailing `JMP` like the kernel ("last
-insn is not an exit or jmp").
+Recent closures:
+
+- `dead_code__005` — `check_cfg` accepts a trailing `JMP` like the kernel.
+- `jump__000..004` — privileged pointer comparisons (`allow_ptr_leaks`):
+  mini keeps both branches, the concrete side compares model addresses,
+  the spec pushes both successors, and a spill of an uninitialized
+  register marks the slot uninitialized instead of aborting the run. The
+  unprivileged half of the rule (`"R%d pointer comparison prohibited"`)
+  is the second axis in `tools/MODES.md`.
 
 240 of 478 cases have a modelled prog type; the other 238 are
 `unmodeled-prog-type` surface gaps until #135 lands SCHED_CLS/XDP support.

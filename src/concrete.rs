@@ -1166,7 +1166,16 @@ pub(crate) fn concrete_step(
             let frameno = stack_ptr_frameno(pc, *base, base_value)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
             let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
-            let value = read_concrete_reg(pc, state, *src)?;
+            // A privileged kernel allows spilling an uninitialized
+            // register (verifier/jump.c: `.result = ACCEPT`): the covered
+            // bytes stay uninitialized, so the slot becomes unknown here
+            // and a later load from it is still an error (#158).
+            let Some(value) = state.regs[*src as usize] else {
+                let mut next = *state;
+                let stack = concrete_frame_stack_mut(&mut next, frameno);
+                stack[slot] = None;
+                return Ok(next);
+            };
             let mut next = *state;
             concrete_merge(&mut next, frameno, slot, in_slot, size.bytes(), value);
             Ok(next)
@@ -1702,9 +1711,25 @@ fn concrete_cond_imm(
             CondOp::Ne => true,
             _ => return Err(ConcreteFailure::InvalidComparisonImm { pc, dst }),
         },
-        // a pointer compared to an immediate is never comparable
-        // (mirror of the abstract cond_branch_impl)
-        _ => return Err(ConcreteFailure::InvalidComparisonImm { pc, dst }),
+        // a pointer compared to an immediate is a privileged
+        // comparison (allow_ptr_leaks): compare the model address, the
+        // unprivileged kernel rejects it with "R%d pointer comparison
+        // prohibited" (#143, #158)
+        other => {
+            let a = other.bits();
+            match op {
+                CondOp::Eq => a == s,
+                CondOp::Ne => a != s,
+                CondOp::Ugt => a > s,
+                CondOp::Uge => a >= s,
+                CondOp::Ult => a < s,
+                CondOp::Ule => a <= s,
+                CondOp::Sgt => (a as i64) > (imm as i64),
+                CondOp::Sge => (a as i64) >= (imm as i64),
+                CondOp::Slt => (a as i64) < (imm as i64),
+                CondOp::Sle => (a as i64) <= (imm as i64),
+            }
+        }
     };
     let next_pc = if taken {
         branch_target(pc, offset)
@@ -3245,8 +3270,10 @@ mod tests {
             err,
             ConcreteFailure::UninitializedStackRead { pc: 0, offset: -8 }
         );
-        // spilling an uninitialized register is also a read (#14)
-        let err = concrete_step(
+        // spilling an uninitialized register is allowed for a
+        // privileged loader (verifier/jump.c): the slot stays
+        // uninitialized, so a later load still fails (#158)
+        let next = concrete_step(
             0,
             &ConcreteState::initial(),
             &BpfInsn::StMem {
@@ -3256,8 +3283,24 @@ mod tests {
                 size: crate::insn::MemSize::DW,
             },
         )
+        .unwrap();
+        assert_eq!(next.stack[63], None);
+        let err = concrete_step(
+            0,
+            &next,
+            &BpfInsn::LdMem {
+                dst: 0,
+                base: 10,
+                offset: -8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
+            },
+        )
         .unwrap_err();
-        assert_eq!(err, ConcreteFailure::UninitializedRead { pc: 0, reg: 3 });
+        assert_eq!(
+            err,
+            ConcreteFailure::UninitializedStackRead { pc: 0, offset: -8 }
+        );
     }
 
     #[test]
@@ -3577,16 +3620,20 @@ mod tests {
     }
 
     #[test]
-    fn run_imm_compare_pointer_rejected() {
-        // a pointer compared to an immediate fails concretely too
-        // (r1 = CtxPtr at entry, mirror of the abstract rejection)
-        let program = vec![BpfInsn::JeqImm {
-            dst: 1,
-            imm: 0,
-            offset: 1,
-        }];
-        let err = run_concrete(&program, &[]).unwrap_err();
-        assert_eq!(err, ConcreteFailure::InvalidComparisonImm { pc: 0, dst: 1 });
+    fn run_imm_compare_pointer_allowed() {
+        // a pointer compared to an immediate is a privileged comparison
+        // (allow_ptr_leaks); r1 = CtxPtr at entry, both outcomes land on
+        // the exit
+        let program = vec![
+            BpfInsn::JeqImm {
+                dst: 1,
+                imm: 0,
+                offset: 0,
+            },
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Exit,
+        ];
+        assert!(run_concrete(&program, &[]).is_ok());
     }
 
     #[test]
