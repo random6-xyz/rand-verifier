@@ -42,6 +42,9 @@ const WEIGHT_ALU32: u64 = 15;
 const WEIGHT_CMP: u64 = 30;
 const WEIGHT_STACK: u64 = 15;
 const WEIGHT_HELPER: u64 = 5;
+/// Probability (percent) of a body carrying a BPF-to-BPF call and a
+/// trailing subprogram (#137).
+const SUBPROG_PERCENT: u64 = 15;
 /// Probability (percent) of the last body instruction being an
 /// unconditional jump instead of a regular instruction.
 const JMP_LAST_PERCENT: u64 = 20;
@@ -67,13 +70,20 @@ impl Generator {
         let span = cfg.max_len.saturating_sub(cfg.min_len) + 1;
         let body_len = cfg.min_len + self.rng.below(span as u64) as usize;
 
-        let mut insns = Vec::with_capacity(body_len + 2);
+        // A subprogram call (#137) needs a call site and a trailing
+        // subprogram; only do it when the body is long enough.
+        let with_subprog = body_len >= 3 && self.rng.below(100) < SUBPROG_PERCENT;
+
+        let mut insns = Vec::with_capacity(body_len + 4);
         // r0 init — satisfies the exit R0 check (mini) by construction
         insns.push(insn_lib::mov_imm(0, 0));
 
         for pc in 0..body_len {
             let is_last = pc == body_len - 1;
-            if is_last && self.rng.below(100) < JMP_LAST_PERCENT {
+            if is_last && with_subprog {
+                // call sub @+1 → the subprogram after the main exit
+                insns.push(insn_lib::call_sub(1));
+            } else if is_last && self.rng.below(100) < JMP_LAST_PERCENT {
                 // unconditional jump to the exit — the only safe
                 // unconditional jump: it has a single successor, so a
                 // backward jump would leave the trailing EXIT
@@ -86,6 +96,11 @@ impl Generator {
         }
 
         insns.push(insn_lib::exit());
+        if with_subprog {
+            // [mov r0, imm, exit]: the callee returns to the call site
+            insns.push(insn_lib::mov_imm(0, *self.rng.pick(IMMEDIATES)));
+            insns.push(insn_lib::exit());
+        }
         insns
     }
 
@@ -385,22 +400,24 @@ mod tests {
     }
 
     /// The body length honours the configured bounds (the full program
-    /// is body + 2 for the r0 init and the exit).
+    /// is body + 2 for the r0 init and the exit, +2 when a trailing
+    /// subprogram is emitted, #137).
     #[test]
     fn gen_length_bounds() {
-        // fixed length
+        // fixed length: main = 5, or 7 with the trailing subprogram
         let cfg = GenConfig {
             min_len: 3,
             max_len: 3,
         };
         for seed in 0..20 {
-            assert_eq!(gen_prog(seed, &cfg).len(), 5, "seed {seed}");
+            let len = gen_prog(seed, &cfg).len();
+            assert!(len == 5 || len == 7, "seed {seed}: len {len}");
         }
         // default bounds
         let cfg = GenConfig::default();
         for seed in 0..100 {
             let len = gen_prog(seed, &cfg).len();
-            assert!((3..=102).contains(&len), "seed {seed}: len {len}");
+            assert!((3..=104).contains(&len), "seed {seed}: len {len}");
         }
     }
 

@@ -1,21 +1,16 @@
 {
   "allowed_findings": [
-    "dead_code__005",
     "jump__000",
     "jump__001",
     "jump__002",
     "jump__003",
-    "jump__004",
-    "jump__005",
-    "jump__006",
-    "jump__007"
+    "jump__004"
   ],
   "counts": {
-    "agree": 40,
+    "agree": 46,
     "inconclusive": 28,
-    "rv-precision-gap": 4,
     "soundness-candidate": 5,
-    "surface-gap": 398,
+    "surface-gap": 396,
     "whitelisted": 3
   },
   "kernel_source": "expected",

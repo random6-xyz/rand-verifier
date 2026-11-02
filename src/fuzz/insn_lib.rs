@@ -266,6 +266,12 @@ pub fn mul32_reg(dst: u8, src: u8) -> BpfInsn {
     BpfInsn::Mul32Reg { dst, src }
 }
 
+/// BPF-to-BPF call (`BPF_PSEUDO_CALL`, #137): the offset is relative to
+/// the next instruction.
+pub fn call_sub(offset: i32) -> BpfInsn {
+    BpfInsn::CallSub { offset }
+}
+
 /// BPF_NEG / BPF_NEG32 (#132).
 pub fn neg(dst: u8) -> BpfInsn {
     BpfInsn::Neg { dst }

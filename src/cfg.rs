@@ -382,18 +382,25 @@ fn check_ldimm64_target(
 pub fn check_cfg(insns: &[BpfInsn], subprogs: &[u32]) -> Result<Vec<u32>, VerificationFailure> {
     let insn_cnt = insns.len();
 
-    // every subprogram must end with EXIT (cf. the kernel's "last insn
-    // is not exit"): this is what guarantees that accepted programs
-    // actually reach an exit, even when the CFG contains loops
+    // every subprogram must end with EXIT or an unconditional jump
+    // (kernel check_cfg: "last insn is not an exit or jmp"). Both have no
+    // fall-through, so the program cannot run off the end; a trailing JMP
+    // to an exit is valid and the kernel accepts it.
     if insns.is_empty() {
         return Err(VerificationFailure::new(0, "empty program"));
     }
     for (i, &start) in subprogs.iter().enumerate() {
         let end = subprogs.get(i + 1).copied().unwrap_or(insn_cnt as u32);
-        if !matches!(insns[(end - 1) as usize], BpfInsn::Exit) {
+        if !matches!(
+            insns[(end - 1) as usize],
+            BpfInsn::Exit | BpfInsn::Jmp { .. }
+        ) {
             return Err(VerificationFailure::new(
                 end - 1,
-                format!("subprogram [{}..{}) does not end with exit", start, end),
+                format!(
+                    "subprogram [{}..{}) does not end with exit or jmp",
+                    start, end
+                ),
             ));
         }
     }
@@ -708,14 +715,26 @@ mod tests {
     }
 
     #[test]
-    fn check_cfg_subprogram_must_end_with_exit() {
-        // a loop that never reaches exit: the last instruction of the
-        // (only) subprogram is a jump, not EXIT → rejected (cf. the
-        // kernel's "last insn is not exit")
-        let insns = vec![BpfInsn::Jmp { offset: 0 }, BpfInsn::Jmp { offset: -2 }];
-        let err = check_cfg(&insns, &[0]).unwrap_err();
+    fn check_cfg_subprogram_must_end_with_exit_or_jmp() {
+        // the kernel accepts a trailing unconditional jump (check_cfg:
+        // "last insn is not an exit or jmp"); a fall-through end is
+        // rejected
+        let ok = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Jmp { offset: 1 }, // forward to the jmp below
+            BpfInsn::Exit,
+            BpfInsn::Jmp { offset: -2 }, // trailing jmp to the exit at insn 2
+        ];
+        assert!(check_cfg(&ok, &[0]).is_ok());
+
+        let bad = vec![
+            BpfInsn::MovImm { dst: 0, imm: 0 },
+            BpfInsn::Jmp { offset: -2 },
+            BpfInsn::MovImm { dst: 0, imm: 1 }, // falls through the end
+        ];
+        let err = check_cfg(&bad, &[0]).unwrap_err();
         assert!(
-            err.message.contains("does not end with exit"),
+            err.message.contains("does not end with exit or jmp"),
             "{}",
             err.message
         );
