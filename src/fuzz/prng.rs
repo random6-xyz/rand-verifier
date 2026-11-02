@@ -41,6 +41,11 @@ impl SplitMix64 {
     }
 
     /// A uniform value in `0..n` (modulo bias is acceptable for fuzzing).
+    /// A uniform float in `[0, 1)` (53 random bits, exact in f64).
+    pub(crate) fn unit(&mut self) -> f64 {
+        self.below(1u64 << 53) as f64 / (1u64 << 53) as f64
+    }
+
     pub(crate) fn below(&mut self, n: u64) -> u64 {
         debug_assert!(n > 0, "below(0) is undefined");
         self.next() % n

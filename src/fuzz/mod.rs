@@ -4,6 +4,7 @@ pub mod generator;
 pub mod idiom;
 pub mod insn_lib;
 pub mod mutator;
+pub mod novelty;
 pub mod oracle;
 pub mod prng;
 pub mod qemu;

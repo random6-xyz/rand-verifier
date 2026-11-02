@@ -42,6 +42,12 @@ impl Mutator {
         &pool[self.rng.below(pool.len() as u64) as usize]
     }
 
+    /// A weighted element index (#140 novelty scheduling). Zero/NaN
+    /// weights are skipped; an all-zero vector falls back to uniform.
+    pub fn pick_weighted(&mut self, weights: &[f64]) -> usize {
+        crate::fuzz::novelty::pick_index(&mut self.rng, weights)
+    }
+
     /// One mutation of `seed`. `other` is the second seed for the
     /// splice strategy. Returns `None` when the mutant fails the nano
     /// structural checks (dropped — the runner counts the rate).
