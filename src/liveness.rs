@@ -252,6 +252,24 @@ fn use_def(insn: &BpfInsn) -> InsnUseDef {
             ud.def_regs =
                 reg_bit(0) | reg_bit(1) | reg_bit(2) | reg_bit(3) | reg_bit(4) | reg_bit(5);
         }
+        // STX|ATOMIC (#133): reads the base and the operand, writes the
+        // memory slot; a fetching form also writes r0
+        BpfInsn::Atomic {
+            dst,
+            src,
+            offset,
+            size,
+            op,
+            fetch,
+        } => {
+            ud.use_regs = reg_bit(*dst) | reg_bit(*src);
+            ud.write_slots = write_slots_for(*dst, *offset, *size);
+            if *op == crate::insn::AtomicOp::Cmpxchg {
+                ud.def_regs = reg_bit(0);
+            } else if *fetch {
+                ud.def_regs = reg_bit(*src);
+            }
+        }
         // BPF_JMP32 reads the register operands (#136)
         BpfInsn::Jmp32 { dst, src, .. } => {
             ud.use_regs = reg_bit(*dst) | src.map(reg_bit).unwrap_or(0);

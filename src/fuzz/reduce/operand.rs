@@ -292,6 +292,13 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::LdMapFd { dst, .. }
         | BpfInsn::LdMapValue { dst, .. } => used[*dst as usize] = true,
         BpfInsn::LdImm64Second { .. } => {}
+        BpfInsn::Atomic { dst, src, op, .. } => {
+            used[*dst as usize] = true;
+            used[*src as usize] = true;
+            if *op == crate::insn::AtomicOp::Cmpxchg {
+                used[0] = true;
+            }
+        }
         BpfInsn::LdAbs { .. } => used[0] = true,
         BpfInsn::LdInd { src, .. } => {
             used[0] = true;

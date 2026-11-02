@@ -127,6 +127,13 @@ pub(crate) mod opcode {
     pub const JMP32_JSLE_IMM: u8 = 0xd6;
     pub const JMP32_JSLE: u8 = 0xde;
 
+    // atomic memory operations (#133): BPF_STX | BPF_ATOMIC | W/DW.
+    // The operation and the fetch flag live in `imm` (BPF_ADD..BPF_CMPXCHG
+    // in the high nibble, BPF_FETCH in bit 0).
+    pub const ATOMIC_W: u8 = 0xc3; // BPF_STX | BPF_ATOMIC | BPF_W
+    pub const ATOMIC_DW: u8 = 0xdb; // BPF_STX | BPF_ATOMIC | BPF_DW
+    pub const FETCH: i32 = 0x01;
+
     // legacy packet access (#136): BPF_LD|BPF_ABS/BPF_IND
     pub const LD_ABS: u8 = 0x20; // | BPF_W
     pub const LD_ABS_H: u8 = 0x28;
@@ -187,6 +194,48 @@ impl MulHigh {
             MulHigh::UnsignedHigh => 1,
             MulHigh::SignedHigh => 2,
         }
+    }
+}
+
+/// The operation of a `STX|ATOMIC` instruction (#133), from the high
+/// nibble of `imm` (kernel `BPF_ADD`..`BPF_CMPXCHG`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    Or,
+    And,
+    Xor,
+    Xchg,
+    Cmpxchg,
+}
+
+impl AtomicOp {
+    pub fn from_imm(imm: i32) -> Option<Self> {
+        Some(match imm & 0xf0 {
+            0x00 => AtomicOp::Add,
+            0x40 => AtomicOp::Or,
+            0x50 => AtomicOp::And,
+            0xa0 => AtomicOp::Xor,
+            0xe0 => AtomicOp::Xchg,
+            0xf0 => AtomicOp::Cmpxchg,
+            _ => return None,
+        })
+    }
+
+    pub fn to_imm(self) -> i32 {
+        match self {
+            AtomicOp::Add => 0x00,
+            AtomicOp::Or => 0x40,
+            AtomicOp::And => 0x50,
+            AtomicOp::Xor => 0xa0,
+            AtomicOp::Xchg => 0xe0,
+            AtomicOp::Cmpxchg => 0xf0,
+        }
+    }
+
+    /// Whether the operation requires `BPF_FETCH` (xchg/cmpxchg).
+    pub fn requires_fetch(self) -> bool {
+        matches!(self, AtomicOp::Xchg | AtomicOp::Cmpxchg)
     }
 }
 
@@ -609,6 +658,17 @@ pub enum BpfInsn {
         imm: Option<i32>,
         offset: i16,
         op: Jmp32Op,
+    },
+    /// `BPF_STX | BPF_ATOMIC` (#133): `[dst + off] op= src` with the
+    /// optional fetch (`r0 = old`) and the cmpxchg form (`r0` is the
+    /// comparand and receives the old value).
+    Atomic {
+        dst: u8,
+        src: u8,
+        offset: i16,
+        size: MemSize,
+        op: AtomicOp,
+        fetch: bool,
     },
     /// `BPF_LD | BPF_ABS` (#136): `r0 = *(size *)(packet + imm)`.
     LdAbs {
@@ -1170,6 +1230,42 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 }),
             }
         }
+        // STX | ATOMIC (#133)
+        op @ (opcode::ATOMIC_W | opcode::ATOMIC_DW) => {
+            // dst is the base pointer; src the operand. `imm` carries
+            // the operation (high nibble) and BPF_FETCH (bit 0); the
+            // other bits are reserved (kernel check_atomic).
+            let size = if op == opcode::ATOMIC_W {
+                MemSize::W
+            } else {
+                MemSize::DW
+            };
+            if imm & 0x0e != 0 {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_ATOMIC uses reserved fields",
+                });
+            }
+            let Some(atomic_op) = AtomicOp::from_imm(imm) else {
+                return Err(DecodeError::Unsupported {
+                    op,
+                    reason: "unknown atomic operation",
+                });
+            };
+            let fetch = imm & opcode::FETCH != 0;
+            if atomic_op.requires_fetch() && !fetch {
+                return Err(DecodeError::ReservedFields {
+                    message: "BPF_ATOMIC uses reserved fields",
+                });
+            }
+            Ok(BpfInsn::Atomic {
+                dst,
+                src,
+                offset,
+                size,
+                op: atomic_op,
+                fetch,
+            })
+        }
         _ => {
             if let Some(reason) = unsupported_reason(op) {
                 Err(DecodeError::Unsupported { op, reason })
@@ -1321,6 +1417,20 @@ pub fn disassemble(insn: &BpfInsn) -> String {
                 _ => unreachable!("a JMP32 carries one operand"),
             }
         }
+        BpfInsn::Atomic {
+            dst,
+            src,
+            offset,
+            size,
+            op,
+            fetch,
+        } => format!(
+            "[r{}{:+}] {op:?}{} {size:?} <- r{}",
+            dst,
+            offset,
+            if *fetch { "(fetch)" } else { "" },
+            src
+        ),
         BpfInsn::LdAbs { size, imm } => format!("r0 = *(packet+{imm}) ({size:?})"),
         BpfInsn::LdInd { src, size, imm } => {
             format!("r0 = *(packet+r{src}+{imm}) ({size:?})")
@@ -2069,8 +2179,6 @@ mod tests {
             (0xd7, "BPF_END"),
             // BPF_LD|BPF_IMM (the 32-bit immediate load)
             (0x60, "BPF_LD"),
-            // BPF_STX|BPF_ATOMIC|BPF_DW
-            (0xdb, "stores"),
         ];
         for (op, needle) in unsupported {
             let err = parse_insn(&insn_bytes(op, 0, 0, 0, 0)).unwrap_err();

@@ -1007,6 +1007,93 @@ pub(crate) fn concrete_step(
             next.regs[*dst as usize] = Some(ConcreteValue::Scalar(bits));
             Ok(next)
         }
+        // STX|ATOMIC (#133): the concrete model keeps the address model
+        // and uses 0 as the old value (the abstract side does not
+        // constrain it); stack bounds/alignment still apply
+        BpfInsn::Atomic {
+            dst,
+            src,
+            offset,
+            size,
+            fetch,
+            op,
+        } => {
+            let base_value = read_concrete_reg(pc, state, *dst)?;
+            let _ = read_concrete_reg(pc, state, *src)?;
+            if let ConcreteValue::CtxPtr(_) = base_value {
+                return Err(ConcreteFailure::InvalidCtxAccess {
+                    pc,
+                    off: *offset as i32,
+                    size: size.bytes() as u32,
+                });
+            }
+            if *offset as i64 % size.bytes() as i64 != 0 {
+                return Err(ConcreteFailure::InternalError { pc });
+            }
+            // stack targets need the usual bounds; map values are
+            // zero-initialized memory (the old value is a representative)
+            let src_value = read_concrete_reg(pc, state, *src)?;
+            let ConcreteValue::Scalar(src_bits) = src_value else {
+                return Err(ConcreteFailure::InternalError { pc });
+            };
+            let mut old_value = ConcreteValue::Scalar(0);
+            let mut target: Option<(u8, usize, usize)> = None;
+            if matches!(base_value, ConcreteValue::StackPtr { .. }) {
+                let frameno = stack_ptr_frameno(pc, *dst, base_value)?;
+                let offset = stack_ptr_access_offset(pc, *dst, base_value, *offset as i32)?;
+                let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
+                let stack = concrete_frame_stack(state, frameno);
+                let Some(value) = stack[slot] else {
+                    return Err(ConcreteFailure::UninitializedStackRead { pc, offset });
+                };
+                // the fetched old value is only exact for a full-slot
+                // 8-byte access (the abstract side keeps it unknown for
+                // 32-bit accesses)
+                if size.bytes() == 8 && in_slot == 0 {
+                    old_value = value;
+                }
+                target = Some((frameno, slot, in_slot));
+            }
+            let old_bits = match old_value {
+                ConcreteValue::Scalar(v) => v,
+                _ => 0,
+            };
+            let scalar_old = matches!(old_value, ConcreteValue::Scalar(_));
+            let new_bits = match op {
+                crate::insn::AtomicOp::Add => old_bits.wrapping_add(src_bits),
+                crate::insn::AtomicOp::Or => old_bits | src_bits,
+                crate::insn::AtomicOp::And => old_bits & src_bits,
+                crate::insn::AtomicOp::Xor => old_bits ^ src_bits,
+                crate::insn::AtomicOp::Xchg => src_bits,
+                crate::insn::AtomicOp::Cmpxchg => {
+                    if old_bits
+                        == read_concrete_reg(pc, state, 0).map_or(0, |v| match v {
+                            ConcreteValue::Scalar(v) => v,
+                            _ => 0,
+                        })
+                    {
+                        src_bits
+                    } else {
+                        old_bits
+                    }
+                }
+            };
+            let mut next = *state;
+            if let Some((frameno, slot, in_slot)) = target
+                && size.bytes() == 8
+                && in_slot == 0
+                && scalar_old
+            {
+                let stack = concrete_frame_stack_mut(&mut next, frameno);
+                stack[slot] = Some(ConcreteValue::Scalar(new_bits));
+            }
+            if *op == crate::insn::AtomicOp::Cmpxchg {
+                next.regs[0] = Some(old_value);
+            } else if *fetch {
+                next.regs[*src as usize] = Some(old_value);
+            }
+            Ok(next)
+        }
         // legacy packet loads (#136): r0 gets the (bounds-checked at
         // run time) packet bytes; the concrete model has no packet, so
         // the value is the unknown representative 0
@@ -2129,10 +2216,11 @@ fn concrete_map_access(
     match access {
         MapAccess::Store { src } => {
             let value = read_concrete_reg(pc, state, src)?;
-            let ConcreteValue::Scalar(v) = value else {
-                // the kernel rejects pointer stores into map values
-                // ("R%d leaks addr into map")
-                return Err(ConcreteFailure::PointerArithmetic { pc, reg: src });
+            // privileged loaders may store pointers into map values
+            // (allow_ptr_leaks); the cell keeps the address bits
+            let v = match value {
+                ConcreteValue::Scalar(v) => v,
+                other => other.bits(),
             };
             mem.cells.insert(addr, v);
             Ok(vec![(pc + 1, next)])

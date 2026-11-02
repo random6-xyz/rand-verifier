@@ -1,5 +1,6 @@
 {
   "allowed_findings": [
+    "atomic_fetch__000",
     "calls__057",
     "calls__058",
     "calls__061",
@@ -13,13 +14,14 @@
     "precise__001"
   ],
   "counts": {
-    "agree": 113,
+    "agree": 166,
     "inconclusive": 30,
     "kernel-overstrict-candidate": 1,
     "kernel-unsound-candidate": 8,
+    "rv-soundness-bug": 1,
     "soundness-candidate": 2,
-    "surface-gap": 294,
-    "whitelisted": 30
+    "surface-gap": 226,
+    "whitelisted": 44
   },
   "kernel_source": "expected",
   "strict": false
