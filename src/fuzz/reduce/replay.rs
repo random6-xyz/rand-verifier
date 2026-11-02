@@ -160,6 +160,9 @@ impl Invariant {
                     kernel_reason: sides.kernel_reason.as_deref(),
                     strict,
                     spec: sides.spec,
+                    // recorded sides carry no surface-gap marker; a gap
+                    // is never a recorded finding (#131)
+                    surface_gap: None,
                 });
                 if candidate != *finding {
                     return false;
@@ -383,6 +386,7 @@ pub fn replay_check(spec: &FindingSpec, sides: &Sides, strict: bool) -> Result<(
             kernel_reason: sides.kernel_reason.as_deref(),
             strict,
             spec: sides.spec,
+            surface_gap: None,
         });
         if actual != finding {
             return Err(ReduceError::ReplayMismatch {
