@@ -70,7 +70,7 @@ impl SpecFrame {
     /// uninitialized.
     pub(crate) fn main() -> Self {
         let mut regs = [SpecValue::Uninit; 11];
-        regs[1] = SpecValue::PtrToCtx;
+        regs[1] = SpecValue::PtrToCtx { off: 0 };
         regs[10] = SpecValue::PtrToStack { lo: 0, hi: 0 };
         Self {
             regs,
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn frame_initial_state() {
         let f = SpecFrame::main();
-        assert_eq!(f.regs[1], SpecValue::PtrToCtx);
+        assert_eq!(f.regs[1], SpecValue::PtrToCtx { off: 0 });
         assert_eq!(f.regs[10], SpecValue::PtrToStack { lo: 0, hi: 0 });
         assert_eq!(f.regs[0], SpecValue::Uninit);
     }

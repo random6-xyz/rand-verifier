@@ -40,6 +40,8 @@ use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::oracle::{Finding, SurfaceGapKind, classify_env, surface_gap_kind};
 use rand_verifier::klog::ReasonCategory;
 use rand_verifier::krun::referenced_map_fds;
+use rand_verifier::prog_type::ProgType;
+use rand_verifier::spec::{SpecVerdict, verify_spec_with};
 
 #[derive(serde::Deserialize)]
 struct Row {
@@ -102,7 +104,8 @@ fn main() {
         let entry = per_file.entry(row.file.clone()).or_insert((0, 0));
         entry.0 += 1;
 
-        if let Some(kind) = unsupported_prog_type(row) {
+        let prog_type = prog_type_of(row);
+        if let Some(kind) = unsupported_prog_type(prog_type) {
             *counts.entry(Finding::SurfaceGap.name()).or_insert(0) += 1;
             *surface.entry(kind.name().to_string()).or_insert(0) += 1;
             cases.push(serde_json::json!({
@@ -118,6 +121,7 @@ fn main() {
         }
 
         let mut env = BpfVerifierEnv::new();
+        env.set_prog_type(prog_type);
         register_default_maps(&mut env, &bytes);
         if let Err(err) = env.setup_prog_bytes(&bytes) {
             let message = format!("{err:#}");
@@ -201,6 +205,12 @@ fn main() {
         };
         *agreement.entry(agreement_label).or_insert(0) += 1;
 
+        let spec_verdict = verify_spec_with(env.program_insns(), env.maps(), prog_type);
+        let (spec_label, spec_reason) = match &spec_verdict {
+            SpecVerdict::Accept => ("ACCEPT", None),
+            SpecVerdict::Reject(f) => ("REJECT", Some(f.message.clone())),
+            SpecVerdict::Inconclusive => ("INCONCLUSIVE", None),
+        };
         let finding = classify_env(
             &env,
             &row.name,
@@ -228,6 +238,8 @@ fn main() {
             "mini": side_name(&mini_side),
             "mini_reason": mini_reason,
             "concrete": env.concrete_report_text(),
+            "spec": spec_label,
+            "spec_reason": spec_reason,
             "finding": finding.name(),
         }));
     }
@@ -406,14 +418,22 @@ fn side_name(side: &SideVerdict) -> &'static str {
     }
 }
 
-/// Prog types the models do not represent yet: the corpus case is a
-/// surface gap, not a model disagreement (#131).
-fn unsupported_prog_type(row: &Row) -> Option<SurfaceGapKind> {
-    match row.prog_type.as_deref() {
-        None => None,
-        Some("BPF_PROG_TYPE_SOCKET_FILTER") => None,
-        // xdp/sched_cls land with #135
-        Some(_) => Some(SurfaceGapKind::UnmodeledProgType),
+/// The program type of a corpus row: a missing field means the loader's
+/// default (`BPF_PROG_TYPE_SOCKET_FILTER`).
+fn prog_type_of(row: &Row) -> ProgType {
+    row.prog_type
+        .as_deref()
+        .and_then(ProgType::parse)
+        .unwrap_or_default()
+}
+
+/// Prog types without a context model are a surface gap, not a model
+/// disagreement (#131, #135).
+fn unsupported_prog_type(prog_type: ProgType) -> Option<SurfaceGapKind> {
+    if prog_type.ctx_model().is_none() {
+        Some(SurfaceGapKind::UnmodeledProgType)
+    } else {
+        None
     }
 }
 

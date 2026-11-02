@@ -113,6 +113,8 @@ pub(crate) struct ConcreteState {
     pub(crate) saved: [Option<ConcreteFrame>; crate::state::MAX_CALL_FRAMES - 1],
     pub(crate) curframe: u8,
     pub(crate) ret_pc: u32,
+    /// The program type of the run (#135): selects the context model.
+    pub(crate) prog_type: crate::prog_type::ProgType,
 }
 
 /// Clean a concrete state with its pc's liveness masks, mirroring the
@@ -141,7 +143,13 @@ impl ConcreteState {
     /// `initial_reg_state()`: R1 = context pointer, R10 = frame pointer,
     /// everything else (registers and stack) uninitialized. Argument
     /// seeds arrive with helper-call modeling (#51), not at entry.
+    #[cfg_attr(not(test), allow(dead_code))] // tests build the default state
     pub(crate) fn initial() -> Self {
+        Self::initial_with(crate::prog_type::ProgType::SocketFilter)
+    }
+
+    /// [`Self::initial`] for a specific program type (#135).
+    pub(crate) fn initial_with(prog_type: crate::prog_type::ProgType) -> Self {
         let mut regs = [None; NUM_REGS];
         regs[1] = Some(ConcreteValue::CtxPtr(CTX_BASE));
         regs[10] = Some(ConcreteValue::StackPtr {
@@ -154,6 +162,7 @@ impl ConcreteState {
             saved: [None; crate::state::MAX_CALL_FRAMES - 1],
             curframe: 0,
             ret_pc: 0,
+            prog_type,
         }
     }
 
@@ -242,6 +251,11 @@ pub(crate) enum ConcreteFailure {
     /// A memory access outside the map value (mirrors the abstract
     /// "invalid access to map value", #89).
     MapValueOutOfBounds { pc: u32, offset: i64 },
+    /// A context read the model does not represent (a pointer-typed
+    /// field such as `__sk_buff.data`); a surface gap (#135).
+    CtxReadUnsupported { pc: u32, field: &'static str },
+    /// A context access the kernel's `is_valid_access` rejects (#135).
+    InvalidCtxAccess { pc: u32, off: i32, size: u32 },
     /// A helper whose abstract return type has no concrete counterpart
     /// yet (pointer returns). Unreachable for the current corpus —
     /// map_lookup fixtures fail at argument validation.
@@ -309,6 +323,16 @@ impl std::fmt::Display for ConcreteFailure {
                     f,
                     "at insn {}: invalid comparison of r{} with an immediate",
                     pc, dst
+                )
+            }
+            Self::CtxReadUnsupported { pc, field } => {
+                write!(f, "at insn {}: ctx load of unmapped field {}", pc, field)
+            }
+            Self::InvalidCtxAccess { pc, off, size } => {
+                write!(
+                    f,
+                    "at insn {}: invalid bpf_context access off={} size={}",
+                    pc, off, size
                 )
             }
             Self::UnsupportedHelperReturn { pc, imm } => {
@@ -396,7 +420,9 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
             },
             ConcreteValue::StackPtr { addr: v, .. },
         ) => stack_ptr_covers(min_offset, max_offset, align_off, v),
-        (RegState::PtrToCtx, ConcreteValue::CtxPtr(v)) => v == CTX_BASE,
+        (RegState::PtrToCtx { off }, ConcreteValue::CtxPtr(v)) => {
+            v == CTX_BASE.wrapping_add_signed(off as i64)
+        }
         // map pointers (#89): the map object and each value pointer keep
         // their fd/element identity separate from the value-relative offset.
         (RegState::PtrToMap { .. }, ConcreteValue::MapPtr { index: None, .. }) => true,
@@ -434,7 +460,7 @@ pub(crate) fn abstract_covers(reg: RegState, value: ConcreteValue) -> bool {
         // type mismatches are never covered
         (RegState::Scalar(_), _)
         | (RegState::PtrToStack { .. }, _)
-        | (RegState::PtrToCtx, _)
+        | (RegState::PtrToCtx { .. }, _)
         | (RegState::PtrToMap { .. }, _)
         | (RegState::PtrToMapValue { .. }, _)
         | (RegState::PtrToMapValueOrNull { .. }, _)
@@ -820,11 +846,19 @@ fn concrete_alu_imm(
         }
         // context pointer + immediate: ADD/SUB keeps the pointer (the
         // kernel allows ctx arithmetic with a sane offset, #90)
-        ConcreteValue::CtxPtr(_) => {
+        ConcreteValue::CtxPtr(a) => {
             if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
-            Ok(*state)
+            // the ctx address carries the fixed offset (`reg->off`, #135)
+            let addr = if op == AluOp::Add {
+                a.wrapping_add(imm as i64 as u64)
+            } else {
+                a.wrapping_sub(imm as i64 as u64)
+            };
+            let mut next = *state;
+            next.regs[dst as usize] = Some(ConcreteValue::CtxPtr(addr));
+            Ok(next)
         }
         // referenced memory pointers reject arithmetic (the abstract
         // side rejects it first; the concrete mirrors for the
@@ -912,13 +946,19 @@ fn concrete_alu_reg(
         }
         // context pointer + scalar / scalar + context pointer:
         // ADD/SUB keeps (or inherits) the context pointer (#90)
-        (ConcreteValue::CtxPtr(_), ConcreteValue::Scalar(_))
-        | (ConcreteValue::Scalar(_), ConcreteValue::CtxPtr(_)) => {
+        (ConcreteValue::CtxPtr(a), ConcreteValue::Scalar(s))
+        | (ConcreteValue::Scalar(s), ConcreteValue::CtxPtr(a)) => {
             if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
                 return Err(ConcreteFailure::PointerArithmetic { pc, reg: dst });
             }
+            // the ctx address carries the fixed offset (`reg->off`, #135)
+            let addr = if op == AluOp::Add {
+                a.wrapping_add(s)
+            } else {
+                a.wrapping_sub(s)
+            };
             let mut next = *state;
-            next.regs[dst as usize] = Some(ConcreteValue::CtxPtr(CTX_BASE));
+            next.regs[dst as usize] = Some(ConcreteValue::CtxPtr(addr));
             Ok(next)
         }
         // every other combination is pointer arithmetic (#20)
@@ -1215,6 +1255,29 @@ pub(crate) fn concrete_step(
         } => {
             check_concrete_reg(pc, *dst)?;
             let base_value = read_concrete_reg(pc, state, *base)?;
+            // a context read: the program type's table decides (#135)
+            if let ConcreteValue::CtxPtr(addr) = base_value {
+                let off = (addr.wrapping_sub(CTX_BASE) as i64 + *offset as i64) as i32;
+                return match crate::ctx::read(state.prog_type, off, size.bytes() as u32) {
+                    Ok(crate::ctx::CtxAccess::Scalar) => {
+                        let mut next = *state;
+                        // the concrete value of a ctx field is unknown;
+                        // zero is a valid representative inside the
+                        // abstract interval
+                        next.regs[*dst as usize] = Some(ConcreteValue::Scalar(0));
+                        Ok(next)
+                    }
+                    Ok(crate::ctx::CtxAccess::Pointer(field))
+                    | Err(crate::ctx::CtxError::Unmodeled(field)) => {
+                        Err(ConcreteFailure::CtxReadUnsupported { pc, field })
+                    }
+                    Err(crate::ctx::CtxError::Invalid) => Err(ConcreteFailure::InvalidCtxAccess {
+                        pc,
+                        off,
+                        size: size.bytes() as u32,
+                    }),
+                };
+            }
             let frameno = stack_ptr_frameno(pc, *base, base_value)?;
             let offset = stack_ptr_access_offset(pc, *base, base_value, *offset as i32)?;
             let (slot, in_slot) = concrete_stack_range(pc, offset, size.bytes())?;
@@ -1248,6 +1311,8 @@ pub(crate) struct ConcreteLimits {
     /// that keeps producing new states is not converging. Mirrors the
     /// abstract loop budget, so accepted programs terminate before it.
     pub(crate) max_loop_iterations: usize,
+    /// The program type of the run (#135): selects the context model.
+    pub(crate) prog_type: crate::prog_type::ProgType,
 }
 
 impl Default for ConcreteLimits {
@@ -1256,6 +1321,7 @@ impl Default for ConcreteLimits {
             max_states: 1024,
             max_steps: 100_000,
             max_loop_iterations: 256,
+            prog_type: crate::prog_type::ProgType::SocketFilter,
         }
     }
 }
@@ -1325,7 +1391,7 @@ pub(crate) fn run_concrete_with_maps(
 ) -> Result<ConcreteRun, ConcreteFailure> {
     let liveness = analyze(program);
     let mut mem = MapMem::default();
-    let mut worklist = vec![(0u32, ConcreteState::initial())];
+    let mut worklist = vec![(0u32, ConcreteState::initial_with(limits.prog_type))];
     // states already visited at each pc, for exact-state deduplication
     let mut visited: HashMap<u32, Vec<ConcreteState>> = HashMap::new();
     // visit order of the distinct states — the input of #52 (cleaned
@@ -2373,15 +2439,15 @@ mod tests {
     #[test]
     fn ptr_ctx_exact_address() {
         assert!(abstract_covers(
-            RegState::PtrToCtx,
+            RegState::PtrToCtx { off: 0 },
             ConcreteValue::CtxPtr(CTX_BASE)
         ));
         assert!(!abstract_covers(
-            RegState::PtrToCtx,
+            RegState::PtrToCtx { off: 0 },
             ConcreteValue::CtxPtr(CTX_BASE + 1)
         ));
         assert!(!abstract_covers(
-            RegState::PtrToCtx,
+            RegState::PtrToCtx { off: 0 },
             ConcreteValue::CtxPtr(STACK_BASE)
         ));
     }
@@ -2512,7 +2578,7 @@ mod tests {
         };
         assert!(!abstract_covers(reg, ConcreteValue::Scalar(STACK_BASE)));
         assert!(!abstract_covers(
-            RegState::PtrToCtx,
+            RegState::PtrToCtx { off: 0 },
             ConcreteValue::Scalar(CTX_BASE)
         ));
     }
@@ -3119,7 +3185,8 @@ mod tests {
             &BpfInsn::AddImm { dst: 1, imm: 8 },
         )
         .unwrap();
-        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        // the ctx address carries the fixed offset (#135)
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE + 8)));
         let err = concrete_step(
             0,
             &ConcreteState::initial(),
@@ -3131,7 +3198,7 @@ mod tests {
         // the abstract, #90); SUB keeps it too, other ops stay rejected
         let state = run(&[BpfInsn::MovImm { dst: 2, imm: 8 }]);
         let next = concrete_step(1, &state, &BpfInsn::AddReg { dst: 1, src: 2 }).unwrap();
-        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE)));
+        assert_eq!(next.regs[1], Some(ConcreteValue::CtxPtr(CTX_BASE + 8)));
         let err = concrete_step(1, &state, &BpfInsn::XorReg { dst: 1, src: 2 }).unwrap_err();
         assert_eq!(err, ConcreteFailure::PointerArithmetic { pc: 1, reg: 1 });
         // stack pointer + stack pointer

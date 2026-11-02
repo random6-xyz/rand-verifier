@@ -1,10 +1,23 @@
 {
-  "allowed_findings": [],
+  "allowed_findings": [
+    "calls__057",
+    "calls__058",
+    "calls__061",
+    "calls__062",
+    "calls__068",
+    "calls__070",
+    "ctx_skb__004",
+    "precise__000",
+    "precise__001"
+  ],
   "counts": {
-    "agree": 45,
-    "inconclusive": 28,
-    "surface-gap": 399,
-    "whitelisted": 6
+    "agree": 99,
+    "inconclusive": 30,
+    "kernel-overstrict-candidate": 1,
+    "kernel-unsound-candidate": 6,
+    "soundness-candidate": 2,
+    "surface-gap": 315,
+    "whitelisted": 25
   },
   "kernel_source": "expected",
   "strict": false

@@ -79,15 +79,26 @@ impl Default for SpecLimits {
 /// The kernel's arithmetic-time sanity bound (check_reg_sane_offset_*).
 const BPF_MAX_VAR_OFF: i64 = 1 << 29;
 
-/// Verify one program with the safety spec.
+/// Verify one program with the safety spec (socket_filter context).
 pub fn verify_spec(program: &[BpfInsn], maps: &HashMap<u32, MapInfo>) -> SpecVerdict {
-    verify_spec_limited(program, maps, &SpecLimits::default())
+    verify_spec_with(program, maps, crate::prog_type::ProgType::SocketFilter)
+}
+
+/// [`verify_spec`] with the program type that selects the context model
+/// (#135).
+pub fn verify_spec_with(
+    program: &[BpfInsn],
+    maps: &HashMap<u32, MapInfo>,
+    prog_type: crate::prog_type::ProgType,
+) -> SpecVerdict {
+    verify_spec_limited(program, maps, &SpecLimits::default(), prog_type)
 }
 
 pub(crate) fn verify_spec_limited(
     program: &[BpfInsn],
     maps: &HashMap<u32, MapInfo>,
     limits: &SpecLimits,
+    prog_type: crate::prog_type::ProgType,
 ) -> SpecVerdict {
     let loop_heads = compute_loop_heads(program);
     let mut runner = SpecRunner {
@@ -97,6 +108,7 @@ pub(crate) fn verify_spec_limited(
         loop_heads,
         next_ref_id: 0x4000_0000,
         limits: *limits,
+        prog_type,
     };
     runner.run()
 }
@@ -113,6 +125,8 @@ struct SpecRunner<'a> {
     loop_heads: Vec<u32>,
     next_ref_id: u32,
     limits: SpecLimits,
+    /// The program type of the run (#135): selects the ctx model.
+    prog_type: crate::prog_type::ProgType,
 }
 
 /// One worklist item.
@@ -1223,13 +1237,19 @@ impl<'a> SpecRunner<'a> {
                 );
                 Ok(())
             }
-            SpecValue::PtrToCtx => {
-                // ctx += K with a bounded const is allowed; variable
-                // addends are refused (the kernel's BPF_ADD on ctx
-                // requires a constant)
+            SpecValue::PtrToCtx { off } => {
+                // ctx += K with a bounded const is allowed and tracked in
+                // `reg->off`; variable addends are refused (the kernel's
+                // BPF_ADD on ctx requires a constant, #135)
                 if let Some((slo, shi)) = as_signed(a)
                     && slo == shi
                 {
+                    state.set_reg(
+                        dst,
+                        SpecValue::PtrToCtx {
+                            off: off.saturating_add(slo),
+                        },
+                    );
                     Ok(())
                 } else {
                     Err(self.failure(
@@ -1656,6 +1676,40 @@ impl<'a> SpecRunner<'a> {
                 let v = apply_sign(v, bytes, sign_extend);
                 Ok(SpecValue::const_scalar(v))
             }
+            SpecValue::PtrToCtx { off: base_off } => {
+                // context read through the program type's table (#135)
+                let total = base_off.saturating_add(off);
+                let total = i32::try_from(total)
+                    .map_err(|_| self.failure(pc, "context access with an out-of-range offset"))?;
+                match crate::ctx::read(self.prog_type, total, bytes as u32) {
+                    Ok(crate::ctx::CtxAccess::Scalar) => Ok(if sign_extend {
+                        SpecValue::unknown_scalar()
+                    } else {
+                        SpecValue::Scalar {
+                            lo: 0,
+                            hi: width_max(bytes),
+                        }
+                    }),
+                    Ok(crate::ctx::CtxAccess::Pointer(field)) => Err(self.failure(
+                        pc,
+                        format!(
+                            "ctx load of unmapped pointer field {} (prog type {})",
+                            field, self.prog_type
+                        ),
+                    )),
+                    Err(crate::ctx::CtxError::Unmodeled(field)) => Err(self.failure(
+                        pc,
+                        format!(
+                            "ctx load of unmodeled field {} (prog type {})",
+                            field, self.prog_type
+                        ),
+                    )),
+                    Err(crate::ctx::CtxError::Invalid) => Err(self.failure(
+                        pc,
+                        format!("invalid bpf_context access off={total} size={bytes}"),
+                    )),
+                }
+            }
             SpecValue::PtrToMapValue {
                 lo,
                 hi,
@@ -1930,8 +1984,8 @@ impl<'a> SpecRunner<'a> {
                 SpecVerdict::Accept
             }
             (d, s)
-                if matches!(d, SpecValue::PtrToStack { .. } | SpecValue::PtrToCtx)
-                    && matches!(s, SpecValue::PtrToStack { .. } | SpecValue::PtrToCtx) =>
+                if matches!(d, SpecValue::PtrToStack { .. } | SpecValue::PtrToCtx { .. })
+                    && matches!(s, SpecValue::PtrToStack { .. } | SpecValue::PtrToCtx { .. }) =>
             {
                 match cmp {
                     Cmp::Eq => self.push(worklist, target, state),
@@ -2172,6 +2226,15 @@ fn slot_of(abs: i64) -> Option<usize> {
         Some(abs as usize / 8)
     } else {
         None
+    }
+}
+
+/// The largest unsigned value a plain load of `bytes` bytes yields.
+fn width_max(bytes: usize) -> u64 {
+    if bytes >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (bytes * 8)) - 1
     }
 }
 

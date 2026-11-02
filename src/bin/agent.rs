@@ -27,7 +27,7 @@ use std::process;
 
 use rand_verifier::env::{MapInfo, MapType};
 use rand_verifier::krun::{
-    CapMode, KernelOutcome, drop_caps, load_with_kernel_maps_level, referenced_map_fds,
+    CapMode, KernelOutcome, drop_caps, load_with_kernel_maps_typed, referenced_map_fds,
 };
 
 /// Synthetic map registry: every referenced fd maps to the ARRAY
@@ -61,7 +61,7 @@ fn format_kernel_verdict(outcome: &KernelOutcome) -> String {
     }
 }
 
-fn run_program_bytes(data: &[u8]) {
+fn run_program_bytes(data: &[u8], prog_type: u32) {
     let maps = default_maps(data);
     // Full verifier log (level 2) is the default since #142: level 1
     // drops the first error line on errno=28 programs (K-2), which made
@@ -71,12 +71,12 @@ fn run_program_bytes(data: &[u8]) {
         Some("0") => 1,
         _ => 2,
     };
-    let (outcome, log) = load_with_kernel_maps_level(data, &maps, log_level);
+    let (outcome, log) = load_with_kernel_maps_typed(data, &maps, log_level, prog_type);
     // a 4 MiB buffer still runs out on pathological state dumps: retry
     // once with the error-only log so the verdict is never lost
     let (outcome, log) = match outcome {
         KernelOutcome::NoErrorLine { errno: 28 } if log_level > 1 => {
-            let (outcome, log) = load_with_kernel_maps_level(data, &maps, 1);
+            let (outcome, log) = load_with_kernel_maps_typed(data, &maps, 1, prog_type);
             (outcome, log)
         }
         other => (other, log),
@@ -137,12 +137,40 @@ fn main() {
             skip_next = true;
         }
     }
+    // program type axis (#135): `--prog-type <name|id>` or the
+    // AGENT_PROG_TYPE environment variable; per-job `<file>.progtype`
+    // sidecars override both (the host writes them next to the job).
+    let mut prog_type = std::env::var("AGENT_PROG_TYPE")
+        .ok()
+        .and_then(|v| rand_verifier::prog_type::ProgType::parse(&v))
+        .unwrap_or_default()
+        .id();
+    for (i, arg) in rest.iter().enumerate() {
+        if *arg == "--prog-type" {
+            let Some(value) = rest.get(i + 1) else {
+                eprintln!("--prog-type needs a value");
+                process::exit(2);
+            };
+            match rand_verifier::prog_type::ProgType::parse(value) {
+                Some(ty) => prog_type = ty.id(),
+                None => {
+                    eprintln!("unknown --prog-type value {value}");
+                    process::exit(2);
+                }
+            }
+        }
+    }
     let files: Vec<&str> = rest
         .iter()
         .copied()
         .enumerate()
         .filter(|(i, a)| {
-            *a != "--strict" && *a != "--" && *a != "--caps" && !(*i > 0 && rest[i - 1] == "--caps")
+            *a != "--strict"
+                && *a != "--"
+                && *a != "--caps"
+                && *a != "--prog-type"
+                && !(*i > 0 && rest[i - 1] == "--caps")
+                && !(*i > 0 && rest[i - 1] == "--prog-type")
         })
         .map(|(_, a)| a)
         .collect();
@@ -154,10 +182,17 @@ fn main() {
     // privileges: the 9p share can surface host-owned files that the
     // (dropped-privilege) agent cannot open afterwards. Dropping caps
     // is only safe once the bytes are in memory.
-    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut payloads: Vec<(Vec<u8>, u32)> = Vec::new();
     for f in &files {
+        // a `<file>.progtype` sidecar carries the program type of this
+        // job (#135); it wins over the global setting
+        let job_type = fs::read_to_string(format!("{f}.progtype"))
+            .ok()
+            .and_then(|v| rand_verifier::prog_type::ProgType::parse(v.trim()))
+            .map(|t| t.id())
+            .unwrap_or(prog_type);
         match fs::read(f) {
-            Ok(d) => payloads.push(d),
+            Ok(d) => payloads.push((d, job_type)),
             Err(e) => {
                 eprintln!(
                     "cannot-read detail: path={f} errno={}",
@@ -176,8 +211,8 @@ fn main() {
         }
         return;
     }
-    for data in payloads {
-        run_program_bytes(&data);
+    for (data, job_type) in payloads {
+        run_program_bytes(&data, job_type);
     }
 }
 

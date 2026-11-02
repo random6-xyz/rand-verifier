@@ -1,5 +1,6 @@
 // ── Abstract instruction execution and branch expansion ─────────────────────
 
+use crate::ctx::{CtxAccess, CtxError};
 use crate::error::VerificationFailure;
 use crate::helper::{
     check_helper_args, helper_acquires_ref, helper_prototype, helper_releases_ref,
@@ -257,6 +258,15 @@ pub(crate) fn step(
             sign_extend,
         } => {
             check_reg(pc, *dst)?;
+            // a context read: the program type's `is_valid_access` table
+            // decides whether (off, size) names a scalar field (#135)
+            if let RegState::PtrToCtx { off: base_off } = state.regs[*base as usize] {
+                let off = base_off.saturating_add(*offset as i32);
+                let loaded = ctx_read(pc, state.prog_type, off, *size, *sign_extend)?;
+                let mut next = *state;
+                next.regs[*dst as usize] = loaded;
+                return Ok(next);
+            }
             let loaded = stack_read(pc, *base, state, *offset, *size, *sign_extend)?;
             let mut next = *state;
             next.regs[*dst as usize] = loaded;
@@ -557,9 +567,9 @@ fn alu_imm(
             Ok(next)
         }
         // the kernel allows context pointer ADD/SUB with a sane known
-        // offset (adjust_ptr_min_max_vals, PTR_TO_CTX — used for ctx
-        // field access); the offset is not tracked (no ctx loads yet)
-        RegState::PtrToCtx => {
+        // offset (adjust_ptr_min_max_vals, PTR_TO_CTX) and tracks it in
+        // `reg->off`; the context read uses it (#135)
+        RegState::PtrToCtx { off } => {
             if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
                 return Err(VerificationFailure::new(
                     pc,
@@ -567,7 +577,12 @@ fn alu_imm(
                 ));
             }
             check_sane_addend(pc, "ctx", ScalarBounds::constant(imm as i64))?;
-            Ok(*state)
+            let delta = if op == AluOp::Add { imm } else { -imm };
+            let mut next = *state;
+            next.regs[dst as usize] = RegState::PtrToCtx {
+                off: off.saturating_add(delta),
+            };
+            Ok(next)
         }
         RegState::PtrToMap { .. } => Err(VerificationFailure::new(
             pc,
@@ -673,9 +688,11 @@ fn alu_reg(
         );
     }
     // context pointer arithmetic (register form): the kernel allows
-    // ctx ADD/SUB with a sane scalar (adjust_ptr_min_max_vals,
-    // PTR_TO_CTX); the offset is not tracked (no ctx loads yet)
-    if let RegState::PtrToCtx = dst_state {
+    // ctx ADD/SUB with a sane constant scalar and tracks `reg->off`
+    // (#135); a variable addend leaves the access statically
+    // undecidable, so it is refused like the kernel's variable ctx
+    // access.
+    if let RegState::PtrToCtx { off } = dst_state {
         if !matches!(op, AluOp::Add | AluOp::Sub) || width != AluWidth::W64 {
             return Err(VerificationFailure::new(
                 pc,
@@ -684,7 +701,22 @@ fn alu_reg(
         }
         let s = read_scalar(pc, state, src)?;
         check_sane_addend(pc, "ctx", s)?;
-        return Ok(*state);
+        if !s.is_constant() {
+            return Err(VerificationFailure::new(
+                pc,
+                "arithmetic on a context pointer with a variable addend is not allowed",
+            ));
+        }
+        let delta = if op == AluOp::Add {
+            s.smin as i32
+        } else {
+            -(s.smin as i32)
+        };
+        let mut next = *state;
+        next.regs[dst as usize] = RegState::PtrToCtx {
+            off: off.saturating_add(delta),
+        };
+        return Ok(next);
     }
     // map value pointer arithmetic: PtrToMapValue + ScalarRange widens
     // the offset interval; bounds are validated at access time (#89)
@@ -752,10 +784,18 @@ fn alu_reg(
         if let RegState::PtrToMapValue { .. } = read_reg(pc, state, src)? {
             return add_scalar_to_map_value_ptr(pc, dst, read_reg(pc, state, src)?, d, state);
         }
-        if let RegState::PtrToCtx = read_reg(pc, state, src)? {
+        if let RegState::PtrToCtx { off } = read_reg(pc, state, src)? {
             check_sane_addend(pc, "ctx", d)?;
+            if !d.is_constant() {
+                return Err(VerificationFailure::new(
+                    pc,
+                    "arithmetic on a context pointer with a variable addend is not allowed",
+                ));
+            }
             let mut next = *state;
-            next.regs[dst as usize] = RegState::PtrToCtx;
+            next.regs[dst as usize] = RegState::PtrToCtx {
+                off: off.saturating_add(d.smin as i32),
+            };
             return Ok(next);
         }
     }
@@ -1238,6 +1278,51 @@ fn kfunc_call(
         next.regs[reg] = RegState::Uninit;
     }
     Ok(next)
+}
+
+/// A context read (`ldx [r1 + off]`): resolve the field through the
+/// program type's table (#135). Scalar fields yield a zero-extended
+/// scalar of the access width; pointer-typed and unmodelled fields are
+/// reported as surface gaps (the message contains "ctx load" so
+/// [`crate::fuzz::oracle::surface_gap_kind`] classifies them); a
+/// genuinely invalid access mirrors the kernel's wording.
+fn ctx_read(
+    pc: u32,
+    prog_type: crate::prog_type::ProgType,
+    off: i32,
+    size: crate::insn::MemSize,
+    sign_extend: bool,
+) -> Result<RegState, VerificationFailure> {
+    let bytes = size.bytes() as u32;
+    match crate::ctx::read(prog_type, off, bytes) {
+        Ok(CtxAccess::Scalar) => Ok(RegState::Scalar(scalar_for_width(bytes, sign_extend))),
+        Ok(CtxAccess::Pointer(field)) => Err(VerificationFailure::new(
+            pc,
+            format!("ctx load of unmapped pointer field {field} (prog type {prog_type})"),
+        )),
+        Err(CtxError::Unmodeled(field)) => Err(VerificationFailure::new(
+            pc,
+            format!("ctx load of unmodeled field {field} (prog type {prog_type})"),
+        )),
+        Err(CtxError::Invalid) => Err(VerificationFailure::new(
+            pc,
+            format!("invalid bpf_context access off={off} size={bytes}"),
+        )),
+    }
+}
+
+/// The scalar range a `size`-byte load produces: zero-extended for
+/// plain loads, sign-extended for `LDX|MEMSX`.
+fn scalar_for_width(size: u32, sign_extend: bool) -> ScalarBounds {
+    match (size as usize, sign_extend) {
+        (1, false) => ScalarBounds::from_signed(0, u8::MAX as i64),
+        (2, false) => ScalarBounds::from_signed(0, u16::MAX as i64),
+        (4, false) => ScalarBounds::from_signed(0, u32::MAX as i64),
+        (1, true) => ScalarBounds::from_signed(i8::MIN as i64, i8::MAX as i64),
+        (2, true) => ScalarBounds::from_signed(i16::MIN as i64, i16::MAX as i64),
+        (4, true) => ScalarBounds::from_signed(i32::MIN as i64, i32::MAX as i64),
+        _ => ScalarBounds::unknown(),
+    }
 }
 
 fn non_stack_base_error(pc: u32, reg: u8, kind: &str) -> VerificationFailure {
@@ -3800,7 +3885,7 @@ fn cond_branch_impl(
         // pointers of the same type: equality and inequality are allowed
         // without refinement; ordered comparisons on pointers are not
         (RegState::PtrToStack { .. }, RegState::PtrToStack { .. })
-        | (RegState::PtrToCtx, RegState::PtrToCtx)
+        | (RegState::PtrToCtx { .. }, RegState::PtrToCtx { .. })
         | (RegState::PtrToMap { .. }, RegState::PtrToMap { .. })
         | (RegState::PtrToMapValue { .. }, RegState::PtrToMapValue { .. })
         | (RegState::PtrToMapValueOrNull { .. }, RegState::PtrToMapValueOrNull { .. }) => {
@@ -3827,7 +3912,7 @@ fn cond_branch_impl(
         // `.result = ACCEPT` / `.result_unpriv = REJECT`.
         (
             RegState::PtrToStack { .. }
-            | RegState::PtrToCtx
+            | RegState::PtrToCtx { .. }
             | RegState::PtrToMap { .. }
             | RegState::PtrToMapValue { .. }
             | RegState::PtrToMapValueOrNull { .. }
@@ -3837,7 +3922,7 @@ fn cond_branch_impl(
         | (
             RegState::Scalar(_),
             RegState::PtrToStack { .. }
-            | RegState::PtrToCtx
+            | RegState::PtrToCtx { .. }
             | RegState::PtrToMap { .. }
             | RegState::PtrToMapValue { .. }
             | RegState::PtrToMapValueOrNull { .. }
@@ -3886,7 +3971,7 @@ mod tests {
         let next = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 10 }).unwrap();
         assert_eq!(next.regs[2], RegState::Scalar(ScalarBounds::constant(10)));
         // other registers untouched
-        assert_eq!(next.regs[1], RegState::PtrToCtx);
+        assert_eq!(next.regs[1], RegState::PtrToCtx { off: 0 });
         assert_eq!(next.regs[10], ptr_stack(0));
     }
 
@@ -3918,7 +4003,7 @@ mod tests {
     fn step_mov_reg_copies_pointers() {
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::MovReg { dst: 4, src: 1 }).unwrap();
-        assert_eq!(next.regs[4], RegState::PtrToCtx);
+        assert_eq!(next.regs[4], RegState::PtrToCtx { off: 0 });
         let next = step(0, &state, &BpfInsn::MovReg { dst: 5, src: 10 }).unwrap();
         assert_eq!(next.regs[5], ptr_stack(0));
     }
@@ -4056,7 +4141,8 @@ mod tests {
         // adjust_ptr_min_max_vals PTR_TO_CTX); other ops stay rejected
         let state = VerifierState::initial();
         let next = step(0, &state, &BpfInsn::AddImm { dst: 1, imm: 10 }).unwrap();
-        assert_eq!(next.regs[1], RegState::PtrToCtx);
+        // the immediate is tracked in `reg->off` for the ctx read (#135)
+        assert_eq!(next.regs[1], RegState::PtrToCtx { off: 10 });
         let err = step(0, &state, &BpfInsn::XorImm { dst: 1, imm: 10 }).unwrap_err();
         assert!(err.message.contains("context pointer"));
         // an insane offset is rejected (kernel check_reg_sane_offset_*)
@@ -5718,8 +5804,8 @@ mod tests {
 
     #[test]
     fn access_time_non_stack_base_rejected() {
-        // [r1] with R1 = PtrToCtx is not implemented (kernel ctx loads
-        // are out of the subset)
+        // a context read now goes through the program type's table
+        // (#135): an 8-byte read at offset 0 of __sk_buff is invalid
         let state = VerifierState::initial();
         let err = step(
             0,
@@ -5733,7 +5819,11 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.message.contains("non-stack pointer"), "{}", err.message);
+        assert!(
+            err.message.contains("invalid bpf_context access"),
+            "{}",
+            err.message
+        );
         let err = step(
             0,
             &state,
@@ -5746,6 +5836,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("non-stack pointer"), "{}", err.message);
+    }
+
+    #[test]
+    fn ctx_read_uses_the_program_type_table() {
+        use crate::prog_type::ProgType;
+        let sched = VerifierState::initial_with(ProgType::SchedCls);
+        // __sk_buff.len (u32 at 0) → a zero-extended scalar
+        let next = step(
+            0,
+            &sched,
+            &BpfInsn::LdMem {
+                dst: 2,
+                base: 1,
+                offset: 0,
+                size: crate::insn::MemSize::W,
+                sign_extend: false,
+            },
+        )
+        .unwrap();
+        match next.regs[2] {
+            RegState::Scalar(b) => {
+                assert_eq!(b.umin, 0);
+                assert_eq!(b.umax, u32::MAX as u64);
+            }
+            other => panic!("expected a scalar, got {other:?}"),
+        }
+        // `r1 += 4` is tracked in reg->off and moves the field
+        let shifted = step(0, &sched, &BpfInsn::AddImm { dst: 1, imm: 4 }).unwrap();
+        let next = step(
+            1,
+            &shifted,
+            &BpfInsn::LdMem {
+                dst: 2,
+                base: 1,
+                offset: 0,
+                size: crate::insn::MemSize::W,
+                sign_extend: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(next.regs[2], RegState::Scalar(_)));
+        // an 8-byte read of a 4-byte field is invalid for every type
+        let err = step(
+            0,
+            &sched,
+            &BpfInsn::LdMem {
+                dst: 2,
+                base: 1,
+                offset: 0,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("invalid bpf_context access"),
+            "{}",
+            err.message
+        );
+        // pointer-typed fields stay surface gaps, classified as such
+        let xdp = VerifierState::initial_with(ProgType::Xdp);
+        let err = step(
+            0,
+            &xdp,
+            &BpfInsn::LdMem {
+                dst: 2,
+                base: 1,
+                offset: 0,
+                size: crate::insn::MemSize::W,
+                sign_extend: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("ctx load"), "{}", err.message);
+        assert_eq!(
+            crate::fuzz::oracle::surface_gap_kind(&err.message),
+            Some(crate::fuzz::oracle::SurfaceGapKind::UnmodeledCtx)
+        );
+        // tracepoint: any aligned 8-byte-aligned read from offset 8 is ok
+        let tp = VerifierState::initial_with(ProgType::TracePoint);
+        let next = step(
+            0,
+            &tp,
+            &BpfInsn::LdMem {
+                dst: 2,
+                base: 1,
+                offset: 8,
+                size: crate::insn::MemSize::DW,
+                sign_extend: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(next.regs[2], RegState::Scalar(_)));
     }
 
     #[test]
@@ -7114,7 +7297,7 @@ mod tests {
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("uninitialized"), "{}", err.message);
         // a spilled pointer is not readable as a key buffer
-        spill_full(&mut state, 0, RegState::PtrToCtx);
+        spill_full(&mut state, 0, RegState::PtrToCtx { off: 0 });
         let err = step(0, &state, &BpfInsn::Call { imm: 1 }).unwrap_err();
         assert!(err.message.contains("indirect read"), "{}", err.message);
     }

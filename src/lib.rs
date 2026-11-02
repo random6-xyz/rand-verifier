@@ -23,6 +23,7 @@
 
 pub mod cfg;
 pub mod concrete;
+pub mod ctx;
 pub mod diff;
 pub mod env;
 pub mod error;
@@ -34,6 +35,7 @@ pub mod klog;
 pub mod krun;
 pub mod liveness;
 pub mod mini;
+pub mod prog_type;
 #[cfg(feature = "smt")]
 pub mod smt;
 pub mod spec;
