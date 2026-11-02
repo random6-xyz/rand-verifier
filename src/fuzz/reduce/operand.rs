@@ -268,6 +268,10 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::LshImm { dst, .. }
         | BpfInsn::RshImm { dst, .. }
         | BpfInsn::ArshImm { dst, .. }
+        | BpfInsn::MulImm { dst, .. }
+        | BpfInsn::DivImm { dst, .. }
+        | BpfInsn::ModImm { dst, .. }
+        | BpfInsn::Neg { dst, .. }
         | BpfInsn::Add32Imm { dst, .. }
         | BpfInsn::Sub32Imm { dst, .. }
         | BpfInsn::And32Imm { dst, .. }
@@ -276,6 +280,10 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::Lsh32Imm { dst, .. }
         | BpfInsn::Rsh32Imm { dst, .. }
         | BpfInsn::Arsh32Imm { dst, .. }
+        | BpfInsn::Mul32Imm { dst, .. }
+        | BpfInsn::Div32Imm { dst, .. }
+        | BpfInsn::Mod32Imm { dst, .. }
+        | BpfInsn::Neg32 { dst, .. }
         | BpfInsn::LdMem { dst, .. }
         | BpfInsn::LdImm64 { dst, .. }
         | BpfInsn::LdMapFd { dst, .. }
@@ -290,6 +298,9 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::LshReg { dst, src }
         | BpfInsn::RshReg { dst, src }
         | BpfInsn::ArshReg { dst, src }
+        | BpfInsn::MulReg { dst, src, .. }
+        | BpfInsn::DivReg { dst, src }
+        | BpfInsn::ModReg { dst, src }
         | BpfInsn::Add32Reg { dst, src }
         | BpfInsn::Sub32Reg { dst, src }
         | BpfInsn::And32Reg { dst, src }
@@ -297,7 +308,10 @@ fn mark_regs(used: &mut [bool; 11], insn: &BpfInsn) {
         | BpfInsn::Xor32Reg { dst, src }
         | BpfInsn::Lsh32Reg { dst, src }
         | BpfInsn::Rsh32Reg { dst, src }
-        | BpfInsn::Arsh32Reg { dst, src } => {
+        | BpfInsn::Arsh32Reg { dst, src }
+        | BpfInsn::Mul32Reg { dst, src }
+        | BpfInsn::Div32Reg { dst, src }
+        | BpfInsn::Mod32Reg { dst, src } => {
             used[*dst as usize] = true;
             used[*src as usize] = true;
         }

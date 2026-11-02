@@ -42,6 +42,13 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         BpfInsn::RshReg { dst, src } => (opcode::RSH_REG, *dst, *src, 0, 0),
         BpfInsn::ArshImm { dst, imm } => (opcode::ARSH_IMM, *dst, 0, 0, *imm),
         BpfInsn::ArshReg { dst, src } => (opcode::ARSH_REG, *dst, *src, 0, 0),
+        BpfInsn::MulImm { dst, imm, high } => (opcode::MUL_IMM, *dst, 0, high.to_off(), *imm),
+        BpfInsn::MulReg { dst, src, high } => (opcode::MUL_REG, *dst, *src, high.to_off(), 0),
+        BpfInsn::DivImm { dst, imm } => (opcode::DIV_IMM, *dst, 0, 0, *imm),
+        BpfInsn::DivReg { dst, src } => (opcode::DIV_REG, *dst, *src, 0, 0),
+        BpfInsn::ModImm { dst, imm } => (opcode::MOD_IMM, *dst, 0, 0, *imm),
+        BpfInsn::ModReg { dst, src } => (opcode::MOD_REG, *dst, *src, 0, 0),
+        BpfInsn::Neg { dst } => (opcode::NEG, *dst, 0, 0, 0),
         // ALU32
         BpfInsn::Add32Imm { dst, imm } => (opcode::ADD32_IMM, *dst, 0, 0, *imm),
         BpfInsn::Add32Reg { dst, src } => (opcode::ADD32_REG, *dst, *src, 0, 0),
@@ -59,6 +66,13 @@ pub fn encode(insn: &BpfInsn) -> [u8; 8] {
         BpfInsn::Rsh32Reg { dst, src } => (opcode::RSH32_REG, *dst, *src, 0, 0),
         BpfInsn::Arsh32Imm { dst, imm } => (opcode::ARSH32_IMM, *dst, 0, 0, *imm),
         BpfInsn::Arsh32Reg { dst, src } => (opcode::ARSH32_REG, *dst, *src, 0, 0),
+        BpfInsn::Mul32Imm { dst, imm } => (opcode::MUL32_IMM, *dst, 0, 0, *imm),
+        BpfInsn::Mul32Reg { dst, src } => (opcode::MUL32_REG, *dst, *src, 0, 0),
+        BpfInsn::Div32Imm { dst, imm } => (opcode::DIV32_IMM, *dst, 0, 0, *imm),
+        BpfInsn::Div32Reg { dst, src } => (opcode::DIV32_REG, *dst, *src, 0, 0),
+        BpfInsn::Mod32Imm { dst, imm } => (opcode::MOD32_IMM, *dst, 0, 0, *imm),
+        BpfInsn::Mod32Reg { dst, src } => (opcode::MOD32_REG, *dst, *src, 0, 0),
+        BpfInsn::Neg32 { dst } => (opcode::NEG32, *dst, 0, 0, 0),
         // stack accesses — DW only, any base register (#87; the
         // verifier requires a stack pointer at exec time)
         BpfInsn::LdMem {
@@ -230,6 +244,40 @@ alu_k_builder!(xor_imm => XorImm);
 alu_k_builder!(lsh_imm => LshImm);
 alu_k_builder!(rsh_imm => RshImm);
 alu_k_builder!(arsh_imm => ArshImm);
+alu32_k_builder!(div32_imm => Div32Imm);
+alu32_k_builder!(mod32_imm => Mod32Imm);
+alu32_x_builder!(div32_reg => Div32Reg);
+alu32_x_builder!(mod32_reg => Mod32Reg);
+
+/// MUL with the HMUL selector (ALU64 only, #132).
+pub fn mul_imm(dst: u8, imm: i32, high: crate::insn::MulHigh) -> BpfInsn {
+    BpfInsn::MulImm { dst, imm, high }
+}
+
+pub fn mul_reg(dst: u8, src: u8, high: crate::insn::MulHigh) -> BpfInsn {
+    BpfInsn::MulReg { dst, src, high }
+}
+
+pub fn mul32_imm(dst: u8, imm: i32) -> BpfInsn {
+    BpfInsn::Mul32Imm { dst, imm }
+}
+
+pub fn mul32_reg(dst: u8, src: u8) -> BpfInsn {
+    BpfInsn::Mul32Reg { dst, src }
+}
+
+/// BPF_NEG / BPF_NEG32 (#132).
+pub fn neg(dst: u8) -> BpfInsn {
+    BpfInsn::Neg { dst }
+}
+
+pub fn neg32(dst: u8) -> BpfInsn {
+    BpfInsn::Neg32 { dst }
+}
+alu_k_builder!(div_imm => DivImm);
+alu_k_builder!(mod_imm => ModImm);
+alu_x_builder!(div_reg => DivReg);
+alu_x_builder!(mod_reg => ModReg);
 // ALU64 — X forms
 alu_x_builder!(mov_reg => MovReg);
 alu_x_builder!(add_reg => AddReg);
@@ -375,7 +423,14 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::RshImm { .. }
         | BpfInsn::RshReg { .. }
         | BpfInsn::ArshImm { .. }
-        | BpfInsn::ArshReg { .. } => "alu64",
+        | BpfInsn::ArshReg { .. }
+        | BpfInsn::MulImm { .. }
+        | BpfInsn::MulReg { .. }
+        | BpfInsn::DivImm { .. }
+        | BpfInsn::DivReg { .. }
+        | BpfInsn::ModImm { .. }
+        | BpfInsn::ModReg { .. }
+        | BpfInsn::Neg { .. } => "alu64",
         BpfInsn::Add32Imm { .. }
         | BpfInsn::Add32Reg { .. }
         | BpfInsn::Sub32Imm { .. }
@@ -391,7 +446,14 @@ pub fn opcode_family(insn: &BpfInsn) -> &'static str {
         | BpfInsn::Rsh32Imm { .. }
         | BpfInsn::Rsh32Reg { .. }
         | BpfInsn::Arsh32Imm { .. }
-        | BpfInsn::Arsh32Reg { .. } => "alu32",
+        | BpfInsn::Arsh32Reg { .. }
+        | BpfInsn::Mul32Imm { .. }
+        | BpfInsn::Mul32Reg { .. }
+        | BpfInsn::Div32Imm { .. }
+        | BpfInsn::Div32Reg { .. }
+        | BpfInsn::Mod32Imm { .. }
+        | BpfInsn::Mod32Reg { .. }
+        | BpfInsn::Neg32 { .. } => "alu32",
         BpfInsn::Jeq { .. }
         | BpfInsn::JeqImm { .. }
         | BpfInsn::Jne { .. }

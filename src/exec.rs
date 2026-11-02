@@ -22,6 +22,10 @@ pub(crate) enum AluOp {
     Lsh,
     Rsh,
     Arsh,
+    Mul,
+    Div,
+    Mod,
+    Neg,
 }
 
 /// ALU width: ALU64 (full 64-bit) or ALU32 (truncating, zero-extended).
@@ -205,6 +209,23 @@ pub(crate) fn step(
         BpfInsn::Arsh32Reg { dst, src } => {
             alu_reg(pc, state, *dst, *src, AluOp::Arsh, AluWidth::W32)
         }
+        // ALU64 MUL, including the HMUL forms (#132): off selects the
+        // unsigned/signed high half; the kernel folds constants and
+        // marks a variable product unknown.
+        BpfInsn::MulImm { dst, imm, high } => mul_imm(pc, state, *dst, *imm, *high),
+        BpfInsn::MulReg { dst, src, high } => mul_reg(pc, state, *dst, *src, *high),
+        BpfInsn::DivImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Div, AluWidth::W64),
+        BpfInsn::DivReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Div, AluWidth::W64),
+        BpfInsn::ModImm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Mod, AluWidth::W64),
+        BpfInsn::ModReg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Mod, AluWidth::W64),
+        BpfInsn::Neg { dst } => alu_neg(pc, state, *dst, AluWidth::W64),
+        BpfInsn::Mul32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Mul, AluWidth::W32),
+        BpfInsn::Mul32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Mul, AluWidth::W32),
+        BpfInsn::Div32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Div, AluWidth::W32),
+        BpfInsn::Div32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Div, AluWidth::W32),
+        BpfInsn::Mod32Imm { dst, imm } => alu_imm(pc, state, *dst, *imm, AluOp::Mod, AluWidth::W32),
+        BpfInsn::Mod32Reg { dst, src } => alu_reg(pc, state, *dst, *src, AluOp::Mod, AluWidth::W32),
+        BpfInsn::Neg32 { dst } => alu_neg(pc, state, *dst, AluWidth::W32),
         // [base + off] = rY → write the source's state to the stack
         // (#100: partial widths allowed; the kernel's
         // check_stack_write_fixed_off). The base must be a stack
@@ -368,6 +389,107 @@ pub(crate) fn step(
 /// Scalar destinations get the (possibly over-approximated) result range;
 /// stack pointers only support `rX += imm` (#20), and every other pointer
 /// type rejects arithmetic (mirroring the kernel's check_alu_op).
+/// The high half of a 64-bit product (kernel BPF_UHMUL / BPF_SHMUL).
+fn hmul_const(a: u64, b: u64, high: crate::insn::MulHigh) -> u64 {
+    match high {
+        crate::insn::MulHigh::Low => a.wrapping_mul(b),
+        crate::insn::MulHigh::UnsignedHigh => ((u128::from(a) * u128::from(b)) >> 64) as u64,
+        crate::insn::MulHigh::SignedHigh => {
+            (((a as i64 as i128) * (b as i64 as i128)) >> 64) as u64
+        }
+    }
+}
+
+/// ALU64 MUL with the HMUL selector: exact for constants, unknown for a
+/// variable product (the kernel has no range analysis for HMUL yet).
+fn mul_imm(
+    pc: u32,
+    state: &VerifierState,
+    dst: u8,
+    imm: i32,
+    high: crate::insn::MulHigh,
+) -> Result<VerifierState, VerificationFailure> {
+    if high == crate::insn::MulHigh::Low {
+        return alu_imm(pc, state, dst, imm, AluOp::Mul, AluWidth::W64);
+    }
+    check_reg(pc, dst)?;
+    let dst_state = read_reg(pc, state, dst)?;
+    let RegState::Scalar(d) = dst_state else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on pointer r{} is not allowed", dst),
+        ));
+    };
+    let bounds = if d.is_constant() {
+        ScalarBounds::constant(hmul_const(d.smin as u64, imm as u64, high) as i64)
+    } else {
+        ScalarBounds::unknown()
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::Scalar(bounds);
+    Ok(next)
+}
+
+/// ALU64 register MUL with the HMUL selector.
+fn mul_reg(
+    pc: u32,
+    state: &VerifierState,
+    dst: u8,
+    src: u8,
+    high: crate::insn::MulHigh,
+) -> Result<VerifierState, VerificationFailure> {
+    if high == crate::insn::MulHigh::Low {
+        return alu_reg(pc, state, dst, src, AluOp::Mul, AluWidth::W64);
+    }
+    check_reg(pc, dst)?;
+    let dst_state = read_reg(pc, state, dst)?;
+    let src_state = read_reg(pc, state, src)?;
+    let (RegState::Scalar(d), RegState::Scalar(s)) = (dst_state, src_state) else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on pointer r{} is not allowed", dst),
+        ));
+    };
+    let bounds = if d.is_constant() && s.is_constant() {
+        ScalarBounds::constant(hmul_const(d.smin as u64, s.smin as u64, high) as i64)
+    } else {
+        ScalarBounds::unknown()
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::Scalar(bounds);
+    Ok(next)
+}
+
+/// Unary ALU: `rX = -rX` (BPF_NEG). Constants fold exactly; a variable
+/// value gets the full range (the kernel has no neg range rule).
+fn alu_neg(
+    pc: u32,
+    state: &VerifierState,
+    dst: u8,
+    width: AluWidth,
+) -> Result<VerifierState, VerificationFailure> {
+    check_reg(pc, dst)?;
+    let dst_state = read_reg(pc, state, dst)?;
+    let RegState::Scalar(d) = dst_state else {
+        return Err(VerificationFailure::new(
+            pc,
+            format!("arithmetic on pointer r{} is not allowed", dst),
+        ));
+    };
+    let bounds = if d.is_constant() {
+        let bits = match width {
+            AluWidth::W64 => alu_const64(AluOp::Neg, d.smin as u64, 0),
+            AluWidth::W32 => alu_const32(AluOp::Neg, d.smin as u64, 0),
+        };
+        ScalarBounds::constant(bits as i64)
+    } else {
+        ScalarBounds::unknown()
+    };
+    let mut next = *state;
+    next.regs[dst as usize] = RegState::Scalar(bounds);
+    Ok(next)
+}
+
 fn alu_imm(
     pc: u32,
     state: &VerifierState,
@@ -2296,6 +2418,8 @@ fn alu_tnum(op: AluOp, d: Tnum, s: Tnum, amount_min: i64, amount_max: i64) -> Tn
         AluOp::And => d.and(s),
         AluOp::Or => d.or(s),
         AluOp::Xor => d.xor(s),
+        // no kernel tnum rule for mul/div/mod/neg: the result is unknown
+        AluOp::Mul | AluOp::Div | AluOp::Mod | AluOp::Neg => Tnum::unknown(),
         AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => {
             if amount_min != amount_max {
                 Tnum::unknown()
@@ -2323,6 +2447,25 @@ fn alu32_range(op: AluOp, d: (u32, u32), s: (u32, u32)) -> (u32, u32) {
         AluOp::And => (0, d.1.min(s.1)),
         AluOp::Or => (d.0.max(s.0), u32::MAX),
         AluOp::Xor => (0, u32::MAX),
+        AluOp::Mul => {
+            // 32-bit product bounds: [d.0*s.0, d.1*s.1] mod 2^32
+            let lo = u64::from(d.0) * u64::from(s.0);
+            let hi = u64::from(d.1) * u64::from(s.1);
+            interval_mod(lo as i64, hi as i64)
+        }
+        // a divisor that may be zero makes the result unbounded
+        AluOp::Div => match d.1.checked_div(s.0) {
+            Some(hi) => (d.0 / s.1.max(1), hi),
+            None => (0, u32::MAX),
+        },
+        AluOp::Mod => {
+            if s.0 == 0 {
+                (0, u32::MAX)
+            } else {
+                (0, s.1.saturating_sub(1))
+            }
+        }
+        AluOp::Neg => (0, u32::MAX),
         AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift32_range(op, d, s),
     }
 }
@@ -2398,6 +2541,12 @@ pub(crate) fn alu_const64(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::And => a & b,
         AluOp::Or => a | b,
         AluOp::Xor => a ^ b,
+        AluOp::Mul => a.wrapping_mul(b),
+        // interpreter semantics: DIV by zero yields 0, MOD by zero
+        // leaves the destination unchanged
+        AluOp::Div => a.checked_div(b).unwrap_or(0),
+        AluOp::Mod => a.checked_rem(b).unwrap_or(a),
+        AluOp::Neg => a.wrapping_neg(),
         // hardware semantics: the shift amount is masked (count & 63),
         // which is also what the kernel's JIT/interpreter does
         AluOp::Lsh => a.wrapping_shl(b as u32),
@@ -2417,6 +2566,10 @@ pub(crate) fn alu_const32(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::And => a & b,
         AluOp::Or => a | b,
         AluOp::Xor => a ^ b,
+        AluOp::Mul => a.wrapping_mul(b),
+        AluOp::Div => a.checked_div(b).unwrap_or(0),
+        AluOp::Mod => a.checked_rem(b).unwrap_or(a),
+        AluOp::Neg => a.wrapping_neg(),
         // hardware semantics: 32-bit shifts mask the amount (& 31)
         AluOp::Lsh => a.wrapping_shl(b & 31),
         AluOp::Rsh => a.wrapping_shr(b & 31),
@@ -2486,6 +2639,40 @@ fn alu64_signed(op: AluOp, d: (i64, i64), s: (i64, i64)) -> (i64, i64) {
                 (i64::MIN, i64::MAX)
             }
         }
+        // product range: exact when every endpoint product fits i64,
+        // otherwise the full range (wrapped products are not an interval)
+        AluOp::Mul => {
+            let products = [
+                (dmin as i128) * (smin as i128),
+                (dmin as i128) * (smax as i128),
+                (dmax as i128) * (smin as i128),
+                (dmax as i128) * (smax as i128),
+            ];
+            let mut lo = i128::MAX;
+            let mut hi = i128::MIN;
+            for p in products {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            if lo < i64::MIN as i128 || hi > i64::MAX as i128 {
+                (i64::MIN, i64::MAX)
+            } else {
+                (lo as i64, hi as i64)
+            }
+        }
+        // division is not monotone and can overflow (i64::MIN / -1):
+        // only the constant fold above is exact
+        AluOp::Div => (i64::MIN, i64::MAX),
+        // |a % b| < |b| when b is a known constant; otherwise unbounded
+        AluOp::Mod => {
+            if smin == smax && smin != 0 {
+                let bound = smin.unsigned_abs().saturating_sub(1) as i64;
+                (-bound, bound)
+            } else {
+                (i64::MIN, i64::MAX)
+            }
+        }
+        AluOp::Neg => (i64::MIN, i64::MAX),
         AluOp::Lsh | AluOp::Rsh | AluOp::Arsh => shift64_range(op, dmin, dmax, smin, smax),
     }
 }
@@ -2518,6 +2705,38 @@ fn alu64_unsigned(op: AluOp, d: (u64, u64), s: (u64, u64)) -> (u64, u64) {
         AluOp::And => (0, dmax.min(smax)),
         AluOp::Or => (dmin.max(smin), u64::MAX),
         AluOp::Xor => (0, u64::MAX),
+        AluOp::Mul => {
+            let products = [
+                u128::from(dmin) * u128::from(smin),
+                u128::from(dmin) * u128::from(smax),
+                u128::from(dmax) * u128::from(smin),
+                u128::from(dmax) * u128::from(smax),
+            ];
+            let mut lo = u128::MAX;
+            let mut hi = 0u128;
+            for p in products {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            if hi > u128::from(u64::MAX) {
+                (0, u64::MAX)
+            } else {
+                (lo as u64, hi as u64)
+            }
+        }
+        // a divisor range that includes zero has no bounded quotient
+        AluOp::Div => match dmax.checked_div(smin) {
+            Some(hi) => (dmin / smax.max(1), hi),
+            None => (0, u64::MAX),
+        },
+        AluOp::Mod => {
+            if smin == 0 {
+                (0, u64::MAX)
+            } else {
+                (0, smax - 1)
+            }
+        }
+        AluOp::Neg => (0, u64::MAX),
         AluOp::Lsh => {
             if smin == smax && dmax <= (u64::MAX >> smin as u32) {
                 (dmin << smin as u32, dmax << smin as u32)
@@ -3860,6 +4079,112 @@ mod tests {
         };
         assert_eq!(b.signed(), (-2, -2));
         assert_eq!(b.unsigned(), (u64::MAX - 1, u64::MAX - 1));
+    }
+
+    /// #132: MUL/DIV/MOD/NEG fold constants exactly and stay
+    /// conservative for variable operands.
+    #[test]
+    fn step_alu_mul_div_mod_neg() {
+        let state = VerifierState::initial();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 6 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::MulImm {
+                dst: 1,
+                imm: 7,
+                high: crate::insn::MulHigh::Low,
+            },
+        )
+        .unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.unsigned(), (42, 42));
+
+        // div/mod by a constant fold exactly
+        let next = step(0, &state, &BpfInsn::DivImm { dst: 1, imm: 4 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.unsigned(), (1, 1));
+        let next = step(0, &state, &BpfInsn::ModImm { dst: 1, imm: 4 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.unsigned(), (2, 2));
+
+        // NEG wraps: -6 in u64 space
+        let next = step(0, &state, &BpfInsn::Neg { dst: 1 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.signed(), (-6, -6));
+
+        // register form: r1 = 100 / r2 = 3 folds exactly
+        let state = step(0, &state, &BpfInsn::Call { imm: 7 }).unwrap();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: 100 }).unwrap();
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 2, imm: 3 }).unwrap();
+        let next = step(0, &state, &BpfInsn::DivReg { dst: 1, src: 2 }).unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.unsigned(), (33, 33));
+    }
+
+    /// HMUL: constants fold to the high half; a variable product is
+    /// unknown (kernel c9ec5e4256c1).
+    #[test]
+    fn step_hmul_folds_constants_and_widens_variables() {
+        let state = VerifierState::initial();
+        // r1 = -1 (u64::MAX)
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::MulImm {
+                dst: 1,
+                imm: -1,
+                high: crate::insn::MulHigh::UnsignedHigh,
+            },
+        )
+        .unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        // (2^64-1)^2 >> 64 == 2^64 - 2
+        assert_eq!(b.unsigned(), (u64::MAX - 1, u64::MAX - 1));
+
+        // signed high half of (-1) * (-1) is 0
+        let state = step(0, &state, &BpfInsn::MovImm { dst: 1, imm: -1 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::MulImm {
+                dst: 1,
+                imm: -1,
+                high: crate::insn::MulHigh::SignedHigh,
+            },
+        )
+        .unwrap();
+        let RegState::Scalar(b) = next.regs[1] else {
+            panic!("expected scalar")
+        };
+        assert_eq!(b.unsigned(), (0, 0));
+
+        // a variable product is the full unknown
+        let state = step(0, &state, &BpfInsn::Call { imm: 7 }).unwrap();
+        let next = step(
+            0,
+            &state,
+            &BpfInsn::MulReg {
+                dst: 0,
+                src: 0,
+                high: crate::insn::MulHigh::UnsignedHigh,
+            },
+        )
+        .unwrap();
+        assert_eq!(next.regs[0], RegState::Scalar(ScalarBounds::unknown()));
     }
 
     #[test]

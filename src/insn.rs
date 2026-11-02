@@ -34,6 +34,13 @@ pub(crate) mod opcode {
     pub const RSH_REG: u8 = 0x7f;
     pub const ARSH_IMM: u8 = 0xc7;
     pub const ARSH_REG: u8 = 0xcf;
+    pub const MUL_IMM: u8 = 0x27;
+    pub const MUL_REG: u8 = 0x2f;
+    pub const DIV_IMM: u8 = 0x37;
+    pub const DIV_REG: u8 = 0x3f;
+    pub const MOD_IMM: u8 = 0x97;
+    pub const MOD_REG: u8 = 0x9f;
+    pub const NEG: u8 = 0x87;
 
     // ALU32 (class 0x04)
     pub const ADD32_IMM: u8 = 0x04;
@@ -52,6 +59,13 @@ pub(crate) mod opcode {
     pub const RSH32_REG: u8 = 0x7c;
     pub const ARSH32_IMM: u8 = 0xc4;
     pub const ARSH32_REG: u8 = 0xcc;
+    pub const MUL32_IMM: u8 = 0x24;
+    pub const MUL32_REG: u8 = 0x2c;
+    pub const DIV32_IMM: u8 = 0x34;
+    pub const DIV32_REG: u8 = 0x3c;
+    pub const MOD32_IMM: u8 = 0x94;
+    pub const MOD32_REG: u8 = 0x9c;
+    pub const NEG32: u8 = 0x84;
 
     // loads/stores — 8-byte (DW) accesses with the frame pointer as
     // the base register (#100 adds the partial widths); the decode
@@ -108,6 +122,38 @@ impl MemSize {
     }
 }
 
+/// The `off` selector of an ALU64 MUL (kernel `BPF_UHMUL`/`BPF_SHMUL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MulHigh {
+    /// `off == 0`: the low 64 bits of the product.
+    #[default]
+    Low,
+    /// `off == 1` (BPF_UHMUL): the unsigned high half.
+    UnsignedHigh,
+    /// `off == 2` (BPF_SHMUL): the signed high half.
+    SignedHigh,
+}
+
+impl MulHigh {
+    /// Decode the `off` selector; `None` is a reserved off value.
+    pub fn from_off(off: i16) -> Option<Self> {
+        match off {
+            0 => Some(MulHigh::Low),
+            1 => Some(MulHigh::UnsignedHigh),
+            2 => Some(MulHigh::SignedHigh),
+            _ => None,
+        }
+    }
+
+    pub fn to_off(self) -> i16 {
+        match self {
+            MulHigh::Low => 0,
+            MulHigh::UnsignedHigh => 1,
+            MulHigh::SignedHigh => 2,
+        }
+    }
+}
+
 /// The supported eBPF subset, decoded from the kernel encoding (see
 /// [`opcode`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +166,65 @@ pub enum BpfInsn {
     MovReg {
         dst: u8,
         src: u8,
+    },
+    /// ALU64 MUL with the HMUL selector in `off` (kernel `c9ec5e4256c1`):
+    /// `off == 0` is the low half, 1 the unsigned high half (UHMUL),
+    /// 2 the signed high half (SHMUL). ALU32 MUL must keep `off == 0`.
+    MulImm {
+        dst: u8,
+        imm: i32,
+        high: MulHigh,
+    },
+    MulReg {
+        dst: u8,
+        src: u8,
+        high: MulHigh,
+    },
+    DivImm {
+        dst: u8,
+        imm: i32,
+    },
+    DivReg {
+        dst: u8,
+        src: u8,
+    },
+    ModImm {
+        dst: u8,
+        imm: i32,
+    },
+    ModReg {
+        dst: u8,
+        src: u8,
+    },
+    Neg {
+        dst: u8,
+    },
+    Mul32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Mul32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Div32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Div32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Mod32Imm {
+        dst: u8,
+        imm: i32,
+    },
+    Mod32Reg {
+        dst: u8,
+        src: u8,
+    },
+    Neg32 {
+        dst: u8,
     },
     // ALU64
     AddImm {
@@ -496,6 +601,9 @@ pub enum DecodeError {
     /// A `BPF_LD|BPF_DW|BPF_IMM` first slot without its second slot
     /// (kernel: "invalid bpf_ldimm64 insn").
     LdImm64Truncated,
+    /// `BPF_DIV`/`BPF_MOD` with an immediate zero divisor (kernel:
+    /// "div by zero" in check_alu_op).
+    DivisionByZero,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -516,6 +624,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::LdImm64Truncated => {
                 write!(f, "invalid bpf_ldimm64 insn (missing second slot)")
             }
+            DecodeError::DivisionByZero => write!(f, "div by zero"),
         }
     }
 }
@@ -559,6 +668,20 @@ fn is_supported_alu(op: u8) -> bool {
             | opcode::RSH32_REG
             | opcode::ARSH32_IMM
             | opcode::ARSH32_REG
+            | opcode::MUL_IMM
+            | opcode::MUL_REG
+            | opcode::DIV_IMM
+            | opcode::DIV_REG
+            | opcode::MOD_IMM
+            | opcode::MOD_REG
+            | opcode::NEG
+            | opcode::MUL32_IMM
+            | opcode::MUL32_REG
+            | opcode::DIV32_IMM
+            | opcode::DIV32_REG
+            | opcode::MOD32_IMM
+            | opcode::MOD32_REG
+            | opcode::NEG32
     )
 }
 
@@ -580,8 +703,6 @@ fn unsupported_reason(op: u8) -> Option<&'static str> {
         0x03 => Some("only 8-byte stores to the stack frame are implemented"),
         // BPF_ALU / BPF_ALU64
         0x04 | 0x07 => match op & 0xf0 {
-            0x20 | 0x30 | 0x90 => Some("MUL/DIV/MOD are not implemented"),
-            0x80 => Some("BPF_NEG is not implemented"),
             0xd0 => Some("BPF_END is not implemented"),
             0xb0 => Some("32-bit MOV (BPF_ALU | BPF_MOV) is not implemented"),
             _ => None,
@@ -635,7 +756,18 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
         // which are implemented here)
         _ if is_supported_alu(op) => {
             let is_x = op & 0x08 != 0; // the kernel's BPF_SRC bit
-            if (is_x && imm != 0) || (!is_x && src != 0) || offset != 0 {
+            // ALU64 MUL carries the HMUL selector in `off` (kernel
+            // c9ec5e4256c1); every other ALU op requires off == 0 and
+            // ALU32 MUL keeps the field reserved.
+            let mul64 = matches!(op, opcode::MUL_IMM | opcode::MUL_REG);
+            let high = if mul64 {
+                MulHigh::from_off(offset)
+            } else if offset == 0 {
+                Some(MulHigh::Low)
+            } else {
+                None
+            };
+            if (is_x && imm != 0) || (!is_x && src != 0) || high.is_none() {
                 let message = if op == opcode::MOV_IMM || op == opcode::MOV_REG {
                     "BPF_MOV uses reserved fields"
                 } else {
@@ -643,6 +775,14 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 };
                 return Err(DecodeError::ReservedFields { message });
             }
+            if matches!(
+                op,
+                opcode::DIV_IMM | opcode::MOD_IMM | opcode::DIV32_IMM | opcode::MOD32_IMM
+            ) && imm == 0
+            {
+                return Err(DecodeError::DivisionByZero);
+            }
+            let high = high.expect("checked above");
             Ok(match op {
                 opcode::MOV_IMM => BpfInsn::MovImm { dst, imm },
                 opcode::MOV_REG => BpfInsn::MovReg { dst, src },
@@ -678,6 +818,20 @@ pub fn parse_insn(bytes: &[u8]) -> Result<BpfInsn, DecodeError> {
                 opcode::RSH32_REG => BpfInsn::Rsh32Reg { dst, src },
                 opcode::ARSH32_IMM => BpfInsn::Arsh32Imm { dst, imm },
                 opcode::ARSH32_REG => BpfInsn::Arsh32Reg { dst, src },
+                opcode::MUL_IMM => BpfInsn::MulImm { dst, imm, high },
+                opcode::MUL_REG => BpfInsn::MulReg { dst, src, high },
+                opcode::DIV_IMM => BpfInsn::DivImm { dst, imm },
+                opcode::DIV_REG => BpfInsn::DivReg { dst, src },
+                opcode::MOD_IMM => BpfInsn::ModImm { dst, imm },
+                opcode::MOD_REG => BpfInsn::ModReg { dst, src },
+                opcode::NEG => BpfInsn::Neg { dst },
+                opcode::MUL32_IMM => BpfInsn::Mul32Imm { dst, imm },
+                opcode::MUL32_REG => BpfInsn::Mul32Reg { dst, src },
+                opcode::DIV32_IMM => BpfInsn::Div32Imm { dst, imm },
+                opcode::DIV32_REG => BpfInsn::Div32Reg { dst, src },
+                opcode::MOD32_IMM => BpfInsn::Mod32Imm { dst, imm },
+                opcode::MOD32_REG => BpfInsn::Mod32Reg { dst, src },
+                opcode::NEG32 => BpfInsn::Neg32 { dst },
                 _ => unreachable!("is_supported_alu covered the opcode"),
             })
         }
@@ -982,6 +1136,28 @@ pub fn disassemble(insn: &BpfInsn) -> String {
         BpfInsn::Rsh32Reg { dst, src } => format!("w{} >>= r{}", dst, src),
         BpfInsn::Arsh32Imm { dst, imm } => format!("w{} s>>= {}", dst, imm),
         BpfInsn::Arsh32Reg { dst, src } => format!("w{} s>>= r{}", dst, src),
+        BpfInsn::MulImm { dst, imm, high } => match high {
+            MulHigh::Low => format!("r{} *= {}", dst, imm),
+            MulHigh::UnsignedHigh => format!("r{} = uhmul(r{}, {})", dst, dst, imm),
+            MulHigh::SignedHigh => format!("r{} = shmul(r{}, {})", dst, dst, imm),
+        },
+        BpfInsn::MulReg { dst, src, high } => match high {
+            MulHigh::Low => format!("r{} *= r{}", dst, src),
+            MulHigh::UnsignedHigh => format!("r{} = uhmul(r{}, r{})", dst, dst, src),
+            MulHigh::SignedHigh => format!("r{} = shmul(r{}, r{})", dst, dst, src),
+        },
+        BpfInsn::DivImm { dst, imm } => format!("r{} /= {}", dst, imm),
+        BpfInsn::DivReg { dst, src } => format!("r{} /= r{}", dst, src),
+        BpfInsn::ModImm { dst, imm } => format!("r{} %= {}", dst, imm),
+        BpfInsn::ModReg { dst, src } => format!("r{} %= r{}", dst, src),
+        BpfInsn::Neg { dst } => format!("r{} = -r{}", dst, dst),
+        BpfInsn::Mul32Imm { dst, imm } => format!("w{} *= {}", dst, imm),
+        BpfInsn::Mul32Reg { dst, src } => format!("w{} *= w{}", dst, src),
+        BpfInsn::Div32Imm { dst, imm } => format!("w{} /= {}", dst, imm),
+        BpfInsn::Div32Reg { dst, src } => format!("w{} /= w{}", dst, src),
+        BpfInsn::Mod32Imm { dst, imm } => format!("w{} %= {}", dst, imm),
+        BpfInsn::Mod32Reg { dst, src } => format!("w{} %= w{}", dst, src),
+        BpfInsn::Neg32 { dst } => format!("w{} = -w{}", dst, dst),
         BpfInsn::LdMem {
             dst,
             base,
@@ -1666,10 +1842,6 @@ mod tests {
             (0xc2, "BPF_ST"),
             // BPF_JMP32|BPF_JA
             (0x06, "BPF_JMP32"),
-            // BPF_ALU64|BPF_MUL|BPF_K
-            (0x27, "MUL"),
-            // BPF_ALU|BPF_NEG
-            (0x84, "BPF_NEG"),
             // BPF_ALU64|BPF_END
             (0xd7, "BPF_END"),
             // BPF_ALU|BPF_MOV|BPF_K (32-bit MOV)
@@ -1698,6 +1870,76 @@ mod tests {
                 needle
             );
         }
+    }
+
+    /// #132: MUL decodes with the HMUL selector in `off`; ALU32 MUL and
+    /// the other ALU ops keep the field reserved; `div by zero` is a
+    /// decode rejection.
+    #[test]
+    fn parse_insn_mul_div_mod_neg() {
+        assert!(matches!(
+            parse(opcode::MUL_IMM, 1, 0, 0, 7),
+            BpfInsn::MulImm {
+                dst: 1,
+                imm: 7,
+                high: MulHigh::Low
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::MUL_REG, 2, 3, 1, 0),
+            BpfInsn::MulReg {
+                dst: 2,
+                src: 3,
+                high: MulHigh::UnsignedHigh
+            }
+        ));
+        assert!(matches!(
+            parse(opcode::MUL_REG, 2, 3, 2, 0),
+            BpfInsn::MulReg {
+                high: MulHigh::SignedHigh,
+                ..
+            }
+        ));
+        // off > 2 is reserved
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::MUL_IMM, 1, 0, 3, 7)),
+            Err(DecodeError::ReservedFields { .. })
+        ));
+        // ALU32 MUL keeps off reserved
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::MUL32_IMM, 1, 0, 1, 7)),
+            Err(DecodeError::ReservedFields { .. })
+        ));
+        // div/mod by an immediate zero
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::DIV_IMM, 1, 0, 0, 0)),
+            Err(DecodeError::DivisionByZero)
+        ));
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::MOD_IMM, 1, 0, 0, 0)),
+            Err(DecodeError::DivisionByZero)
+        ));
+        assert!(matches!(
+            parse(opcode::DIV_IMM, 1, 0, 0, 3),
+            BpfInsn::DivImm { dst: 1, imm: 3 }
+        ));
+        assert!(matches!(
+            parse(opcode::MOD32_REG, 1, 2, 0, 0),
+            BpfInsn::Mod32Reg { dst: 1, src: 2 }
+        ));
+        assert!(matches!(
+            parse(opcode::NEG, 1, 0, 0, 0),
+            BpfInsn::Neg { dst: 1 }
+        ));
+        assert!(matches!(
+            parse(opcode::NEG32, 1, 0, 0, 0),
+            BpfInsn::Neg32 { dst: 1 }
+        ));
+        // NEG has no source register
+        assert!(matches!(
+            parse_insn(&insn_bytes(opcode::NEG, 1, 2, 0, 0)),
+            Err(DecodeError::ReservedFields { .. })
+        ));
     }
 
     #[test]
