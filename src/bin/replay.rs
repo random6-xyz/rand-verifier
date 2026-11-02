@@ -227,6 +227,7 @@ fn main() {
             "kernel_reason": kernel_reason,
             "mini": side_name(&mini_side),
             "mini_reason": mini_reason,
+            "concrete": env.concrete_report_text(),
             "finding": finding.name(),
         }));
     }

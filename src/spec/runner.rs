@@ -1940,6 +1940,16 @@ impl<'a> SpecRunner<'a> {
                 }
                 SpecVerdict::Accept
             }
+            // A pointer compared with an arbitrary scalar is allowed for
+            // privileged loaders (allow_ptr_leaks); the unprivileged
+            // kernel rejects it with "R%d pointer comparison prohibited"
+            // (verifier/jump.c, #143). No refinement: the comparison is
+            // not statically decidable.
+            (d, s) if (d.is_pointer() && s.is_scalar()) || (d.is_scalar() && s.is_pointer()) => {
+                self.push(worklist, target, state);
+                self.push(worklist, pc + 1, state);
+                SpecVerdict::Accept
+            }
             // comparing a pointer to a non-null scalar or a different
             // kind: refuse (kernel "same type check failed")
             _ => self.failure(pc, "comparing different pointer kinds is not allowed"),
