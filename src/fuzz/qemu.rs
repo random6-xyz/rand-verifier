@@ -19,6 +19,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::diff::SideVerdict;
 use crate::klog::categorize_reason;
@@ -85,6 +87,8 @@ touch /mnt/host/batch-done
 pub struct QemuBatch {
     tx: std::sync::mpsc::Sender<QemuJob>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// Batches that needed the one-shot retry (#142).
+    retries: Arc<AtomicUsize>,
 }
 
 /// One kernel query: program bytes + a channel the worker replies on.
@@ -98,11 +102,20 @@ impl QemuBatch {
     pub fn new(dir: PathBuf, strict: bool) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_dir = dir.clone();
-        let handle = std::thread::spawn(move || qemu_worker(worker_dir, strict, rx));
+        let retries = Arc::new(AtomicUsize::new(0));
+        let worker_retries = Arc::clone(&retries);
+        let handle =
+            std::thread::spawn(move || qemu_worker(worker_dir, strict, rx, worker_retries));
         Self {
             tx,
             handle: Some(handle),
+            retries,
         }
+    }
+
+    /// How many batches needed the one-shot consume retry (#142).
+    pub fn retries(&self) -> usize {
+        self.retries.load(Ordering::Relaxed)
     }
 
     /// Queue one program and block until the guest kernel verdict is
@@ -149,28 +162,33 @@ impl Drop for QemuBatch {
 
 /// Worker thread: collect queries, flush them to the guest in batches,
 /// and deliver every verdict to its query channel.
-fn qemu_worker(dir: PathBuf, strict: bool, rx: std::sync::mpsc::Receiver<QemuJob>) {
+fn qemu_worker(
+    dir: PathBuf,
+    strict: bool,
+    rx: std::sync::mpsc::Receiver<QemuJob>,
+    retries: Arc<AtomicUsize>,
+) {
     let mut pending: Vec<QemuJob> = Vec::new();
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(30)) {
             Ok((name, bytes, resp)) => {
                 if name == "__flush__" {
-                    flush_batch(&dir, strict, &mut pending);
+                    flush_batch(&dir, strict, &mut pending, &retries);
                     let _ = resp.send(Ok((SideVerdict::Accept, None, None)));
                 } else {
                     pending.push((name, bytes, resp));
                     if pending.len() >= QEMU_BATCH {
-                        flush_batch(&dir, strict, &mut pending);
+                        flush_batch(&dir, strict, &mut pending, &retries);
                     }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
-                    flush_batch(&dir, strict, &mut pending);
+                    flush_batch(&dir, strict, &mut pending, &retries);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                flush_batch(&dir, strict, &mut pending);
+                flush_batch(&dir, strict, &mut pending, &retries);
                 break;
             }
         }
@@ -178,7 +196,11 @@ fn qemu_worker(dir: PathBuf, strict: bool, rx: std::sync::mpsc::Receiver<QemuJob
 }
 
 /// Send one batch to the guest and deliver the parsed verdicts.
-fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
+///
+/// A batch the guest did not fully consume (9p readdir races, a slow
+/// tail) is retried once with only the missing jobs (#142). The retry
+/// count is exposed for the campaign summary.
+fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>, retries: &AtomicUsize) {
     if pending.is_empty() {
         return;
     }
@@ -187,13 +209,6 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
     if fs::create_dir_all(&job).is_err() || fs::create_dir_all(&out).is_err() {
         fail_all(pending, "qemu: cannot create share dirs");
         return;
-    }
-    // strict mode is signalled to the guest via a marker file
-    let strict_marker = dir.join("strict");
-    if strict {
-        let _ = fs::write(&strict_marker, b"1");
-    } else {
-        let _ = fs::remove_file(&strict_marker);
     }
 
     // wait until the guest consumed the previous batch: job/ empty AND
@@ -212,75 +227,50 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // stale markers from a previous batch would make the guest re-run
-    // the old run.sh, so clear them before writing anything
-    let _ = fs::remove_file(dir.join("batch-ready"));
-    let _ = fs::remove_file(dir.join("run.sh"));
-    let _ = fs::remove_file(dir.join("manifest"));
-    clear_dir(&out);
 
-    // write the batch: job files, then a manifest listing them, then
-    // the run script + batch-ready marker. The guest reads the
-    // manifest by path (reliable) instead of globbing job/ (9p
-    // readdir can lag and miss fresh files).
-    let mut ok = true;
-    let mut manifest = String::new();
-    for (name, bytes, _) in pending.iter() {
-        let p = job.join(format!("{name}.bin"));
-        if fs::write(&p, bytes).is_err() {
-            ok = false;
-            break;
-        }
-        // security_model=none can surface host files to the guest with
-        // ownership the guest cannot read even as root (EACCES); force
-        // world-read/write so the guest agent can always open them.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o666));
-        }
-        manifest.push_str(name);
-        manifest.push('\n');
-    }
-    if ok {
-        ok = fs::write(dir.join("manifest"), manifest.as_bytes()).is_ok();
-    }
-    if ok {
-        ok = fs::write(dir.join("run.sh"), QEMU_RUN_SCRIPT).is_ok();
-    }
-    // batch-ready tells the guest that every job/*.bin and the
-    // manifest are on disk. The guest only runs run.sh when
-    // batch-ready exists, so it never sees a half-written batch.
-    if ok {
-        // give the 9p server a moment to settle the freshly written
-        // files (metadata/ownership) before the guest opens them;
-        // opening too early surfaced as EACCES (errno=13) even for
-        // world-readable files.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        ok = fs::write(dir.join("batch-ready"), b"1").is_ok();
-    }
-    if !ok {
+    let jobs: Vec<(String, Vec<u8>)> = pending
+        .iter()
+        .map(|(name, bytes, _)| (name.clone(), bytes.clone()))
+        .collect();
+    let names: Vec<String> = jobs.iter().map(|(name, _)| name.clone()).collect();
+    if !write_batch(dir, strict, &jobs, true) {
         fail_all(pending, "qemu: cannot write batch");
         return;
     }
-    // poll until every job has its result AND the guest consumed the
-    // whole batch (job files gone). We do NOT stop on batch-done alone:
-    // the guest touches it after its glob loop, which can finish with
-    // job files still present if 9p showed a stale empty directory —
-    // stopping then would strand those jobs. Waiting for every out
-    // file instead gives the guest's retry globs time to pick up
-    // stragglers.
-    let want = pending.len();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    while pending.iter().any(|(name, _, _)| {
-        job.join(format!("{name}.bin")).exists() || !out.join(format!("{name}.out")).is_file()
-    }) {
-        if std::time::Instant::now() > deadline {
-            eprintln!("qemu: timeout waiting for {want} results; marking rest skipped");
+    let mut round = 0;
+    loop {
+        let timeout = if round == 0 { 300 } else { 120 };
+        let complete = wait_for_results(dir, &names, timeout);
+        if complete {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // one retry with only the missing jobs: the guest consumed the
+        // rest, so their out files must survive the re-arm
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|name| !out.join(format!("{name}.out")).is_file())
+            .cloned()
+            .collect();
+        if round > 0 || missing.is_empty() {
+            eprintln!("qemu: timeout waiting for {} result(s)", missing.len());
+            break;
+        }
+        eprintln!("qemu: {} job(s) not consumed; retrying once", missing.len());
+        retries.fetch_add(1, Ordering::Relaxed);
+        clear_dir(&job);
+        let _ = fs::remove_file(dir.join("batch-done"));
+        let retry_jobs: Vec<(String, Vec<u8>)> = jobs
+            .iter()
+            .filter(|(name, _)| missing.contains(name))
+            .cloned()
+            .collect();
+        if !write_batch(dir, strict, &retry_jobs, false) {
+            eprintln!("qemu: cannot write retry batch");
+            break;
+        }
+        round = 1;
     }
+
     // parse the results and reply
     for (name, _, resp) in pending.drain(..) {
         let p = out.join(format!("{name}.out"));
@@ -321,6 +311,89 @@ fn flush_batch(dir: &Path, strict: bool, pending: &mut Vec<QemuJob>) {
     let _ = fs::remove_file(dir.join("run.sh"));
     let _ = fs::remove_file(dir.join("batch-ready"));
     let _ = fs::remove_file(dir.join("manifest"));
+}
+
+/// Write job files, the manifest, run.sh and batch-ready. `clear_out`
+/// drops stale verdict files from the previous batch (false on a retry,
+/// where the completed results must stay).
+fn write_batch(dir: &Path, strict: bool, jobs: &[(String, Vec<u8>)], clear_out: bool) -> bool {
+    let job = dir.join("job");
+    let out = dir.join("out");
+    if fs::create_dir_all(&job).is_err() || fs::create_dir_all(&out).is_err() {
+        return false;
+    }
+    // strict mode is signalled to the guest via a marker file
+    let strict_marker = dir.join("strict");
+    if strict {
+        let _ = fs::write(&strict_marker, b"1");
+    } else {
+        let _ = fs::remove_file(&strict_marker);
+    }
+    // stale markers from a previous batch would make the guest re-run
+    // the old run.sh, so clear them before writing anything
+    let _ = fs::remove_file(dir.join("batch-ready"));
+    let _ = fs::remove_file(dir.join("run.sh"));
+    let _ = fs::remove_file(dir.join("manifest"));
+    if clear_out {
+        clear_dir(&out);
+    }
+
+    // write the batch: job files, then a manifest listing them, then
+    // the run script + batch-ready marker. The guest reads the
+    // manifest by path (reliable) instead of globbing job/ (9p
+    // readdir can lag and miss fresh files).
+    let mut manifest = String::new();
+    for (name, bytes) in jobs {
+        let p = job.join(format!("{name}.bin"));
+        if fs::write(&p, bytes).is_err() {
+            return false;
+        }
+        // security_model=none can surface host files to the guest with
+        // ownership the guest cannot read even as root (EACCES); force
+        // world-read/write so the guest agent can always open them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o666));
+        }
+        manifest.push_str(name);
+        manifest.push('\n');
+    }
+    if fs::write(dir.join("manifest"), manifest.as_bytes()).is_err() {
+        return false;
+    }
+    if fs::write(dir.join("run.sh"), QEMU_RUN_SCRIPT).is_err() {
+        return false;
+    }
+    // batch-ready tells the guest that every job/*.bin and the
+    // manifest are on disk. The guest only runs run.sh when
+    // batch-ready exists, so it never sees a half-written batch.
+    //
+    // give the 9p server a moment to settle the freshly written files
+    // (metadata/ownership) before the guest opens them; opening too
+    // early surfaced as EACCES (errno=13) even for world-readable files.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    fs::write(dir.join("batch-ready"), b"1").is_ok()
+}
+
+/// Poll until every job has a result and the guest consumed the whole
+/// batch (job files gone). We do NOT stop on batch-done alone: the guest
+/// touches it after its glob loop, which can finish with job files still
+/// present if 9p showed a stale empty directory — stopping then would
+/// strand those jobs. Returns true when all results are present.
+fn wait_for_results(dir: &Path, names: &[String], timeout_secs: u64) -> bool {
+    let job = dir.join("job");
+    let out = dir.join("out");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while names.iter().any(|name| {
+        job.join(format!("{name}.bin")).exists() || !out.join(format!("{name}.out")).is_file()
+    }) {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
 }
 
 fn job_has_files(job: &Path) -> bool {
@@ -426,5 +499,50 @@ mod tests {
         assert!(parse_agent_verdict("REJECT invalid-program bytes errno=22\n").is_none());
         assert!(parse_agent_verdict("REJECT no-error-line errno=28\n").is_none());
         assert!(parse_agent_verdict("REJECT not-privileged errno=1\n").is_none());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn temp_share(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rv-qemu-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_batch_creates_jobs_manifest_and_ready_marker() {
+        let dir = temp_share("write");
+        let jobs = vec![
+            ("a".to_string(), vec![0xb7, 0, 0, 0, 1, 0, 0, 0]),
+            ("b".to_string(), vec![0x95, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        assert!(write_batch(&dir, false, &jobs, true));
+        assert!(dir.join("job/a.bin").is_file());
+        assert!(dir.join("job/b.bin").is_file());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("manifest")).unwrap(),
+            "a\nb\n"
+        );
+        assert!(dir.join("batch-ready").is_file());
+        assert!(!dir.join("strict").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_results_requires_every_out_file() {
+        let dir = temp_share("wait");
+        let jobs = vec![("a".to_string(), vec![0x95, 0, 0, 0, 0, 0, 0, 0])];
+        assert!(write_batch(&dir, true, &jobs, true));
+        assert!(!wait_for_results(&dir, &["a".to_string()], 0));
+        std::fs::write(dir.join("out/a.out"), "ACCEPT\n").unwrap();
+        // the guest removes the job file after running it; the wait only
+        // completes when both the verdict exists and the job is consumed
+        std::fs::remove_file(dir.join("job/a.bin")).unwrap();
+        assert!(wait_for_results(&dir, &["a".to_string()], 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

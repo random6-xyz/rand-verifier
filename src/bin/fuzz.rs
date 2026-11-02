@@ -238,6 +238,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // flush the qemu batch tail so every kernel verdict is in, then report
+    // the retry count in the same summary (#142)
+    if let Some(qemu) = qemu.as_mut() {
+        qemu.flush()?;
+    }
+    let batch_retries = qemu.as_ref().map(|q| q.retries()).unwrap_or(0);
+
     write_summary(
         &args,
         &counts,
@@ -249,12 +256,8 @@ fn main() -> anyhow::Result<()> {
         &groups_dir,
         &mutations,
         &flips,
+        batch_retries,
     )?;
-
-    // flush the qemu batch tail so every kernel verdict is in
-    if let Some(qemu) = qemu.as_mut() {
-        qemu.flush()?;
-    }
 
     println!(
         "campaign done: seed {} iters {} mode {}",
@@ -993,11 +996,13 @@ fn write_summary(
     groups_dir: &Path,
     mutations: &MutStats,
     flips: &[(String, String, String)],
+    batch_retries: usize,
 ) -> anyhow::Result<()> {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"seed\": {},\n", args.seed));
     s.push_str(&format!("  \"mode\": \"{}\",\n", args.mode));
     s.push_str(&format!("  \"iters\": {},\n", args.iters));
+    s.push_str(&format!("  \"batch_retries\": {batch_retries},\n"));
     s.push_str("  \"counts\": {\n");
     push_map(&mut s, counts, "    ");
     s.push_str("  },\n  \"surface_gaps\": {\n");

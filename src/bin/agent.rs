@@ -69,14 +69,24 @@ fn drop_caps_for_strict_mode(
 
 fn run_program_bytes(data: &[u8]) {
     let maps = default_maps(data);
-    // AGENT_LOG=1 → full verifier log (level 2) kept for diagnostics; a
-    // subset is printed to stderr (captured into the out file by run.sh)
-    let log_level = if std::env::var_os("AGENT_LOG").is_some() {
-        2
-    } else {
-        1
+    // Full verifier log (level 2) is the default since #142: level 1
+    // drops the first error line on errno=28 programs (K-2), which made
+    // a plain bounded loop look like "no-error-line errno=28".
+    // AGENT_LOG=0 opts back into level 1 for throughput runs.
+    let log_level = match std::env::var("AGENT_LOG").ok().as_deref() {
+        Some("0") => 1,
+        _ => 2,
     };
     let (outcome, log) = load_with_kernel_maps_level(data, &maps, log_level);
+    // a 4 MiB buffer still runs out on pathological state dumps: retry
+    // once with the error-only log so the verdict is never lost
+    let (outcome, log) = match outcome {
+        KernelOutcome::NoErrorLine { errno: 28 } if log_level > 1 => {
+            let (outcome, log) = load_with_kernel_maps_level(data, &maps, 1);
+            (outcome, log)
+        }
+        other => (other, log),
+    };
     println!("{}", format_kernel_verdict(&outcome));
     if log_level >= 2 {
         eprintln!("AGENT_LOG: log len {} bytes", log.len());

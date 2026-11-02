@@ -11,8 +11,9 @@ const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_PSEUDO_MAP_VALUE: u8 = 2;
-/// 1 MiB verifier log buffer, like libbpf's default.
-pub const LOG_BUF_SIZE: usize = 1 << 20;
+/// 4 MiB verifier log buffer (#142): level-2 logs of pathological
+/// programs overflow libbpf's 1 MiB default (errno=28 loses the verdict).
+pub const LOG_BUF_SIZE: usize = 1 << 22;
 
 /// `_LINUX_CAPABILITY_VERSION_3` (linux/capability.h).
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
