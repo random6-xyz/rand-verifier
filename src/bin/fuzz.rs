@@ -35,6 +35,7 @@ use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::generator::{GenConfig, Generator};
 use rand_verifier::fuzz::insn_lib::{self, opcode_family};
 use rand_verifier::fuzz::mutator::Mutator;
+use rand_verifier::fuzz::novelty::{NoveltyMap, feature_signature, signature};
 use rand_verifier::fuzz::oracle::{
     Finding, SurfaceGapKind, classify_env_with_gap, first_violation_pc, surface_gap_kind,
 };
@@ -68,6 +69,10 @@ struct Args {
     save_corpus: Option<PathBuf>,
     /// Kernel column via the qemu guest agent (9p share dir).
     qemu_dir: Option<PathBuf>,
+    /// Novelty-weighted seed selection (#140), opt-in.
+    novelty: bool,
+    /// Directory for promoted novel programs (also loaded as seeds).
+    novelty_corpus: PathBuf,
 }
 
 fn usage() -> ! {
@@ -75,7 +80,7 @@ fn usage() -> ! {
         "usage: fuzz --seed <u64> [--iters <n>] [--min-len <n>] [--max-len <n>]\n\
          \x20            [--out-dir <dir>] [--strict] [--kernel] [--tolerate-findings]\n\
          \x20            [--mode generation|mutation] [--mutate-ratio <0-100>]\n\
-         \x20            [--corpus-dir <dir>]... [--save-corpus <dir>] [--qemu-dir <dir>]"
+         \x20            [--corpus-dir <dir>]... [--save-corpus <dir>] [--qemu-dir <dir>] [--novelty|--no-novelty] [--novel-corpus <dir>]"
     );
     process::exit(2);
 }
@@ -95,6 +100,9 @@ fn parse_args() -> Args {
         corpus_dirs: Vec::new(),
         save_corpus: None,
         qemu_dir: None,
+        // opt-in until the A/B shows a win (tools/NOVELTY.md)
+        novelty: false,
+        novelty_corpus: PathBuf::from("fuzz-out/corpus"),
     };
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -115,6 +123,9 @@ fn parse_args() -> Args {
             "--corpus-dir" => args.corpus_dirs.push(value().into()),
             "--save-corpus" => args.save_corpus = Some(value().into()),
             "--qemu-dir" => args.qemu_dir = Some(value().into()),
+            "--novelty" => args.novelty = true,
+            "--no-novelty" => args.novelty = false,
+            "--novel-corpus" => args.novelty_corpus = PathBuf::from(value()),
             "--strict" => args.strict = true,
             "--kernel" => args.kernel = true,
             "--tolerate-findings" => args.tolerate_findings = true,
@@ -162,6 +173,13 @@ fn main() -> anyhow::Result<()> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut surface_gaps: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut suppressed: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut novelty = NoveltyMap::new();
+    let mut promoted = 0usize;
+    let mut args = args;
+    if args.novelty && args.novelty_corpus.is_dir() {
+        // promoted programs from earlier campaigns are seeds again
+        args.corpus_dirs.push(args.novelty_corpus.clone());
+    }
     let mut kpi = Kpi::new();
     let mut coverage: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut findings: Vec<(String, String)> = Vec::new(); // (name, dir)
@@ -181,6 +199,9 @@ fn main() -> anyhow::Result<()> {
             &mut counts,
             &mut surface_gaps,
             &mut suppressed,
+            &mut novelty,
+            Some(args.novelty_corpus.as_path()),
+            &mut promoted,
             &mut kpi,
             &mut coverage,
             &mut findings,
@@ -210,6 +231,9 @@ fn main() -> anyhow::Result<()> {
                 &mut counts,
                 &mut surface_gaps,
                 &mut suppressed,
+                &mut novelty,
+                Some(args.novelty_corpus.as_path()),
+                &mut promoted,
                 &mut kpi,
                 &mut coverage,
                 &mut findings,
@@ -255,6 +279,8 @@ fn main() -> anyhow::Result<()> {
         &counts,
         &surface_gaps,
         &suppressed,
+        &novelty,
+        promoted,
         &kpi,
         &coverage,
         &findings,
@@ -311,6 +337,9 @@ fn run_mutation_campaign(
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
     suppressed: &mut BTreeMap<&'static str, usize>,
+    novelty: &mut NoveltyMap,
+    novelty_dir: Option<&Path>,
+    promoted: &mut usize,
     kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
@@ -321,7 +350,7 @@ fn run_mutation_campaign(
 ) -> anyhow::Result<()> {
     let corpus = load_corpus_seeds(args)?;
     let corpus_len = corpus.len();
-    let mut pool: Vec<(String, Vec<BpfInsn>, &'static str)> = corpus;
+    let mut pool: Vec<Seed> = corpus;
 
     for i in 0..args.iters {
         let name = format!("mseed-{}-{}", args.seed, i);
@@ -329,8 +358,15 @@ fn run_mutation_campaign(
 
         let (insns, seed_verdict) = if mutator.chance(args.mutate_ratio) {
             mutations.total += 1;
-            let (_, seed_insns, seed_v) = mutator.pick(&pool);
-            let other_seed = mutator.pick(&pool);
+            let weights: Vec<f64> = if args.novelty {
+                pool.iter().map(|seed| novelty.energy(&seed.3)).collect()
+            } else {
+                vec![1.0; pool.len()]
+            };
+            let seed_index = mutator.pick_weighted(&weights);
+            let other_index = mutator.pick_weighted(&weights);
+            let (_, seed_insns, seed_v, _) = &pool[seed_index];
+            let other_seed = &pool[other_index];
             let seed_insns = seed_insns.clone();
             let seed_v = *seed_v;
             match mutator.try_mutate(&seed_insns, Some(&other_seed.1)) {
@@ -379,7 +415,12 @@ fn run_mutation_campaign(
         // the pool grows with campaign programs; only the campaign
         // tail is drained — the corpus seeds stay in the pool for the
         // whole campaign (AGENTS.md: seed >= 1000 must be exercised)
-        pool.push((name.clone(), out.insns.clone(), out.mini.name()));
+        pool.push((
+            name.clone(),
+            out.insns.clone(),
+            out.mini.name(),
+            out.signature.clone(),
+        ));
         if pool.len() > corpus_len + POOL_CAP {
             pool.drain(corpus_len..pool.len() - POOL_CAP);
         }
@@ -388,6 +429,9 @@ fn run_mutation_campaign(
             counts,
             surface_gaps,
             suppressed,
+            novelty,
+            novelty_dir,
+            promoted,
             kpi,
             coverage,
             findings,
@@ -416,7 +460,9 @@ fn run_mutation_campaign(
 
 /// The corpus fixtures as decoded mutation seeds, with their known
 /// mini verdicts ("ACCEPT" / "REJECT").
-fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &'static str)>> {
+type Seed = (String, Vec<BpfInsn>, &'static str, String);
+
+fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<Seed>> {
     let mut seeds = Vec::new();
     for (dir, verdict) in [
         ("tests/programs/accept", "ACCEPT"),
@@ -433,10 +479,12 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &
             let Ok(insns) = rand_verifier::insn::decode_program(&bytes) else {
                 continue;
             };
+            let signature = signature(verdict, None, None, &insns);
             seeds.push((
                 path.file_stem().unwrap().to_string_lossy().into_owned(),
                 insns,
                 verdict,
+                signature,
             ));
         }
     }
@@ -475,10 +523,12 @@ fn load_corpus_seeds(args: &Args) -> anyhow::Result<Vec<(String, Vec<BpfInsn>, &
                 Verdict::Safe => "ACCEPT",
                 Verdict::Unsafe(_) => "REJECT",
             };
+            let signature = signature(verdict, None, None, &insns);
             seeds.push((
                 path.file_stem().unwrap().to_string_lossy().into_owned(),
                 insns,
                 verdict,
+                signature,
             ));
         }
     }
@@ -507,81 +557,11 @@ impl Kpi {
         if !out.finding.is_finding() {
             return;
         }
-        let is_new = self.clusters.insert(cluster_key(out));
+        let is_new = self.clusters.insert(out.signature.clone());
         if is_new && self.first_new_cluster_ms.is_none() {
             self.first_new_cluster_ms = Some(self.started.elapsed().as_millis());
         }
     }
-}
-
-/// Normalize a verifier message into a clusterable form: embedded hex and
-/// decimal literals become `#` (they vary per program, the rule does not),
-/// while register names (`R6`) keep their number.
-fn normalize_message(message: &str) -> String {
-    let mut out = String::new();
-    let mut prev_space = false;
-    for token in message.split_whitespace() {
-        let mut norm = String::new();
-        let mut chars = token.chars().peekable();
-        let mut prev: Option<char> = None;
-        while let Some(c) = chars.next() {
-            let starts_number =
-                c.is_ascii_digit() && prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_');
-            if starts_number {
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_hexdigit() || d == 'x' || d == 'X' {
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if norm.ends_with('-') || norm.ends_with('+') {
-                    norm.pop();
-                }
-                norm.push('#');
-                prev = Some('#');
-            } else {
-                norm.push(c);
-                prev = Some(c);
-            }
-        }
-        let norm = norm.trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
-        if norm.is_empty() {
-            continue;
-        }
-        if prev_space {
-            out.push(' ');
-        }
-        out.push_str(norm);
-        prev_space = true;
-    }
-    out.truncate(120);
-    out
-}
-
-/// FNV-1a over the opcode-family sequence: deterministic across processes
-/// (std's DefaultHasher is randomly keyed).
-fn shape_hash(insns: &[BpfInsn]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for insn in insns {
-        for byte in opcode_family(insn).bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn cluster_key(out: &Outcome) -> String {
-    format!(
-        "{}|{}|{}|{:016x}",
-        out.finding.name(),
-        normalize_message(out.mini_reason.as_deref().unwrap_or("")),
-        normalize_message(out.kernel_message.as_deref().unwrap_or("")),
-        shape_hash(&out.insns),
-    )
 }
 
 /// Mutation statistics for the summary.
@@ -618,6 +598,10 @@ struct Outcome {
     kernel_insn: Option<u32>,
     finding: Finding,
     surface_gap: Option<SurfaceGapKind>,
+    /// KPI cluster key (finding class + normalized messages + exact shape).
+    signature: String,
+    /// Coarse scheduling feature (families / branch bucket / length bucket).
+    feature: String,
 }
 
 /// One program through the whole pipeline: verify (mini + concrete),
@@ -641,6 +625,8 @@ fn run_program(
         // judge this program", never "the kernel is wrong" (#131)
         let message = format!("{err:#}");
         let kind = surface_gap_kind(&message).unwrap_or(SurfaceGapKind::Other);
+        let signature = signature(Finding::SurfaceGap.name(), Some(&message), None, insns);
+        let feature = feature_signature(Finding::SurfaceGap.name(), Some(&message), None, insns);
         return Ok(Outcome {
             name: name.to_string(),
             bytes,
@@ -654,6 +640,8 @@ fn run_program(
             kernel_insn: None,
             finding: Finding::SurfaceGap,
             surface_gap: Some(kind),
+            signature,
+            feature,
         });
     }
     let (mini, mini_reason, mini_insn, panic_msg) =
@@ -708,6 +696,18 @@ fn run_program(
             args.strict,
         )
     };
+    let signature = signature(
+        finding.name(),
+        mini_reason.as_deref(),
+        kernel_message.as_deref(),
+        insns,
+    );
+    let feature = feature_signature(
+        finding.name(),
+        mini_reason.as_deref(),
+        kernel_message.as_deref(),
+        insns,
+    );
     Ok(Outcome {
         name: name.to_string(),
         bytes,
@@ -721,16 +721,32 @@ fn run_program(
         kernel_insn,
         finding,
         surface_gap,
+        signature,
+        feature,
     })
 }
 
 /// Count, record coverage, and persist a finding (plus its triage
 /// candidate) — shared by both campaign modes.
 #[allow(clippy::too_many_arguments)]
+/// FNV-1a over bytes: the promoted corpus file name (deterministic).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_outcome(
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
     suppressed: &mut BTreeMap<&'static str, usize>,
+    novelty: &mut NoveltyMap,
+    novelty_dir: Option<&Path>,
+    promoted: &mut usize,
     kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
@@ -742,6 +758,19 @@ fn handle_outcome(
         *coverage.entry(opcode_family(insn)).or_insert(0) += 1;
     }
     *counts.entry(out.finding.name()).or_insert(0) += 1;
+    let novel = novelty.observe(&out.feature);
+    if novel && let Some(dir) = novelty_dir {
+        // persist one program per new signature (promotion): the next
+        // campaign loads these as extra seeds
+        let _ = fs::create_dir_all(dir);
+        let count = fs::read_dir(dir).map(|it| it.count()).unwrap_or(0);
+        if count < 512 && out.bytes.len() <= 4096 {
+            let name = format!("nov-{:016x}.bin", fnv1a(out.signature.as_bytes()));
+            if fs::write(dir.join(name), &out.bytes).is_ok() {
+                *promoted += 1;
+            }
+        }
+    }
     kpi.observe(&out);
     if out.finding == Finding::Whitelisted {
         let input = FingerprintInput {
@@ -1010,6 +1039,8 @@ fn write_summary(
     counts: &BTreeMap<&'static str, usize>,
     surface_gaps: &BTreeMap<&'static str, usize>,
     suppressed: &BTreeMap<&'static str, usize>,
+    novelty: &NoveltyMap,
+    promoted: usize,
     kpi: &Kpi,
     coverage: &BTreeMap<&'static str, usize>,
     findings: &[(String, String)],
@@ -1030,6 +1061,22 @@ fn write_summary(
     push_map(&mut s, surface_gaps, "    ");
     s.push_str("  },\n  \"suppressed\": {\n");
     push_map(&mut s, suppressed, "    ");
+    s.push_str("  },\n  \"novelty\": {\n");
+    s.push_str(&format!("    \"enabled\": {},\n", args.novelty));
+    s.push_str(&format!("    \"unique_features\": {},\n", novelty.unique()));
+    s.push_str(&format!(
+        "    \"novel_events\": {},\n",
+        novelty.novel_events()
+    ));
+    let feature_ratio = if novelty.unique() == 0 {
+        0.0
+    } else {
+        args.iters as f64 / novelty.unique() as f64
+    };
+    s.push_str(&format!(
+        "    \"feature_duplicate_ratio\": {feature_ratio:.3},\n"
+    ));
+    s.push_str(&format!("    \"promoted\": {promoted}\n"));
     let findings_total = findings.len();
     let unique_clusters = kpi.clusters.len();
     let duplicate_ratio = if unique_clusters == 0 {
@@ -1131,7 +1178,7 @@ fn json_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod kpi_tests {
-    use super::*;
+    use rand_verifier::fuzz::novelty::{normalize_message, shape_hash};
     use rand_verifier::insn::decode_program;
 
     #[test]
