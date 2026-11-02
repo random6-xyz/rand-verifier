@@ -142,7 +142,7 @@ fn patch_map_fds(insns: &[u8], fds: &HashMap<u32, i32>) -> Vec<u8> {
 }
 
 /// Collect the map fds referenced by ldimm64 pseudo instructions.
-fn referenced_map_fds(insns: &[u8]) -> Vec<u32> {
+pub fn referenced_map_fds(insns: &[u8]) -> Vec<u32> {
     let mut fds = Vec::new();
     let mut i = 0usize;
     while i + 16 <= insns.len() {

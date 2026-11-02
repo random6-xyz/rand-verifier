@@ -1,0 +1,25 @@
+{
+  "allowed_findings": [
+    "calls__038",
+    "dead_code__005",
+    "jump__000",
+    "jump__001",
+    "jump__002",
+    "jump__003",
+    "jump__004",
+    "jump__005",
+    "jump__006",
+    "jump__007"
+  ],
+  "counts": {
+    "agree": 40,
+    "inconclusive": 121,
+    "kernel-unsound-candidate": 1,
+    "rv-precision-gap": 4,
+    "soundness-candidate": 5,
+    "unsupported-prog-type": 238,
+    "whitelisted": 69
+  },
+  "kernel_source": "expected",
+  "strict": false
+}
