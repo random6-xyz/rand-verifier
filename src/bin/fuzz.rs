@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use rand_verifier::diff::{SideVerdict, categorize_mini_reason};
+use rand_verifier::diff::{
+    FingerprintInput, SideVerdict, categorize_mini_reason, suppressed_fingerprint,
+};
 use rand_verifier::env::BpfVerifierEnv;
 use rand_verifier::error::Verdict;
 use rand_verifier::fuzz::generator::{GenConfig, Generator};
@@ -159,6 +161,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut surface_gaps: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut suppressed: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut kpi = Kpi::new();
     let mut coverage: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut findings: Vec<(String, String)> = Vec::new(); // (name, dir)
@@ -177,6 +180,7 @@ fn main() -> anyhow::Result<()> {
             &findings_dir,
             &mut counts,
             &mut surface_gaps,
+            &mut suppressed,
             &mut kpi,
             &mut coverage,
             &mut findings,
@@ -205,6 +209,7 @@ fn main() -> anyhow::Result<()> {
             handle_outcome(
                 &mut counts,
                 &mut surface_gaps,
+                &mut suppressed,
                 &mut kpi,
                 &mut coverage,
                 &mut findings,
@@ -249,6 +254,7 @@ fn main() -> anyhow::Result<()> {
         &args,
         &counts,
         &surface_gaps,
+        &suppressed,
         &kpi,
         &coverage,
         &findings,
@@ -304,6 +310,7 @@ fn run_mutation_campaign(
     findings_dir: &Path,
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
+    suppressed: &mut BTreeMap<&'static str, usize>,
     kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
@@ -380,6 +387,7 @@ fn run_mutation_campaign(
         handle_outcome(
             counts,
             surface_gaps,
+            suppressed,
             kpi,
             coverage,
             findings,
@@ -722,6 +730,7 @@ fn run_program(
 fn handle_outcome(
     counts: &mut BTreeMap<&'static str, usize>,
     surface_gaps: &mut BTreeMap<&'static str, usize>,
+    suppressed: &mut BTreeMap<&'static str, usize>,
     kpi: &mut Kpi,
     coverage: &mut BTreeMap<&'static str, usize>,
     findings: &mut Vec<(String, String)>,
@@ -734,6 +743,17 @@ fn handle_outcome(
     }
     *counts.entry(out.finding.name()).or_insert(0) += 1;
     kpi.observe(&out);
+    if out.finding == Finding::Whitelisted {
+        let input = FingerprintInput {
+            name: &out.name,
+            mini: &out.mini,
+            kernel: &out.kernel,
+            mini_reason: out.mini_reason.as_deref(),
+        };
+        if let Some(fingerprint) = suppressed_fingerprint(&input) {
+            *suppressed.entry(fingerprint.id).or_insert(0) += 1;
+        }
+    }
     if let Some(gap) = out.surface_gap {
         *surface_gaps.entry(gap.name()).or_insert(0) += 1;
     }
@@ -989,6 +1009,7 @@ fn write_summary(
     args: &Args,
     counts: &BTreeMap<&'static str, usize>,
     surface_gaps: &BTreeMap<&'static str, usize>,
+    suppressed: &BTreeMap<&'static str, usize>,
     kpi: &Kpi,
     coverage: &BTreeMap<&'static str, usize>,
     findings: &[(String, String)],
@@ -1007,6 +1028,8 @@ fn write_summary(
     push_map(&mut s, counts, "    ");
     s.push_str("  },\n  \"surface_gaps\": {\n");
     push_map(&mut s, surface_gaps, "    ");
+    s.push_str("  },\n  \"suppressed\": {\n");
+    push_map(&mut s, suppressed, "    ");
     let findings_total = findings.len();
     let unique_clusters = kpi.clusters.len();
     let duplicate_ratio = if unique_clusters == 0 {
